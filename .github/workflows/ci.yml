@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest      # VM runner: io_uring available
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: sudo apt-get update && sudo apt-get install -y liburing-dev libssl-dev
+      - run: pip install polars numpy pyarrow "moto[s3]" flatbuffers boto3
+      - run: PYTHONPATH=. python3 quiver/compiler/gen_templates.py quiver/exec/ipc_gen.h
+      - run: make -C quiver/exec quiver-exec
+      - run: PYTHONPATH=. python3 -m quiver.tests.run_all
+        env:
+          # runners without io_uring (containerized) can force the
+          # portable engine; VM runners run the full matrix
+          QUIVER_FORCE_ENGINE: ""
