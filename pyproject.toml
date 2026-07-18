@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quiver-tools"
+version = "0.1.0"
+description = "Set-at-a-time Unix file tools on io_uring, Polars, and Arrow; nock self-indexing archives"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+dependencies = ["polars>=1.0", "numpy>=1.26"]
+
+[project.optional-dependencies]
+s3 = ["boto3"]
+dev = ["pyarrow", "moto[s3]", "flatbuffers"]   # test oracles only
+
+[project.scripts]
+quiver = "quiver.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["quiver*"]

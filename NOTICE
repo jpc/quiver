@@ -1,0 +1,9 @@
+quiver
+Copyright (c) 2026 quiver contributors
+
+This product includes software developed at Hume AI (wsds/pupyarrow,
+ducl/pwalk2 worker model).
+
+pupyarrow/fb.py contains a builder algorithm ported from
+google/flatbuffers (https://github.com/google/flatbuffers),
+licensed under the Apache License, Version 2.0.

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+quiver/exec/quiver-exec
+quiver/exec/ipc_gen.h
+*.wal
+*.wal.done
+dist/
+*.egg-info/
