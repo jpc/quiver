@@ -56,11 +56,11 @@ def _check(comp: pl.DataFrame, cmds: pl.DataFrame) -> None:
 # ── du ────────────────────────────────────────────────────────────────────
 
 def du(root: str, depth: int = 1, apparent: bool = False,
-       engine: str = "auto") -> pl.DataFrame:
+       engine: str = "auto", threads: int = 8) -> pl.DataFrame:
     """Disk usage by prefix at `depth`. Matches du semantics: st_blocks
     based (unless apparent=True), hardlinks counted once, directory
     inodes included. Pure scan + group_by — no execution engine."""
-    df = scan(root, engine)
+    df = scan(root, engine, threads)
     usage = (pl.col("size") if apparent else pl.col("blocks") * 512)
     files = df.filter(~pl.col("is_dir")).unique(subset="ino")  # hardlinks
     entries = pl.concat([files, df.filter(pl.col("is_dir"))])
@@ -81,11 +81,11 @@ def du(root: str, depth: int = 1, apparent: bool = False,
 
 def rm(root: str, select: pl.Expr | None = None,
        engine: str = "auto", wal: str | None = None,
-       scheduler: str = "refcount") -> int:
+       scheduler: str = "refcount", threads: int = 8) -> int:
     """Recursive delete of root's contents (and root itself unless a
     `select` filter keeps survivors). Files in epoch 0, rmdirs deepest-
     first — the executor barrier makes -ENOTEMPTY structurally impossible."""
-    df = scan(root, engine)
+    df = scan(root, engine, threads)
     if select is not None:
         df = df.filter(select)
         remove_root = False
@@ -154,9 +154,9 @@ def _setmeta_cmds(dst_root: str, df: pl.DataFrame,
 
 
 def cp(src_root: str, dst_root: str, engine: str = "auto",
-       wal: str | None = None) -> int:
+       wal: str | None = None, threads: int = 8) -> int:
     """cp -r = sync into emptiness (S8)."""
-    src = scan(src_root, engine).with_columns(DEPTH)
+    src = scan(src_root, engine, threads).with_columns(DEPTH)
     os.makedirs(dst_root, exist_ok=True)
     cmds, _ = sync_cmds(src, empty_stat(), src_root, dst_root,
                         delete=False)
@@ -222,11 +222,12 @@ def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
 
 
 def sync(src_root: str, dst_root: str, delete: bool = True,
-         engine: str = "auto", wal: str | None = None) -> pl.DataFrame:
+         engine: str = "auto", wal: str | None = None,
+         threads: int = 8) -> pl.DataFrame:
     """One-way sync src → dst; idempotent (mtimes preserved)."""
-    src = scan(src_root, engine).with_columns(DEPTH)
+    src = scan(src_root, engine, threads).with_columns(DEPTH)
     os.makedirs(dst_root, exist_ok=True)
-    dst = scan(dst_root, engine)
+    dst = scan(dst_root, engine, threads)
     cmds, summary = sync_cmds(src, dst, src_root, dst_root, delete)
     if len(cmds):
         _run(cmds, engine, wal)

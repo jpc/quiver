@@ -9,7 +9,7 @@ def main(argv=None):
     from . import nock, tools, wire
     p = argparse.ArgumentParser(prog="quiver")
     p.add_argument("--engine", default="auto", choices=["auto","uring","sync"])
-    p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--threads", type=int, default=64)  # WEKA plateau, see docs/BENCH-IREN.md
     sub = p.add_subparsers(dest="cmd", required=True)
     for name, nargs in (("du",1),("rm",1),("scan",1)):
         sp = sub.add_parser(name); sp.add_argument("paths", nargs=nargs)
@@ -21,15 +21,15 @@ def main(argv=None):
     a = p.parse_args(argv)
     eng, thr = a.engine, a.threads
     if a.cmd == "du":
-        print(tools.du(a.paths[0], engine=eng))
+        print(tools.du(a.paths[0], engine=eng, threads=thr))
     elif a.cmd == "scan":
         print(wire.scan(a.paths[0], eng, thr))
     elif a.cmd == "rm":
-        print(f"{tools.rm(a.paths[0], engine=eng)} ops")
+        print(f"{tools.rm(a.paths[0], engine=eng, threads=thr)} ops")
     elif a.cmd == "cp":
-        print(f"{tools.cp(a.paths[0], a.paths[1], engine=eng)} entries")
+        print(f"{tools.cp(a.paths[0], a.paths[1], engine=eng, threads=thr)} entries")
     elif a.cmd == "sync":
-        print(tools.sync(a.paths[0], a.paths[1], engine=eng))
+        print(tools.sync(a.paths[0], a.paths[1], engine=eng, threads=thr))
     elif a.cmd == "pack":
         fmt = nock.TarFormat() if a.tar else nock.RawFormat()
         idx = tools.pack(a.paths[0], a.paths[1], fmt, engine=eng,
