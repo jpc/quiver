@@ -559,21 +559,32 @@ static int g_deferred_fd = 1;
 
 #define OPEN_POOL 16
 typedef struct {
-    const CmdBatch *c; const int64_t *rows; RowState *rs;
-    int first, step, count;
-} OpenJob;
+    const CmdBatch *c; RowState *rs;
+    pthread_mutex_t mu; pthread_cond_t cv_work, cv_done;
+    int64_t q[WINDOW];  int qn;      /* rows waiting for their open(2)s */
+    int64_t dq[WINDOW]; int dn;      /* rows whose fds are ready */
+    int active, stop;
+    pthread_t tid[OPEN_POOL]; int nthreads;
+} OpenPool;
 
 static void *open_worker(void *arg) {
-    OpenJob *j = arg;
-    for (int q = j->first; q < j->count; q += j->step) {
-        int64_t i = j->rows[q];
-        RowState *r = &j->rs[i];
-        const CmdBatch *c = j->c;
+    OpenPool *p = arg;
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        while (p->qn == 0 && !p->stop)
+            pthread_cond_wait(&p->cv_work, &p->mu);
+        if (p->qn == 0 && p->stop) { pthread_mutex_unlock(&p->mu); return NULL; }
+        int64_t i = p->q[--p->qn];
+        p->active++;
+        pthread_mutex_unlock(&p->mu);
+
+        RowState *r = &p->rs[i];
+        const CmdBatch *c = p->c;
         if (c->size[i] > 0) {
             r->sfd = open(c->path[i], O_RDONLY);
-            if (r->sfd < 0) { r->first_err = -errno; continue; }
+            if (r->sfd < 0) r->first_err = -errno;
         }
-        if (c->dst[i][0]) {
+        if (!r->first_err && c->dst[i][0]) {
             r->dfd = open(c->dst[i],
                 O_WRONLY | O_CREAT |
                 ((c->header_offset[i] == 0 && c->data_offset[i] == 0)
@@ -581,8 +592,63 @@ static void *open_worker(void *arg) {
                 c->mode[i] >= 0 ? (mode_t)c->mode[i] : DEFAULT_FILE_MODE);
             if (r->dfd < 0) r->first_err = -errno;
         }
+
+        pthread_mutex_lock(&p->mu);
+        p->dq[p->dn++] = i;
+        p->active--;
+        pthread_cond_signal(&p->cv_done);
+        pthread_mutex_unlock(&p->mu);
     }
-    return NULL;
+}
+
+static void pool_start(OpenPool *p, const CmdBatch *c, RowState *rs) {
+    memset(p, 0, sizeof *p);
+    p->c = c; p->rs = rs;
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv_work, NULL);
+    pthread_cond_init(&p->cv_done, NULL);
+    p->nthreads = OPEN_POOL;
+    for (int t = 0; t < p->nthreads; t++)
+        pthread_create(&p->tid[t], NULL, open_worker, p);
+}
+
+static void pool_stop(OpenPool *p) {
+    pthread_mutex_lock(&p->mu);
+    p->stop = 1;
+    pthread_cond_broadcast(&p->cv_work);
+    pthread_mutex_unlock(&p->mu);
+    for (int t = 0; t < p->nthreads; t++) pthread_join(p->tid[t], NULL);
+    pthread_mutex_destroy(&p->mu);
+    pthread_cond_destroy(&p->cv_work);
+    pthread_cond_destroy(&p->cv_done);
+}
+
+static void pool_push(OpenPool *p, int64_t i) {
+    pthread_mutex_lock(&p->mu);
+    p->q[p->qn++] = i;
+    pthread_cond_signal(&p->cv_work);
+    pthread_mutex_unlock(&p->mu);
+}
+
+/* Harvest opened rows. If `block`, wait until at least one is ready
+ * (caller guarantees work is outstanding). Returns count. */
+static int pool_harvest(OpenPool *p, int64_t *out, int block) {
+    pthread_mutex_lock(&p->mu);
+    if (block)
+        while (p->dn == 0 && (p->qn > 0 || p->active > 0))
+            pthread_cond_wait(&p->cv_done, &p->mu);
+    int n = p->dn;
+    memcpy(out, p->dq, (size_t)n * sizeof(int64_t));
+    p->dn = 0;
+    pthread_mutex_unlock(&p->mu);
+    return n;
+}
+
+static int pool_outstanding(OpenPool *p) {
+    pthread_mutex_lock(&p->mu);
+    int n = p->qn + p->active + p->dn;
+    pthread_mutex_unlock(&p->mu);
+    return n;
 }
 
 static void probe_deferred_fd(struct io_uring *ring) {
@@ -617,6 +683,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
     RowState *rs = calloc((size_t)n, sizeof *rs);
     int64_t *rc = calloc((size_t)n, sizeof(int64_t));   /* children left */
     int64_t *ready = malloc((size_t)n * sizeof(int64_t));
+    OpenPool pool; int pool_on = 0;    /* started on first thread-open row */
     int free_slots[WINDOW], n_free = WINDOW;
     for (int i = 0; i < WINDOW; i++) free_slots[i] = i;
 
@@ -635,7 +702,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
         int64_t e1 = e0;
         while (e1 < n && c->dep_group[e1] == c->dep_group[e0]) e1++;
         int64_t done = 0, span = e1 - e0, n_ready = 0;
-        int64_t wave[WINDOW]; int n_wave = 0;      /* thread-open COPY rows */
+        int64_t chains_inflight = 0;               /* rows with SQEs pending */
         for (int64_t i = e1 - 1; i >= e0; i--)     /* pop ≈ batch order */
             if (rc[i] == 0) ready[n_ready++] = i;
 
@@ -666,7 +733,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                     sqe = io_uring_get_sqe(ring);
                     io_uring_prep_fsync(sqe, afd, 0);
                     sqe->user_data = UD(1);
-                    r->pending = 1;
+                    r->pending = 1; chains_inflight++;
                     continue;
                 }
                 if (op == OP_UNLINK || op == OP_RMDIR || op == OP_MKDIR) {
@@ -679,7 +746,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                         io_uring_prep_unlinkat(sqe, AT_FDCWD, c->path[i],
                                 op == OP_RMDIR ? AT_REMOVEDIR : 0);
                     sqe->user_data = UD(1);
-                    r->pending = 1;
+                    r->pending = 1; chains_inflight++;
                     continue;
                 }
                 /* unified COPY */
@@ -688,7 +755,8 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 if ((size > 0 || has_dst) && !g_deferred_fd) {
                     if (n_free == 0) { ready[n_ready++] = i; break; }
                     r->slot = free_slots[--n_free];  /* in-flight bound only */
-                    wave[n_wave++] = i;              /* opens pooled below */
+                    if (!pool_on) { pool_start(&pool, c, rs); pool_on = 1; }
+                    pool_push(&pool, i);
                     continue;
                 }
                 if ((size > 0 || has_dst) && n_free == 0) {
@@ -755,20 +823,22 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 if (r->pending == 0) {
                     if (s >= 0) { free_slots[n_free++] = s; r->slot = -1; }
                     COMPLETE(i);
-                }
+                } else chains_inflight++;
                 #undef UD
             }
-            if (n_wave > 0) {   /* thread-open path: parallel open(2)s,
-                                   then plain-fd read→write chains */
-                int nt = n_wave < OPEN_POOL ? n_wave : OPEN_POOL;
-                OpenJob jobs[OPEN_POOL]; pthread_t tid[OPEN_POOL];
-                for (int t = 0; t < nt; t++) {
-                    jobs[t] = (OpenJob){c, wave, rs, t, nt, n_wave};
-                    pthread_create(&tid[t], NULL, open_worker, &jobs[t]);
-                }
-                for (int t = 0; t < nt; t++) pthread_join(tid[t], NULL);
-                for (int q = 0; q < n_wave; q++) {
-                    int64_t i = wave[q];
+            if (pool_on) {      /* build chains for rows whose opens are
+                                   done; block for opens only when the
+                                   ring is otherwise idle */
+                int64_t got[WINDOW];
+                /* block iff the pull loop can't progress either (no ready
+                 * rows, or slots all held by queued opens) — otherwise a
+                 * zero-CQE iteration would spin hot */
+                int block = chains_inflight == 0 && done < span &&
+                            (n_ready == 0 || n_free == 0) &&
+                            pool_outstanding(&pool) > 0;
+                int k = pool_harvest(&pool, got, block);
+                for (int q = 0; q < k; q++) {
+                    int64_t i = got[q];
                     RowState *r = &rs[i];
                     int64_t size = c->size[i], align = c->pad_align[i];
                     int64_t hlen = c->hdr_off[i + 1] - c->hdr_off[i];
@@ -816,13 +886,17 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                         if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
                         free_slots[n_free++] = r->slot; r->slot = -1;
                         COMPLETE(i);
-                    }
+                    } else chains_inflight++;
                 }
-                n_wave = 0;
             }
             if (done == span) break;
+            if (chains_inflight == 0) continue;  /* progress came from the
+                                                    pool or pull loop */
             int ret = io_uring_submit_and_wait(ring, 1);
-            if (ret < 0 && ret != -EINTR) { free(rs); free(rc); free(ready); return ret; }
+            if (ret < 0 && ret != -EINTR) {
+                if (pool_on) pool_stop(&pool);
+                free(rs); free(rc); free(ready); return ret;
+            }
 
             struct io_uring_cqe *cqe;
             unsigned head, seen = 0;
@@ -841,6 +915,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                         if (!r->first_err) r->first_err = cqe->res;
                 }
                 if (--r->pending == 0) {
+                    chains_inflight--;
                     if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
                     if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
                     if (r->short_read && !r->first_err)
@@ -859,6 +934,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
         #undef COMPLETE
         e0 = e1;
     }
+    if (pool_on) pool_stop(&pool);
     free(rs); free(rc); free(ready);
     return 0;
 }
