@@ -544,15 +544,46 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
 
 typedef struct {
     int pending; int32_t first_err; int64_t read_res;
-    int short_read; uint8_t *buf; int slot;
+    int short_read; uint8_t *buf; int slot; int sfd, dfd;
 } RowState;
 
 /* Pre-5.17 kernels assign fixed-file slots at submit time, so a linked op
  * cannot see the slot its own chain's openat_direct fills ("io_uring:
  * defer file assignment", v5.17) — the read gets -EBADF. Probe once at
- * init; without the capability, slot-using COPY rows run through the
- * sync path while single-op rows (unlink/mkdir/fsync) stay on the ring. */
+ * init; without the capability, COPY rows take the thread-open path:
+ * open(2) runs in a small pool (the getdents pattern from the scanner),
+ * then the read→write chain references the plain fds — every opcode
+ * there is ≥5.6. fds are closed in userspace at row completion so a
+ * severed chain can't leak them. */
 static int g_deferred_fd = 1;
+
+#define OPEN_POOL 16
+typedef struct {
+    const CmdBatch *c; const int64_t *rows; RowState *rs;
+    int first, step, count;
+} OpenJob;
+
+static void *open_worker(void *arg) {
+    OpenJob *j = arg;
+    for (int q = j->first; q < j->count; q += j->step) {
+        int64_t i = j->rows[q];
+        RowState *r = &j->rs[i];
+        const CmdBatch *c = j->c;
+        if (c->size[i] > 0) {
+            r->sfd = open(c->path[i], O_RDONLY);
+            if (r->sfd < 0) { r->first_err = -errno; continue; }
+        }
+        if (c->dst[i][0]) {
+            r->dfd = open(c->dst[i],
+                O_WRONLY | O_CREAT |
+                ((c->header_offset[i] == 0 && c->data_offset[i] == 0)
+                     ? O_TRUNC : 0),
+                c->mode[i] >= 0 ? (mode_t)c->mode[i] : DEFAULT_FILE_MODE);
+            if (r->dfd < 0) r->first_err = -errno;
+        }
+    }
+    return NULL;
+}
 
 static void probe_deferred_fd(struct io_uring *ring) {
     char b;
@@ -604,6 +635,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
         int64_t e1 = e0;
         while (e1 < n && c->dep_group[e1] == c->dep_group[e0]) e1++;
         int64_t done = 0, span = e1 - e0, n_ready = 0;
+        int64_t wave[WINDOW]; int n_wave = 0;      /* thread-open COPY rows */
         for (int64_t i = e1 - 1; i >= e0; i--)     /* pop ≈ batch order */
             if (rc[i] == 0) ready[n_ready++] = i;
 
@@ -620,7 +652,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 int64_t size = c->size[i], align = c->pad_align[i];
                 int64_t hlen = c->hdr_off[i + 1] - c->hdr_off[i];
                 RowState *r = &rs[i];
-                r->slot = -1; r->read_res = size;
+                r->slot = -1; r->sfd = -1; r->dfd = -1; r->read_res = size;
                 out[i].res = 0; out[i].read_size = size;
                 struct io_uring_sqe *sqe;
                 #define UD(st) (uint64_t)(((uint64_t)i << 8) | (st))
@@ -654,8 +686,10 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 int64_t dlen = c->dst[i][0] ? (int64_t)strlen(c->dst[i]) : 0;
                 int has_dst = dlen > 0;
                 if ((size > 0 || has_dst) && !g_deferred_fd) {
-                    row_sync(c, i, afd, &out[i]);   /* pre-5.17: no direct-fd chains */
-                    COMPLETE(i); continue;
+                    if (n_free == 0) { ready[n_ready++] = i; break; }
+                    r->slot = free_slots[--n_free];  /* in-flight bound only */
+                    wave[n_wave++] = i;              /* opens pooled below */
+                    continue;
                 }
                 if ((size > 0 || has_dst) && n_free == 0) {
                     ready[n_ready++] = i;          /* retry when a slot frees */
@@ -724,6 +758,68 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 }
                 #undef UD
             }
+            if (n_wave > 0) {   /* thread-open path: parallel open(2)s,
+                                   then plain-fd read→write chains */
+                int nt = n_wave < OPEN_POOL ? n_wave : OPEN_POOL;
+                OpenJob jobs[OPEN_POOL]; pthread_t tid[OPEN_POOL];
+                for (int t = 0; t < nt; t++) {
+                    jobs[t] = (OpenJob){c, wave, rs, t, nt, n_wave};
+                    pthread_create(&tid[t], NULL, open_worker, &jobs[t]);
+                }
+                for (int t = 0; t < nt; t++) pthread_join(tid[t], NULL);
+                for (int q = 0; q < n_wave; q++) {
+                    int64_t i = wave[q];
+                    RowState *r = &rs[i];
+                    int64_t size = c->size[i], align = c->pad_align[i];
+                    int64_t hlen = c->hdr_off[i + 1] - c->hdr_off[i];
+                    #define WUD(st) (uint64_t)(((uint64_t)i << 8) | (st))
+                    if (r->first_err) {
+                        if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
+                        if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
+                        out[i].res = r->first_err; out[i].read_size = 0;
+                        free_slots[n_free++] = r->slot; r->slot = -1;
+                        COMPLETE(i); continue;
+                    }
+                    int tfd = r->dfd >= 0 ? r->dfd : afd;
+                    if (io_uring_sq_space_left(ring) < MAX_CHAIN)
+                        io_uring_submit(ring);
+                    struct io_uring_sqe *sqe;
+                    if (size > 0) {
+                        int64_t padded = (size + align - 1) / align * align;
+                        r->buf = calloc(1, (size_t)padded);
+                        sqe = io_uring_get_sqe(ring);
+                        io_uring_prep_read(sqe, r->sfd, r->buf,
+                                           (unsigned)size, 0);
+                        sqe->flags |= IOSQE_IO_LINK;
+                        sqe->user_data = WUD(2); r->pending++;
+                    }
+                    if (hlen > 0) {
+                        sqe = io_uring_get_sqe(ring);
+                        io_uring_prep_write(sqe, tfd,
+                                            c->hdr_data + c->hdr_off[i],
+                                            (unsigned)hlen,
+                                            c->header_offset[i]);
+                        if (size > 0) sqe->flags |= IOSQE_IO_LINK;
+                        sqe->user_data = WUD(3); r->pending++;
+                    }
+                    if (size > 0) {
+                        int64_t padded = (size + align - 1) / align * align;
+                        sqe = io_uring_get_sqe(ring);
+                        io_uring_prep_write(sqe, tfd, r->buf,
+                                            (unsigned)padded,
+                                            c->data_offset[i]);
+                        sqe->user_data = WUD(4); r->pending++;
+                    }
+                    #undef WUD
+                    if (r->pending == 0) {          /* empty-file create */
+                        if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
+                        if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
+                        free_slots[n_free++] = r->slot; r->slot = -1;
+                        COMPLETE(i);
+                    }
+                }
+                n_wave = 0;
+            }
             if (done == span) break;
             int ret = io_uring_submit_and_wait(ring, 1);
             if (ret < 0 && ret != -EINTR) { free(rs); free(rc); free(ready); return ret; }
@@ -745,6 +841,8 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                         if (!r->first_err) r->first_err = cqe->res;
                 }
                 if (--r->pending == 0) {
+                    if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
+                    if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
                     if (r->short_read && !r->first_err)
                         row_sync(c, i, afd, &out[i]);
                     else {
@@ -1256,7 +1354,8 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "quiver-exec %s: engine=%s%s\n", argv[1],
             use_uring ? "uring" : "sync",
-            use_uring && !g_deferred_fd ? " (copy=sync: pre-5.17 kernel)" : "");
+            use_uring && !g_deferred_fd
+                ? " (copy=thread-open: pre-5.17 kernel)" : "");
 
     if (!strcmp(argv[1], "exec")) {
         int afd = -1;
