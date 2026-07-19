@@ -557,16 +557,20 @@ typedef struct {
  * severed chain can't leak them. */
 static int g_deferred_fd = 1;
 
-#define OPEN_POOL 16
+#define OPEN_POOL 64
 typedef struct {
-    const CmdBatch *c; RowState *rs;
+    const CmdBatch *c; RowState *rs; RowResult *out; int afd;
     pthread_mutex_t mu; pthread_cond_t cv_work, cv_done;
-    int64_t q[WINDOW];  int qn;      /* rows waiting for their open(2)s */
-    int64_t dq[WINDOW]; int dn;      /* rows whose fds are ready */
+    int64_t q[WINDOW];  int qn;      /* rows waiting for a worker */
+    int64_t dq[WINDOW]; int dn;      /* rows fully executed */
     int active, stop;
     pthread_t tid[OPEN_POOL]; int nthreads;
 } OpenPool;
 
+/* Workers run the ENTIRE row via row_sync (thread-safe: __thread bufs,
+ * per-row out slots, distinct offsets on the shared archive fd). On
+ * wekafs, N plain threads scale where 5.15's io-wq punting doesn't
+ * (measured: 20k copies t16 2.6s / t64 0.7s vs 36s through chains). */
 static void *open_worker(void *arg) {
     OpenPool *p = arg;
     for (;;) {
@@ -578,20 +582,7 @@ static void *open_worker(void *arg) {
         p->active++;
         pthread_mutex_unlock(&p->mu);
 
-        RowState *r = &p->rs[i];
-        const CmdBatch *c = p->c;
-        if (c->size[i] > 0) {
-            r->sfd = open(c->path[i], O_RDONLY);
-            if (r->sfd < 0) r->first_err = -errno;
-        }
-        if (!r->first_err && c->dst[i][0]) {
-            r->dfd = open(c->dst[i],
-                O_WRONLY | O_CREAT |
-                ((c->header_offset[i] == 0 && c->data_offset[i] == 0)
-                     ? O_TRUNC : 0),
-                c->mode[i] >= 0 ? (mode_t)c->mode[i] : DEFAULT_FILE_MODE);
-            if (r->dfd < 0) r->first_err = -errno;
-        }
+        row_sync(p->c, i, p->afd, &p->out[i]);
 
         pthread_mutex_lock(&p->mu);
         p->dq[p->dn++] = i;
@@ -601,9 +592,10 @@ static void *open_worker(void *arg) {
     }
 }
 
-static void pool_start(OpenPool *p, const CmdBatch *c, RowState *rs) {
+static void pool_start(OpenPool *p, const CmdBatch *c, RowState *rs,
+                       RowResult *out, int afd) {
     memset(p, 0, sizeof *p);
-    p->c = c; p->rs = rs;
+    p->c = c; p->rs = rs; p->out = out; p->afd = afd;
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->cv_work, NULL);
     pthread_cond_init(&p->cv_done, NULL);
@@ -726,8 +718,12 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
 
                 if (op == OP_CKSUM || op == OP_SETMETA ||
                     (op == OP_FBARRIER && c->path[i][0])) {
-                    row_sync(c, i, afd, &out[i]);
-                    COMPLETE(i); continue;
+                    if (n_free == 0) { ready[n_ready++] = i; break; }
+                    r->slot = free_slots[--n_free];
+                    if (!pool_on) { pool_start(&pool, c, rs, out, afd);
+                                    pool_on = 1; }
+                    pool_push(&pool, i);
+                    continue;
                 }
                 if (op == OP_FBARRIER) {
                     sqe = io_uring_get_sqe(ring);
@@ -754,8 +750,9 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 int has_dst = dlen > 0;
                 if ((size > 0 || has_dst) && !g_deferred_fd) {
                     if (n_free == 0) { ready[n_ready++] = i; break; }
-                    r->slot = free_slots[--n_free];  /* in-flight bound only */
-                    if (!pool_on) { pool_start(&pool, c, rs); pool_on = 1; }
+                    r->slot = free_slots[--n_free];
+                    if (!pool_on) { pool_start(&pool, c, rs, out, afd);
+                                    pool_on = 1; }
                     pool_push(&pool, i);
                     continue;
                 }
@@ -826,12 +823,11 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 } else chains_inflight++;
                 #undef UD
             }
-            if (pool_on) {      /* build chains for rows whose opens are
-                                   done; block for opens only when the
-                                   ring is otherwise idle */
+            if (pool_on) {      /* rows come back from the pool fully
+                                   executed — just release and account */
                 int64_t got[WINDOW];
                 /* block iff the pull loop can't progress either (no ready
-                 * rows, or slots all held by queued opens) — otherwise a
+                 * rows, or slots all held by queued rows) — otherwise a
                  * zero-CQE iteration would spin hot */
                 int block = chains_inflight == 0 && done < span &&
                             (n_ready == 0 || n_free == 0) &&
@@ -839,54 +835,8 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 int k = pool_harvest(&pool, got, block);
                 for (int q = 0; q < k; q++) {
                     int64_t i = got[q];
-                    RowState *r = &rs[i];
-                    int64_t size = c->size[i], align = c->pad_align[i];
-                    int64_t hlen = c->hdr_off[i + 1] - c->hdr_off[i];
-                    #define WUD(st) (uint64_t)(((uint64_t)i << 8) | (st))
-                    if (r->first_err) {
-                        if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
-                        if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
-                        out[i].res = r->first_err; out[i].read_size = 0;
-                        free_slots[n_free++] = r->slot; r->slot = -1;
-                        COMPLETE(i); continue;
-                    }
-                    int tfd = r->dfd >= 0 ? r->dfd : afd;
-                    if (io_uring_sq_space_left(ring) < MAX_CHAIN)
-                        io_uring_submit(ring);
-                    struct io_uring_sqe *sqe;
-                    if (size > 0) {
-                        int64_t padded = (size + align - 1) / align * align;
-                        r->buf = calloc(1, (size_t)padded);
-                        sqe = io_uring_get_sqe(ring);
-                        io_uring_prep_read(sqe, r->sfd, r->buf,
-                                           (unsigned)size, 0);
-                        sqe->flags |= IOSQE_IO_LINK;
-                        sqe->user_data = WUD(2); r->pending++;
-                    }
-                    if (hlen > 0) {
-                        sqe = io_uring_get_sqe(ring);
-                        io_uring_prep_write(sqe, tfd,
-                                            c->hdr_data + c->hdr_off[i],
-                                            (unsigned)hlen,
-                                            c->header_offset[i]);
-                        if (size > 0) sqe->flags |= IOSQE_IO_LINK;
-                        sqe->user_data = WUD(3); r->pending++;
-                    }
-                    if (size > 0) {
-                        int64_t padded = (size + align - 1) / align * align;
-                        sqe = io_uring_get_sqe(ring);
-                        io_uring_prep_write(sqe, tfd, r->buf,
-                                            (unsigned)padded,
-                                            c->data_offset[i]);
-                        sqe->user_data = WUD(4); r->pending++;
-                    }
-                    #undef WUD
-                    if (r->pending == 0) {          /* empty-file create */
-                        if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
-                        if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
-                        free_slots[n_free++] = r->slot; r->slot = -1;
-                        COMPLETE(i);
-                    } else chains_inflight++;
+                    free_slots[n_free++] = rs[i].slot; rs[i].slot = -1;
+                    COMPLETE(i);
                 }
             }
             if (done == span) break;
