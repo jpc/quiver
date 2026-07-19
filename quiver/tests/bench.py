@@ -23,7 +23,13 @@ def main(n_files=20000):
     rows = []
 
     rows.append(("scan (uring t8)", t(lambda: wire.scan(str(src), "uring", 8))))
-    rows.append(("find | wc", t(lambda: subprocess.run(
+    # -printf %s forces a stat per entry — the honest baseline for a
+    # statx scan; bare `find` is dirent-only and ~2-4x cheaper than
+    # anything that actually stats.
+    rows.append(("find -printf (stats)", t(lambda: subprocess.run(
+        f"find {src} -printf '%s\\n' | wc -l", shell=True,
+        capture_output=True))))
+    rows.append(("find names-only", t(lambda: subprocess.run(
         f"find {src} | wc -l", shell=True, capture_output=True))))
     rows.append(("du -s", t(lambda: subprocess.run(
         ["du", "-s", str(src)], capture_output=True))))
