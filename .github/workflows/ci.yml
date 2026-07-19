@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
-      - run: sudo apt-get update && sudo apt-get install -y liburing-dev libssl-dev
+      - run: sudo apt-get update && sudo apt-get install -y liburing-dev
       - run: pip install polars numpy pyarrow "moto[s3]" flatbuffers boto3
       - run: PYTHONPATH=. python3 quiver/compiler/gen_templates.py quiver/exec/ipc_gen.h
       - run: make -C quiver/exec quiver-exec

@@ -7,3 +7,7 @@ ducl/pwalk2 worker model).
 pupyarrow/fb.py contains a builder algorithm ported from
 google/flatbuffers (https://github.com/google/flatbuffers),
 licensed under the Apache License, Version 2.0.
+
+quiver/exec/md5.c and md5.h are Alexander Peslyak's (Solar Designer)
+OpenSSL-compatible MD5 implementation, placed in the public domain:
+https://openwall.info/wiki/people/solar/software/public-domain-source-code/md5

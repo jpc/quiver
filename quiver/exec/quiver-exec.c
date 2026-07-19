@@ -39,6 +39,7 @@
 #include <fnmatch.h>
 #include <liburing.h>
 #include <linux/stat.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +66,8 @@ enum { OP_UNLINK = 2, OP_RMDIR = 3, OP_MKDIR = 4,
 #define DEFAULT_FILE_MODE 0644
 #define DEFAULT_DIR_MODE  0755
 
-#include <openssl/evp.h>
+#include "md5.h"   /* vendored public-domain MD5 (Solar Designer);
+                      -DHAVE_OPENSSL -lcrypto swaps in OpenSSL's asm */
 
 /* ── CRC-64/NVME: reflected, poly 0xad93d23594c93659, composable ────────
  * Table-driven reference (~1 GB/s); the production path is PCLMULQDQ
@@ -330,12 +332,12 @@ static void *ck_worker(void *arg) {
     int fd = open(j->path, O_RDONLY);
     if (fd < 0) { j->err = -errno; return NULL; }
     uint8_t *buf = malloc(1 << 20);
-    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    MD5_CTX md;
     for (int64_t p = j->first; p < j->nparts; p += j->step) {
         int64_t off = p * j->part_size;
         int64_t len = j->fsize - off;
         if (len > j->part_size) len = j->part_size;
-        EVP_DigestInit_ex(md, EVP_md5(), NULL);
+        MD5_Init(&md);
         uint64_t crc = ~0ULL;
         int64_t done = 0;
         while (done < len) {
@@ -343,16 +345,16 @@ static void *ck_worker(void *arg) {
             if (want > (1 << 20)) want = 1 << 20;
             ssize_t r = pread(fd, buf, (size_t)want, off + done);
             if (r <= 0) { j->err = r < 0 ? -errno : -EIO; goto out; }
-            EVP_DigestUpdate(md, buf, (size_t)r);
+            MD5_Update(&md, buf, (unsigned long)r);
             crc = crc64_update(crc, buf, (size_t)r);
             done += r;
         }
-        EVP_DigestFinal_ex(md, j->digests[p], NULL);
+        MD5_Final(j->digests[p], &md);
         j->part_crc[p] = ~crc;
         j->part_len[p] = len;
     }
 out:
-    EVP_MD_CTX_free(md); free(buf); close(fd);
+    free(buf); close(fd);
     return NULL;
 }
 
@@ -383,12 +385,11 @@ static int row_cksum_parallel(const char *path, int64_t part_size,
         out->cksum = crc;
         out->read_size = fsize;
         out->has_etag = 1;
-        EVP_MD_CTX *md = EVP_MD_CTX_new();
-        EVP_DigestInit_ex(md, EVP_md5(), NULL);
-        EVP_DigestUpdate(md, digests, 16 * (size_t)nparts);
-        EVP_DigestFinal_ex(md, out->etag, NULL);
+        MD5_CTX md;
+        MD5_Init(&md);
+        MD5_Update(&md, digests, 16 * (unsigned long)nparts);
+        MD5_Final(out->etag, &md);
         out->parts = (int)nparts;
-        EVP_MD_CTX_free(md);
     } else out->res = err;
     free(digests); free(pcrc); free(plen);
     return err;
@@ -405,8 +406,8 @@ static void row_cksum(const char *path, int64_t part_size, RowResult *out) {
     uint64_t crc = ~0ULL;
     uint8_t digests[10000][16];
     int nparts = 0;
-    EVP_MD_CTX *md = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(md, EVP_md5(), NULL);
+    MD5_CTX md;
+    MD5_Init(&md);
     static __thread uint8_t *buf; 
     if (!buf) buf = malloc(1 << 20);
     int64_t in_part = 0, total = 0;
@@ -419,11 +420,11 @@ static void row_cksum(const char *path, int64_t part_size, RowResult *out) {
         while (o < r) {
             ssize_t take = r - o;
             if (take > part_size - in_part) take = part_size - in_part;
-            EVP_DigestUpdate(md, buf + o, (size_t)take);
+            MD5_Update(&md, buf + o, (unsigned long)take);
             o += take; in_part += take; total += take;
             if (in_part == part_size) {
-                EVP_DigestFinal_ex(md, digests[nparts++], NULL);
-                EVP_DigestInit_ex(md, EVP_md5(), NULL);
+                MD5_Final(digests[nparts++], &md);
+                MD5_Init(&md);
                 in_part = 0;
             }
         }
@@ -431,7 +432,7 @@ static void row_cksum(const char *path, int64_t part_size, RowResult *out) {
     close(fd);
     if (out->res == 0) {
         if (in_part > 0 || nparts == 0)
-            EVP_DigestFinal_ex(md, digests[nparts++], NULL);
+            MD5_Final(digests[nparts++], &md);
         out->cksum = ~crc;
         out->read_size = total;
         out->has_etag = 1;
@@ -439,13 +440,12 @@ static void row_cksum(const char *path, int64_t part_size, RowResult *out) {
             memcpy(out->etag, digests[0], 16);       /* single-part PUT */
             out->parts = 0;
         } else {                                     /* composite */
-            EVP_DigestInit_ex(md, EVP_md5(), NULL);
-            EVP_DigestUpdate(md, digests, 16 * (size_t)nparts);
-            EVP_DigestFinal_ex(md, out->etag, NULL);
+            MD5_Init(&md);
+            MD5_Update(&md, digests, 16 * (unsigned long)nparts);
+            MD5_Final(out->etag, &md);
             out->parts = nparts;
         }
     }
-    EVP_MD_CTX_free(md);
 }
 
 static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
