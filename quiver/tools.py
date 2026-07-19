@@ -100,6 +100,11 @@ def rm(root: str, select: pl.Expr | None = None,
         # first) so the sync engine's sequential run stays valid.
         df = df.sort("depth", descending=True) \
                .sort("is_dir", maintain_order=True)   # files, then dirs deep→shallow
+        # stripe the file block across parent dirs (unlink takes the
+        # parent's i_rwsem exclusively — see _stripe_dirs); dirs keep
+        # their positions and parent_row is computed after the permute
+        df = pl.concat([_stripe_dirs(df.filter(~pl.col("is_dir"))),
+                        df.filter(pl.col("is_dir"))])
         paths = df["path"].to_list()
         rows = {}
         base = len(paths)
@@ -169,6 +174,20 @@ def empty_stat() -> pl.DataFrame:
     return pl.DataFrame(schema=SCAN_PL)
 
 
+def _stripe_dirs(df: pl.DataFrame) -> pl.DataFrame:
+    """Round-robin rows across parent directories. The kernel holds the
+    parent dir's i_rwsem exclusively for every create/unlink, so
+    dir-major order convoys the executor's open pool and io-wq on one
+    lock (measured on WEKA: ~2 effective openats in flight out of 16).
+    Striping spreads concurrent ops across directory locks."""
+    if not len(df):
+        return df
+    return (df.with_columns(_d=pl.col("path").str.extract(r"^(.*)/", 1)
+                            .fill_null(""))
+              .with_columns(_r=pl.int_range(pl.len()).over("_d"))
+              .sort(["_r", "_d"]).drop(["_d", "_r"]))
+
+
 def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
               dst_root: str, delete: bool = True
               ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -186,10 +205,12 @@ def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
 
     maxd = int(j["depth"].max() or 0)
     mkdirs = j.filter(in_src & ~in_dst & pl.col("is_dir"))
-    copies = j.filter(in_src & ~pl.col("is_dir").fill_null(False) & (
-        ~in_dst | (pl.col("size") != pl.col("size_d"))
-                | (pl.col("mtime_ns") != pl.col("mtime_ns_d"))))
-    unlinks = j.filter(in_dst & ~in_src & ~pl.col("is_dir_d")) \
+    copies = _stripe_dirs(
+        j.filter(in_src & ~pl.col("is_dir").fill_null(False) & (
+            ~in_dst | (pl.col("size") != pl.col("size_d"))
+                    | (pl.col("mtime_ns") != pl.col("mtime_ns_d")))))
+    unlinks = _stripe_dirs(j.filter(in_dst & ~in_src
+                                    & ~pl.col("is_dir_d"))) \
         if delete else j.clear()
     rmdirs = j.filter(in_dst & ~in_src & pl.col("is_dir_d")) \
         if delete else j.clear()
