@@ -1,78 +1,122 @@
 # IREN/WEKA benchmark — 2026-07-19
 
-The P2 exit criterion from PLAN §9: quiver against pwalk2 and coreutils
-on real WEKA trees. Node `pg12b-4-4-hpc` (24 cores, kernel
-5.15.0-136), WEKA-mounted `/mnt/weka`.
+The P2 exit criterion from PLAN §9: quiver against pwalk2, dust, ducl,
+and coreutils on real WEKA trees. Node `pg12b-4-4-hpc` (24 cores,
+kernel 5.15.0-136), WEKA-mounted `/mnt/weka`. All quiver numbers
+include Python + polars startup (~0.4 s) unless marked as raw scanner.
 
-Kernel note: 5.15 lacks deferred fixed-file assignment (5.17), so COPY
-chains run through the executor's sync fallback — copy numbers below
-are the *floor* for quiver; scan/rm/du run native uring.
+Kernel note: 5.15 lacks deferred fixed-file assignment (5.17+), so the
+executor's direct-fd chains can't run; COPY/CKSUM/SETMETA rows execute
+on the 64-worker sync pool instead (see "what profiling found" below —
+on wekafs that pool *beats* the chains).
 
-## Scan — real audio tree, 365k files (`diverse-speakers/youtube-nocc`)
+## Scan — real audio tree, 365k files / 39k dirs
 
-Full statx of every entry. Two passes each; pass 1 ≈ coldest cache,
-differences between passes were <10% throughout (WEKA metadata is
-RPC-bound either way).
+Full statx of every entry. Two passes; pass-to-pass spread was <10%.
 
 | tool                    | threads | seconds | vs find |
 |-------------------------|--------:|--------:|--------:|
-| find -printf (1 stat/s) |       1 |    54.5 |      1× |
+| find -printf (stats)    |       1 |    54.5 |      1× |
 | quiver scan (uring)     |       8 |     5.1 |     11× |
-| quiver scan (sync)      |       8 |     4.9 |     11× |
 | quiver scan (uring)     |      16 |     2.6 |     21× |
 | pwalk2                  |      16 |     2.6 |     21× |
 | quiver scan (uring)     |      32 |     1.4 |     39× |
 | quiver scan (uring)     |      64 |     1.0 |     52× |
 | pwalk2                  |      64 |     1.1 |     50× |
 | quiver scan (uring)     |     128 |     1.0 |     52× |
-| pwalk2                  |     128 |     1.1 |     50× |
 
-Findings:
-
-- **quiver == pwalk2 thread-for-thread** (2.6 vs 2.6 at t16, 1.0 vs
-  1.1 at t64). The ported worker model reproduces the original's
-  performance while emitting Arrow instead of CSV.
-- Both plateau at ~350k stats/s around 64 threads — the WEKA metadata
-  backend, not the client, is the wall. Default scan threads should be
-  raised from 8 to ~64 for WEKA targets.
-- uring vs sync engine at equal thread count is a wash *for scan* on
-  this kernel: concurrency width (threads × in-flight statx) is what
-  the RPC round-trips reward, exactly as PLAN §1 predicted.
-- The dataset survey also surfaced a pathological target for a future
-  round: a single flat directory holding 40.8M WAVs
-  (`data2/multimodal/core/granary/.../audios/en`), where subtree
-  parallelism is zero and only statx pipelining can help.
+- **quiver == pwalk2 thread-for-thread**; both plateau at ~350k
+  stats/s around 64 threads — the WEKA metadata backend is the wall.
+  CLI default is now `--threads 64`.
+- uring vs sync engine at equal width is a wash for scan on this
+  kernel: statx punts to io-wq threads either way (wchan sampling
+  shows workers in wekafs `commit_blocking_request`); concurrency
+  width is everything, exactly as PLAN §1 predicted.
 
 ## du — same tree
 
-| tool                     | seconds |
-|--------------------------|--------:|
-| quiver du (t16,incl. ~1s Python startup) | 6.0 |
-| du -sb                   |    54.0 |
+| tool                  | seconds |
+|-----------------------|--------:|
+| quiver du (t64)       |     2.1 |
+| dust 1.1.1            | 2.1–2.5 |
+| ducl scan (pwalk2 t64)| 2.2–2.3 |
+| du -sb                |    54.0 |
 
-9×, and quiver's number is mostly the t16 scan — at t64 the scan
-portion drops to ~1s.
+All three parallel tools sit at the same backend plateau; quiver's
+edge is never touching CSV. (An earlier 6s reading was a CLI bug —
+`--threads` parsed but not plumbed; found by cProfile, fixed.)
 
-## cp / sync / rm — synthetic 20k × 1 KB tree on WEKA
+## cp / rm / sync — synthetic 20k × 1 KB tree, 200 dirs
 
-| operation                  | quiver | coreutils |
-|----------------------------|-------:|----------:|
-| cp (20k files, 200 dirs)   |   66.3 |     108.3 |
-| sync (no-op, both sides scanned) | 0.9 | — |
-| rm -r                      |    4.1 |      32.6 |
+| operation                | quiver | coreutils |  ratio |
+|--------------------------|-------:|----------:|-------:|
+| cp                       |    2.5 |     109.2 |    43× |
+| rm -r                    |    1.6 |      32.2 |    20× |
+| sync (no-op, both sides) |    0.9 |         — |      — |
 
-- **rm is 8×**: unlinkat has a native uring opcode, so deletes run at
-  full ring concurrency even on 5.15, epoch barriers included.
-- **cp is 1.6× despite serialized copies** (5.15 fallback): the mkdir
-  epoch runs concurrent on the ring and the sync path spends fewer
-  syscalls per file than cp -a. On a ≥5.17 kernel the copy chains go
-  concurrent; re-measure then.
-- No-op sync converges in 0.9s: two 20k-entry scans + join + empty
-  plan.
+What profiling found, in order (each step verified by re-benchmark):
+
+1. **Directory-lock convoy** (wchan: `rwsem_down_write_slowpath`).
+   The kernel takes the parent dir's i_rwsem exclusively per
+   create/unlink; dir-major command order collapsed 16 concurrent
+   opens to ~2. Fix: the planner stripes copies/unlinks round-robin
+   across parent dirs. cp 56.8→36.9s, rm 4.1→1.6s.
+2. **io-wq punting pathology** (decisive experiment: the same 20k
+   copies as plain userspace threads run in 2.6s at t16 / 0.7s at
+   t64, vs 36s as io_uring chains). On 5.15 every wekafs op is punted
+   to io-wq threads anyway; whatever io-wq serializes on, userspace
+   threads avoid. Fix: the executor's pool executes whole rows via
+   row_sync at 64 workers. cp 36.9→2.5s.
+
+utimensat/chmod on WEKA measured ~17 µs (client-cached) — the SETMETA
+tail is noise, now pooled anyway.
+
+## tar — pack / list / extract, same 20k tree
+
+| operation                        | quiver | GNU tar |
+|----------------------------------|-------:|--------:|
+| pack (create archive)            |    2.3 |     8.4 |
+| list                             |    0.6 |    ~0.0 |
+| extract (all 20k)                |   79.1 |    79.8 |
+| selective extract (100 of 20k)   |    1.0 |     0.5 |
+
+- **pack is 3.7×**: cum_sum layout → concurrent reads + offset writes
+  into one archive fd beat tar's serial append. Output verified by
+  GNU tar; 50 random members byte-identical.
+- **extract is the open gap**: quiver's extract is still a serial
+  Python loop, and both it and GNU tar hit the same ~4 ms/file create
+  wall (79s). The cp result bounds the fix: planning extraction as
+  executor rows (an archive-read mirror of COPY) should land near
+  cp's 2.5s — ~30× headroom. P2/P3 item.
+- list/selective on a 20 MB page-cache-hot archive can't show the
+  footer's advantage (tar full-scans 20 MB in noise time); the
+  scale story — one footer read vs 10M header parses, ranged reads
+  vs full scan — needs a multi-GB cold-cache run to demonstrate.
+
+## Local NVMe (login node, ext4, warm cache, 20k files)
+
+- Raw scanner: 22–29 ms at t8–16 — **3–4× faster than stat-forcing
+  `find`** (80–100 ms). The old "find beats scan" reading compared a
+  dirent-only `find` (no stats, 40 ms) against a full statx scan
+  through the Python wire layer; bench.py now uses `-printf` for the
+  honest baseline.
+- wire.scan (Python end-to-end): ~53–69 ms — ~1.5 µs/row parse cost.
+- rm: executor ≈ `rm -rf` per-op (uring 381 ms vs sync 481 ms for the
+  execute phase; `rm -rf` 296 ms total); the remaining gap is the
+  fixed scan+plan+spawn ~0.2 s, which amortizes with tree size.
+- Python startup (~0.3–0.4 s) dominates only trivial jobs.
+
+## Profiling notes (perf_event_paranoid=4 on nodes — no perf/BPF)
+
+Unprivileged substitutes that were enough to find everything above:
+strace -c (syscall time), /proc/PID/task/*/wchan sampling (off-CPU
+wait channels), cProfile (Python side), and targeted C experiments.
+Getting real perf/bpftrace on the fleet needs a research-infra change
+(`kernel.perf_event_paranoid=1` + linux-tools) — worth doing before
+the next optimization round.
 
 ## Reproduction
 
-`tests/bench-weka.sh` (this run's harness):
-scan/du against a real tree read-only; cp/sync/rm against a synthetic
-tree created under the runner's own space; every number is a single
-`BENCH name seconds` line for easy diffing between runs.
+`quiver/tests/bench-weka.sh` — scan/du read-only against a real tree,
+cp/sync/rm/pack against synthetic trees in the runner's own space.
+Every number is a `BENCH name seconds` line for diffing between runs.
