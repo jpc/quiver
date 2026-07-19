@@ -547,6 +547,39 @@ typedef struct {
     int short_read; uint8_t *buf; int slot;
 } RowState;
 
+/* Pre-5.17 kernels assign fixed-file slots at submit time, so a linked op
+ * cannot see the slot its own chain's openat_direct fills ("io_uring:
+ * defer file assignment", v5.17) — the read gets -EBADF. Probe once at
+ * init; without the capability, slot-using COPY rows run through the
+ * sync path while single-op rows (unlink/mkdir/fsync) stay on the ring. */
+static int g_deferred_fd = 1;
+
+static void probe_deferred_fd(struct io_uring *ring) {
+    char b;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_openat_direct(sqe, AT_FDCWD, "/dev/null", O_RDONLY, 0, 0);
+    sqe->flags |= IOSQE_IO_LINK; sqe->user_data = 1;
+    sqe = io_uring_get_sqe(ring);
+    io_uring_prep_read(sqe, 0, &b, 1, 0);
+    sqe->flags |= IOSQE_FIXED_FILE; sqe->user_data = 2;
+    if (io_uring_submit_and_wait(ring, 2) < 0) { g_deferred_fd = 0; return; }
+    struct io_uring_cqe *cqe;
+    unsigned head, seen = 0;
+    io_uring_for_each_cqe(ring, head, cqe) {
+        seen++;
+        if (cqe->user_data == 2 && cqe->res == -EBADF) g_deferred_fd = 0;
+    }
+    io_uring_cq_advance(ring, seen);
+    sqe = io_uring_get_sqe(ring);        /* free slot 0 (EBADF if empty: fine) */
+    io_uring_prep_close_direct(sqe, 0);
+    sqe->user_data = 3;
+    if (io_uring_submit_and_wait(ring, 1) == 1) {
+        seen = 0;
+        io_uring_for_each_cqe(ring, head, cqe) seen++;
+        io_uring_cq_advance(ring, seen);
+    }
+}
+
 static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                            RowResult *out) {
     int64_t n = c->n_rows;
@@ -620,6 +653,10 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 /* unified COPY */
                 int64_t dlen = c->dst[i][0] ? (int64_t)strlen(c->dst[i]) : 0;
                 int has_dst = dlen > 0;
+                if ((size > 0 || has_dst) && !g_deferred_fd) {
+                    row_sync(c, i, afd, &out[i]);   /* pre-5.17: no direct-fd chains */
+                    COMPLETE(i); continue;
+                }
                 if ((size > 0 || has_dst) && n_free == 0) {
                     ready[n_ready++] = i;          /* retry when a slot frees */
                     break;
@@ -1196,14 +1233,30 @@ int main(int argc, char **argv) {
 
     struct io_uring ring;
     if (use_uring) {
-        if (io_uring_queue_init(QD, &ring, 0) < 0 ||
-            io_uring_register_files_sparse(&ring, 2 * WINDOW) < 0) {
-            if (strcmp(mode, "uring") == 0) { perror("io_uring"); return 2; }
+        int rc = io_uring_queue_init(QD, &ring, 0);
+        if (rc == 0) {
+            rc = io_uring_register_files_sparse(&ring, 2 * WINDOW);
+            if (rc == -EINVAL) {
+                /* pre-5.19 kernel: no RSRC sparse registration; a plain
+                 * register with -1 entries gives the same direct-fd table
+                 * (sparse entries since 5.12, file_index opens since 5.15) */
+                int fds[2 * WINDOW];
+                for (int i = 0; i < 2 * WINDOW; i++) fds[i] = -1;
+                rc = io_uring_register_files(&ring, fds, 2 * WINDOW);
+            }
+        }
+        if (rc < 0) {
+            if (strcmp(mode, "uring") == 0) {
+                fprintf(stderr, "io_uring: %s\n", strerror(-rc));
+                return 2;
+            }
             use_uring = 0;
         }
+        if (use_uring) probe_deferred_fd(&ring);
     }
-    fprintf(stderr, "quiver-exec %s: engine=%s\n", argv[1],
-            use_uring ? "uring" : "sync");
+    fprintf(stderr, "quiver-exec %s: engine=%s%s\n", argv[1],
+            use_uring ? "uring" : "sync",
+            use_uring && !g_deferred_fd ? " (copy=sync: pre-5.17 kernel)" : "");
 
     if (!strcmp(argv[1], "exec")) {
         int afd = -1;
