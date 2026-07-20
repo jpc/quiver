@@ -391,6 +391,36 @@ def test_ssh(tmp):
     ok("ssh: remote scan+sync (inline chunk chains)+verify, corruption "
        "caught by wire-crossing hashes only")
 
+def test_zframe(tmp):
+    try:
+        import zstandard  # noqa
+    except ImportError:
+        return
+    import io, tarfile, subprocess as sp
+    from quiver.nock import zframe
+    # two source tars → verify compat, round-trip, batch random access, merge
+    def mk(path, pfx, n):
+        with tarfile.open(path, "w") as tf:
+            for i in range(n):
+                b = (f"{pfx}-{i}-").encode() * (30 + i % 40)
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+    mk(str(tmp/"za.tar"), "a", 200); mk(str(tmp/"zb.tar"), "b", 120)
+    out = str(tmp/"z.zframe.zstd")
+    df = zframe.recompress([str(tmp/"za.tar"), str(tmp/"zb.tar")], out,
+                           batch_bytes=32 << 10)
+    assert df.height == 320 and df["frame"].n_unique() > 1
+    # standard tools read it (skippable footer ignored, one clean tar)
+    n = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
+               capture_output=True, text=True).stdout.strip()
+    assert n == "320", n
+    # random-access extract of one member from the 2nd input matches
+    zframe.extract(out, str(tmp/"zx"), pl.col("path") == "b/f0100")
+    with tarfile.open(str(tmp/"zb.tar")) as tf:
+        assert (tmp/"zx"/"b"/"f0100").read_bytes() == \
+            tf.extractfile("b/f0100").read()
+    ok("zframe: per-batch frames — tar-compatible, merge, batch extract")
+
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars
     # subtree partition, the fan-out/barrier, and the root-op handling
@@ -450,7 +480,8 @@ def main():
     for t in (test_scan, test_pack, test_tools, test_retrofit,
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
-              test_streaming, test_ssh, test_multi, test_cksum_parallel,
+              test_streaming, test_ssh, test_multi, test_zframe,
+              test_cksum_parallel,
               test_p1_barrier):
         t(tmp)
     shutil.rmtree(tmp)

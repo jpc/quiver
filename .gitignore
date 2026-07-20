@@ -6,3 +6,7 @@ quiver/exec/ipc_gen.h
 *.wal.done
 dist/
 *.egg-info/
+
+# large data archives (never commit)
+*.tar.zstd
+*.tar.zst
