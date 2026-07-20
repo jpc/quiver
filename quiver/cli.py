@@ -65,13 +65,12 @@ def main(argv=None):
                 f"{int(eta)%3600//60:02d}:{int(eta)%60:02d}   ")
             sys.stderr.flush()
 
-        df = zframe.recompress(a.inputs, a.out,
-                               batch_bytes=int(a.batch_mb * (1 << 20)),
-                               level=a.level, workers=a.workers,
-                               limit=a.limit, progress=_prog)
+        res = zframe.recompress(a.inputs, a.out,
+                                batch_bytes=int(a.batch_mb * (1 << 20)),
+                                level=a.level, workers=a.workers,
+                                limit=a.limit, progress=_prog)
         sys.stderr.write("\n")
-        print(f"{df.height} members, {df['frame'].n_unique()} frames "
-              f"-> {a.out}")
+        print(f"{res.members} members, {res.frames} frames -> {a.out}")
 
 
 if __name__ == "__main__":

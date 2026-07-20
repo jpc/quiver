@@ -407,9 +407,9 @@ def test_zframe(tmp):
                 ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
     mk(str(tmp/"za.tar"), "a", 200); mk(str(tmp/"zb.tar"), "b", 120)
     out = str(tmp/"z.zframe.zstd")
-    df = zframe.recompress([str(tmp/"za.tar"), str(tmp/"zb.tar")], out,
-                           batch_bytes=32 << 10)
-    assert df.height == 320 and df["frame"].n_unique() > 1
+    res = zframe.recompress([str(tmp/"za.tar"), str(tmp/"zb.tar")], out,
+                            batch_bytes=32 << 10)
+    assert res.members == 320 and res.frames > 1
     # standard tools read it (skippable footer ignored, one clean tar)
     n = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
                capture_output=True, text=True).stdout.strip()

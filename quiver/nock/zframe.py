@@ -44,14 +44,18 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures as cf
+import io
 import os
 import struct
+import tempfile
 import time
 
+import numpy as np
 import polars as pl
 import zstandard as zstd
 
 from . import footer as _footer
+from ..pupyarrow.writer import StreamReader, StreamWriter
 
 SKIP_MAGIC = 0x184D2A50           # zstd skippable-frame magic (base .0-.F)
 
@@ -152,6 +156,54 @@ _ZF_SCHEMA = {
     "frame": pl.Int32, "frame_coff": pl.Int64,
     "frame_clen": pl.Int64, "in_off": pl.Int64}
 
+_FOOTER_IPC = [("path", "large_string"), ("size", "i64"), ("mode", "i32"),
+               ("mtime_ns", "i64"), ("uid", "i32"), ("gid", "i32"),
+               ("frame", "i32"), ("frame_coff", "i64"),
+               ("frame_clen", "i64"), ("in_off", "i64")]
+_FNUM_DT = [np.int64, np.int32, np.int64, np.int32, np.int32,
+            np.int32, np.int64, np.int64, np.int64]   # the 9 numeric cols
+
+Result = collections.namedtuple("Result", "members frames")
+
+
+class _FooterStream:
+    """Streams footer rows to an Arrow IPC stream (pupyarrow StreamWriter),
+    flushing a record batch every `flush_rows` — so only one batch of
+    footer rows lives in memory, not the whole (potentially 100M-row)
+    index. Columns are accumulated as Python lists and converted to numpy
+    at flush (strings stay lists)."""
+    def __init__(self, fileobj, flush_rows: int = 1_000_000):
+        self.sw = StreamWriter(fileobj, _FOOTER_IPC)
+        self.flush_rows = flush_rows
+        self.paths: list[str] = []
+        self.nums: list[list] = [[] for _ in range(9)]
+        self.n = self.members = 0
+
+    def add(self, path, size, mode, mtime_ns, uid, gid,
+            frame, coff, clen, in_off):
+        self.paths.append(path)
+        for col, v in zip(self.nums, (size, mode, mtime_ns, uid, gid,
+                                      frame, coff, clen, in_off)):
+            col.append(v)
+        self.n += 1
+        self.members += 1
+        if self.n >= self.flush_rows:
+            self.flush()
+
+    def flush(self):
+        if not self.n:
+            return
+        cols = [self.paths] + [np.asarray(self.nums[i], dtype=_FNUM_DT[i])
+                               for i in range(9)]
+        self.sw.write_batch(cols)
+        self.paths = []
+        self.nums = [[] for _ in range(9)]
+        self.n = 0
+
+    def close(self):
+        self.flush()
+        self.sw.close()
+
 
 def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
                level: int = 10, workers: int | None = None,
@@ -176,13 +228,14 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
     compressor (safe); GIL is released in zstd, giving real parallelism.
     """
     workers = workers or min(16, (os.cpu_count() or 4))
-    rows: list[dict] = []
     coff = fidx = nmembers = 0
     buf = bytearray()
     frame_base = 0        # continuous-stream offset of the NEXT frame
     stream_off = 0        # total tar bytes emitted so far
-    pending: list[tuple[dict, int]] = []   # (row, data_off) for current buf
+    pending: list[tuple] = []      # (path,size,mode,mtime,uid,gid,doff) per buf
     fout = open(out_path, "wb")
+    ftmp = tempfile.TemporaryFile()        # footer IPC stream, spills to disk
+    fw = _FooterStream(ftmp)
     pool = cf.ThreadPoolExecutor(max_workers=workers)
     inflight: collections.deque = collections.deque()  # (future, rows, base)
 
@@ -214,11 +267,11 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
         fut, rws, base = inflight.popleft()
         comp = fut.result()                 # waits for this frame's compress
         fout.write(comp)
-        for row, doff in rws:
-            row.update(frame=fidx, frame_coff=coff, frame_clen=len(comp),
-                       in_off=doff - base)
-            rows.append(row)
-        coff += len(comp)
+        clen = len(comp)
+        for (path, size, mode, mtime, uid, gid, doff) in rws:
+            fw.add(path, size, mode, mtime, uid, gid,
+                   fidx, coff, clen, doff - base)
+        coff += clen
         fidx += 1
 
     def flush():
@@ -247,10 +300,8 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
                     stream_off += len(mraw)
                     if name is not None:
                         pending.append((
-                            {"path": name.decode("utf-8", "surrogateescape"),
-                             "size": size, "mode": mode,
-                             "mtime_ns": mtime * 10**9,
-                             "uid": uid, "gid": gid}, data_off))
+                            name.decode("utf-8", "surrogateescape"),
+                            size, mode, mtime * 10**9, uid, gid, data_off))
                         nmembers += 1
                     if len(buf) >= batch_bytes:
                         flush()
@@ -266,23 +317,62 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
             drain_one()
         report(None, force=True)
 
-        df = pl.DataFrame(rows, schema=_ZF_SCHEMA)
-        feat = _footer._feather_bytes(df, {"nock_version": "1",
-                                           "nock_host": "zframe"})
-        payload = feat + struct.pack("<Q", len(feat)) + _footer.MAGIC
-        fout.write(struct.pack("<II", SKIP_MAGIC, len(payload)))
-        fout.write(payload)
+        # footer is now a finished IPC stream on `ftmp` (bounded memory).
+        fw.close()
+        flen = ftmp.tell()
+        # trailer: [len][MAGIC], self-locating from EOF like every nock host.
+        # ≤4 GB → one zstd skippable frame (standard tools skip it); larger
+        # → a .nock sidecar (the archive stays a clean multi-frame tar.zstd).
+        trailer = struct.pack("<Q", flen) + _footer.MAGIC
+        if flen + len(trailer) <= 0xFFFFFFFF:
+            fout.write(struct.pack("<II", SKIP_MAGIC, flen + len(trailer)))
+            ftmp.seek(0)
+            while True:
+                chunk = ftmp.read(1 << 20)
+                if not chunk:
+                    break
+                fout.write(chunk)
+            fout.write(trailer)
+        else:
+            with open(out_path + ".nock", "wb") as side:
+                ftmp.seek(0)
+                while True:
+                    chunk = ftmp.read(1 << 20)
+                    if not chunk:
+                        break
+                    side.write(chunk)
+                side.write(trailer)
     finally:
         pool.shutdown(wait=True)
+        ftmp.close()
         fout.close()
-    return df
+    return Result(members=fw.members, frames=fidx)
+
+
+def _footer_bytes(path: str) -> bytes:
+    """Return the raw footer IPC-stream bytes, from the embedded skippable
+    frame or the .nock sidecar."""
+    side = path + ".nock"
+    if os.path.exists(side):
+        with open(side, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            f.seek(end - _footer.TRAILER_LEN)
+            (flen,) = struct.unpack("<Q", f.read(8))
+            f.seek(0)
+            return f.read(flen)
+    with open(path, "rb") as f:
+        off, n = _footer._locate_trailer(f)   # EOF-anchored, ignores skip hdr
+        f.seek(off)
+        return f.read(n)
 
 
 def read_index(path: str) -> pl.DataFrame:
-    """Footer frame (member → frame + in-frame offset). Reuses nock's
-    EOF-anchored trailer locator — the skippable-frame prefix sits before
-    the feather and is ignored."""
-    return _footer.read_index(path)
+    """Footer frame (member → frame + in-frame offset), read from the
+    streamed IPC footer via pupyarrow (concatenating its batches)."""
+    data = _footer_bytes(path)
+    dfs = [pl.DataFrame(b) for b in StreamReader(io.BytesIO(data))]
+    return (pl.concat(dfs) if dfs else pl.DataFrame(schema=_ZF_SCHEMA))
 
 
 def extract(path: str, dest: str, predicate: pl.Expr | None = None):
