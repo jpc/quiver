@@ -93,6 +93,27 @@ tail is noise, now pooled anyway.
   scale story — one footer read vs 10M header parses, ranged reads
   vs full scan — needs a multi-GB cold-cache run to demonstrate.
 
+## Phase split — where each tool's time goes (2026-07-20, final code)
+
+In-process (no Python startup), t64, warm-ish WEKA caches. wire.scan /
+run_commands wrapped with timers; plan = total − scan − execute.
+
+| tool                    | total | scan | plan | exec | coreutils |
+|-------------------------|------:|-----:|-----:|-----:|----------:|
+| du (real 365k tree)     |   1.5 |  1.1 |  0.3 |    — |      54.0 |
+| cp 20k                  |   1.8 |  0.1 |  0.1 |  1.5 |     109.2 |
+| sync no-op 20k          |   0.2 |  0.1 |  0.0 |  0.0 |         — |
+| pack (tar) 20k          |   1.5 |  0.2 |  0.5 |  0.8 |       8.6 |
+| extract 20k             |   1.5 |  0.0 |  0.0 |  1.4 |      79.8 |
+| extract selective (100) |   0.2 |  0.0 |  0.0 |  0.2 |       0.5 |
+| rm 20k                  |   1.0 |  0.1 |  0.0 |  0.9 |      32.2 |
+
+Every tool is execute-bound at ~40–75 µs/file effective — the wall is
+WEKA op throughput, not quiver structure (bare-copy floor at t64 was
+0.7 s). Scan and plan are noise everywhere except pack's 0.5 s plan
+(cum_sum layout + tar-header expressions) and du's 0.3 s aggregation.
+Add ~0.4 s Python startup for one-shot CLI invocations.
+
 ## Local NVMe (login node, ext4, warm cache, 20k files)
 
 - Raw scanner: 22–29 ms at t8–16 — **3–4× faster than stat-forcing
