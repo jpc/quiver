@@ -114,6 +114,29 @@ WEKA op throughput, not quiver structure (bare-copy floor at t64 was
 (cum_sum layout + tar-header expressions) and du's 0.3 s aggregation.
 Add ~0.4 s Python startup for one-shot CLI invocations.
 
+## 10× scale — 200k files / 2000 dirs / 307 MiB archive
+
+Same harness, same phase split. Scaling vs the 20k table is linear or
+better everywhere; no phase goes super-linear.
+
+| tool                    | total | scan | plan | exec | vs 20k |
+|-------------------------|------:|-----:|-----:|-----:|-------:|
+| scan 200k               |   0.9 |  0.9 |    — |    — |   ~5× |
+| du 200k                 |   0.6 |  0.5 |  0.1 |    — |      — |
+| cp 200k                 |  17.3 |  0.9 |  0.6 | 15.8 |   9.6× |
+| sync no-op 200k         |   1.5 |  1.5 |  0.0 |  0.0 |   7.5× |
+| pack (tar) 200k         |  13.9 |  2.1 |  4.3 |  7.6 |   9.3× |
+| extract 200k            |  15.7 |  0.1 |  0.4 | 15.3 |  10.5× |
+| extract selective (100) |   0.2 |  0.1 |  0.0 |  0.2 |     1× |
+| rm 200k                 |  ~10  |  0.6 |  0.3 |  9.4 |    10× |
+
+Coreutils at this scale: tar -cf 87.9 s (6.3×), rm -rf 322.7 s (31×);
+cp -a extrapolates to ~18 min (~63×). Steady-state rates: ~12.7k
+copies/s, ~20k unlinks/s, ~12.7k extracts/s. Selective extract stays
+constant-time — the footer's point. pack's plan (header expressions +
+cum_sum) is linear at ~21 µs/row and is now its largest
+non-executor cost.
+
 ## Local NVMe (login node, ext4, warm cache, 20k files)
 
 - Raw scanner: 22–29 ms at t8–16 — **3–4× faster than stat-forcing
