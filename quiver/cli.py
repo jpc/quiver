@@ -21,6 +21,13 @@ def main(argv=None):
     sp.add_argument("--tar", action="store_true")
     sp = sub.add_parser("nock"); sp.add_argument("paths", nargs=1)
     sp = sub.add_parser("extract"); sp.add_argument("paths", nargs=2)
+    sp = sub.add_parser("recompress",
+                        help="tar/tar.zstd... -> per-batch-frame zstd nock")
+    sp.add_argument("out"); sp.add_argument("inputs", nargs="+")
+    sp.add_argument("--batch-mb", type=float, default=16.0)
+    sp.add_argument("--level", type=int, default=10)
+    sp.add_argument("--limit", type=int, default=None,
+                    help="max members per input (sampling)")
     a = p.parse_args(argv)
     eng, thr = a.engine, a.threads
     if a.cmd == "du":
@@ -42,6 +49,13 @@ def main(argv=None):
         print(nock.index_tar(a.paths[0]).height, "members indexed")
     elif a.cmd == "extract":
         print(f"{len(nock.extract(a.paths[0], a.paths[1], engine=eng))} extracted")
+    elif a.cmd == "recompress":
+        from .nock import zframe
+        df = zframe.recompress(a.inputs, a.out,
+                               batch_bytes=int(a.batch_mb * (1 << 20)),
+                               level=a.level, limit=a.limit)
+        print(f"{df.height} members, {df['frame'].n_unique()} frames "
+              f"-> {a.out}")
 
 
 if __name__ == "__main__":

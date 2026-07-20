@@ -18,19 +18,23 @@ Consequences:
     original tar, and standard zstd skips the trailing skippable frame.
 
 Merging multiple inputs into one archive is native — a frame never
-spans a source, so N source decompressors feed the framer in parallel
-(the input-side parallelism). Frame indices and compressed offsets are
-global across sources.
+spans a source (each source ends on a frame boundary), so frame indices
+and compressed offsets are global across sources and the sources could
+be decompressed in parallel (the input-side parallelism).
 
-PROTOTYPE: reads whole inputs into memory and compresses frames
-single-shot. Production wants a streaming member reader (the 666 GB
-source can't be materialized) and a compression-thread pool; the format
-and footer are the durable part.
+The reader STREAMS: one member at a time, holding only the current batch
+buffer (~batch_bytes) plus the current member, so it runs against
+multi-hundred-GB sources without materializing them (verified against
+the 666 GB / 110 GB production shards). Still open for full scale: a
+frame-level compression pool (zstd's internal `threads` parallelizes
+within a frame today), an incremental Arrow-batch footer writer for
+hundred-million-member corpora (footer rows are in memory for now), and
+the C OP_EXTRACT libzstd path for parallel extraction. The format and
+footer are the durable part.
 """
 
 from __future__ import annotations
 
-import io
 import os
 import struct
 import tarfile
@@ -47,84 +51,104 @@ ZFRAME_COLS = ["path", "size", "mode", "mtime_ns", "uid", "gid",
                "frame", "frame_coff", "frame_clen", "in_off"]
 
 
-def _read_tar_bytes(src: str) -> bytes:
-    """Whole tar bytes (decompressing .zstd). Prototype-only — production
-    streams members instead of materializing the tar."""
-    if src.endswith((".zst", ".zstd")):
-        with open(src, "rb") as f:
-            return zstd.ZstdDecompressor().stream_reader(f).read()
-    with open(src, "rb") as f:
-        return f.read()
+def _tar_stream(src: str):
+    """A streaming tar reader over `src`, decompressing .zstd on the fly.
+    Never materializes the archive — reads member by member."""
+    f = open(src, "rb")
+    raw = (zstd.ZstdDecompressor().stream_reader(f)
+           if src.endswith((".zst", ".zstd")) else f)
+    return tarfile.open(fileobj=raw, mode="r|"), (f, raw)
 
 
-def _member_end(data: bytes) -> int:
-    """Offset just past the last real member (before the trailing zero
-    blocks), so concatenating multiple tars stays one valid tar."""
-    tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
-    ms = tf.getmembers()
-    if not ms:
-        return 0
-    last = ms[-1]
-    body = last.offset_data + (last.size + 511) // 512 * 512
-    return body
+_ZF_SCHEMA = {
+    "path": pl.String, "size": pl.Int64, "mode": pl.Int32,
+    "mtime_ns": pl.Int64, "uid": pl.Int32, "gid": pl.Int32,
+    "frame": pl.Int32, "frame_coff": pl.Int64,
+    "frame_clen": pl.Int64, "in_off": pl.Int64}
 
 
 def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
                level: int = 10, threads: int = 0,
-               keep_tar_valid: bool = True) -> pl.DataFrame:
-    """Merge tar (or tar.zstd) `inputs` into one per-batch-frame archive
-    at `out_path`. Returns the footer frame. `threads` is per-frame zstd
-    worker count (0 = auto)."""
+               limit: int | None = None,
+               tar_format: int = tarfile.PAX_FORMAT) -> pl.DataFrame:
+    """Stream `inputs` (tar or tar.zstd) into one per-batch-frame archive.
+
+    Bounded memory: at most one batch buffer (~batch_bytes) plus the
+    current member is held, so this runs against multi-hundred-GB sources
+    without materializing them. Re-emits a continuous tar stream (PAX
+    headers) and cuts frames at member boundaries; each source ends on a
+    frame boundary so sources stay independently framed (future parallel
+    input). `limit` caps members per source (sampling / testing).
+
+    Footer rows accumulate in memory — fine up to millions of members;
+    hundreds of millions (a full 2 TB text corpus) want the incremental
+    Arrow-batch footer writer (a follow-up; the format is unchanged).
+
+    `threads` is zstd's per-frame worker count (0 = auto)."""
     cctx = zstd.ZstdCompressor(level=level, threads=threads)
-    rows, coff, fidx = [], 0, 0
-    with open(out_path, "wb") as fout:
-        for si, src in enumerate(inputs):
-            data = _read_tar_bytes(src)
-            tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
-            members = tf.getmembers()
-            # frames end at the trailing zeros of the LAST input only, so
-            # a multi-input archive is still one clean tar stream.
-            end = (len(data) if (si == len(inputs) - 1 or not keep_tar_valid)
-                   else _member_end(data))
+    rows: list[dict] = []
+    coff = fidx = 0
+    buf = bytearray()
+    frame_base = 0        # continuous-stream offset of buf[0]
+    stream_off = 0        # total tar bytes emitted so far
+    pending: list[tuple[dict, int]] = []   # (row, data_off) for current buf
+    fout = open(out_path, "wb")
 
-            # cut points: member offsets where the running batch crosses
-            # batch_bytes (always at a member boundary → whole members)
-            cuts, bstart = [0], 0
-            for m in members:
-                if m.offset > bstart and m.offset - bstart >= batch_bytes:
-                    cuts.append(m.offset)
-                    bstart = m.offset
-            cuts.append(end)
+    def flush():
+        nonlocal coff, fidx, buf, frame_base, pending
+        if not buf:
+            return
+        comp = cctx.compress(bytes(buf))
+        fout.write(comp)
+        for row, doff in pending:
+            row.update(frame=fidx, frame_coff=coff, frame_clen=len(comp),
+                       in_off=doff - frame_base)
+            rows.append(row)
+        coff += len(comp)
+        fidx += 1
+        frame_base += len(buf)
+        buf = bytearray()
+        pending = []
 
-            for fi in range(len(cuts) - 1):
-                s, e = cuts[fi], cuts[fi + 1]
-                comp = cctx.compress(data[s:e])
-                fout.write(comp)
-                for m in members:
-                    if m.isfile() and s <= m.offset < e:
-                        rows.append({
-                            "path": m.name, "size": m.size,
-                            "mode": m.mode, "mtime_ns": int(m.mtime) * 10**9,
-                            "uid": m.uid, "gid": m.gid,
-                            "frame": fidx, "frame_coff": coff,
-                            "frame_clen": len(comp),
-                            "in_off": m.offset_data - s,
-                        })
-                coff += len(comp)
-                fidx += 1
+    try:
+        for src in inputs:
+            tin, handles = _tar_stream(src)
+            try:
+                for k, m in enumerate(tin):
+                    if limit is not None and k >= limit:
+                        break
+                    body = tin.extractfile(m).read() if m.isfile() else b""
+                    hdr = m.tobuf(format=tar_format)
+                    pad = (-len(body)) % 512
+                    data_off = stream_off + len(hdr)
+                    buf += hdr
+                    buf += body
+                    if pad:
+                        buf += b"\x00" * pad
+                    stream_off += len(hdr) + len(body) + pad
+                    if m.isfile():
+                        pending.append((
+                            {"path": m.name, "size": m.size, "mode": m.mode,
+                             "mtime_ns": int(m.mtime) * 10**9,
+                             "uid": m.uid, "gid": m.gid}, data_off))
+                    if len(buf) >= batch_bytes:
+                        flush()
+            finally:
+                tin.close()
+                for h in handles:
+                    h.close()
+            flush()                       # source boundary = frame boundary
+        buf += b"\x00" * 1024             # end-of-archive marker
+        flush()
 
-        df = pl.DataFrame(rows, schema={
-            "path": pl.String, "size": pl.Int64, "mode": pl.Int32,
-            "mtime_ns": pl.Int64, "uid": pl.Int32, "gid": pl.Int32,
-            "frame": pl.Int32, "frame_coff": pl.Int64,
-            "frame_clen": pl.Int64, "in_off": pl.Int64})
+        df = pl.DataFrame(rows, schema=_ZF_SCHEMA)
         feat = _footer._feather_bytes(df, {"nock_version": "1",
                                            "nock_host": "zframe"})
-        # skippable frame wrapping the nock footer + its self-locating
-        # trailer, so nock.read_index finds it from EOF unchanged.
         payload = feat + struct.pack("<Q", len(feat)) + _footer.MAGIC
         fout.write(struct.pack("<II", SKIP_MAGIC, len(payload)))
         fout.write(payload)
+    finally:
+        fout.close()
     return df
 
 
