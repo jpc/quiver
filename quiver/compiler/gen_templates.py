@@ -12,12 +12,16 @@ SCHEMAS = {
     "COMP": ([("user_data","u64"),("res","i32"),("read_size","i64"),
               ("cksum","u64"),("etag","large_binary"),("parts","i32")],
              [[1,2],[0,-5],[10,20],[3,4],[b"aa",b"bb"],[0,2]]),
+    # child_count: -1 on a normal stat row; >=0 marks a directory
+    # close-event (path=dir, is_dir=1) carrying its emitted-child count,
+    # emitted at getdents-EOF only when the scan is asked for closes.
     "STAT": ([("path","large_string"),("size","i64"),("blocks","i64"),
               ("mtime_ns","i64"),("atime_ns","i64"),("ctime_ns","i64"),
               ("ino","u64"),("parent_ino","u64"),("dev","u64"),
               ("mode","i32"),("uid","i32"),("gid","i32"),("nlink","i32"),
-              ("depth","i32"),("is_dir","u8")],
-             [["a","bb"]] + [[1,2]]*5 + [[3,4]]*3 + [[5,6]]*5 + [[0,1]]),
+              ("depth","i32"),("is_dir","u8"),("child_count","i64")],
+             [["a","bb"]] + [[1,2]]*5 + [[3,4]]*3 + [[5,6]]*5
+             + [[0,1]] + [[-1,-1]]),
 }
 
 def carr(name, data):

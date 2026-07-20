@@ -892,6 +892,7 @@ static struct {
     int use_uring;
     const char *prefix;              /* stage-1 pushdown: subtree prune */
     const char *glob;                /* stage-2 pushdown: skip statx    */
+    int emit_closes;                 /* emit dir close-events (rm/rsync) */
     _Atomic long dirs_opened, statx_done, emitted;
 } G;
 
@@ -962,6 +963,7 @@ typedef struct {
     uint64_t *ino, *pino, *dev;
     int32_t *mode, *uid, *gid, *nlink, *depth;
     uint8_t *is_dir;
+    int64_t *child_count;         /* -1 normal row; >=0 dir close-event */
 } StatBuilder;
 
 static void sb_init(StatBuilder *b) {
@@ -977,6 +979,7 @@ static void sb_init(StatBuilder *b) {
     int32_t **i32s[] = {&b->mode,&b->uid,&b->gid,&b->nlink,&b->depth};
     for (unsigned k = 0; k < 5; k++) *i32s[k] = malloc(4 * (size_t)b->cap);
     b->is_dir = malloc((size_t)b->cap);
+    b->child_count = malloc(8 * (size_t)b->cap);
 }
 
 static void sb_row(StatBuilder *b, const char *rel, int64_t rel_len,
@@ -1001,6 +1004,27 @@ static void sb_row(StatBuilder *b, const char *rel, int64_t rel_len,
     b->nlink[i] = (int32_t)sx->stx_nlink;
     b->depth[i] = depth;
     b->is_dir[i] = S_ISDIR(sx->stx_mode) ? 1 : 0;
+    b->child_count[i] = -1;                    /* normal stat row */
+}
+
+/* directory close-event: a row with path=dir, is_dir=1, child_count=N
+ * (its emitted-child count). Consumers keyed on path arithmetic — a
+ * child "d/f" decrements remaining["d"]; dirname of a root child is ""
+ * which is the root's own rel, so the root close event lines up too. */
+static void sb_close(StatBuilder *b, const char *rel, int64_t rel_len,
+                     int64_t nchild, int32_t depth) {
+    while (b->pdata_len + rel_len > b->pdata_cap)
+        b->pdata = realloc(b->pdata, (size_t)(b->pdata_cap *= 2));
+    memcpy(b->pdata + b->pdata_len, rel, (size_t)rel_len);
+    b->pdata_len += rel_len;
+    int64_t i = b->n++;
+    b->poff[i + 1] = b->pdata_len;
+    b->size[i] = 0; b->blocks[i] = 0;
+    b->mtime[i] = 0; b->atime[i] = 0; b->ctime[i] = 0;
+    b->ino[i] = 0; b->pino[i] = 0; b->dev[i] = 0;
+    b->mode[i] = 0; b->uid[i] = 0; b->gid[i] = 0; b->nlink[i] = 0;
+    b->depth[i] = depth; b->is_dir[i] = 1;
+    b->child_count[i] = nchild;
 }
 
 static int sb_flush(StatBuilder *b) {          /* holds the output mutex */
@@ -1014,6 +1038,7 @@ static int sb_flush(StatBuilder *b) {          /* holds the output mutex */
         {NULL,0},{b->mode, 4*b->n}, {NULL,0},{b->uid, 4*b->n},
         {NULL,0},{b->gid, 4*b->n}, {NULL,0},{b->nlink, 4*b->n},
         {NULL,0},{b->depth, 4*b->n}, {NULL,0},{b->is_dir, b->n},
+        {NULL,0},{b->child_count, 8*b->n},
     };
     pthread_mutex_lock(&G.out_mu);
     int rc = emit_batch(1, STAT_BATCH_TMPL, STAT_TMPL_LEN,
@@ -1109,7 +1134,8 @@ static void stat_batch_reap(Worker *w, Ent *ents, int cnt) {
 }
 
 static void process_batch(Worker *w, const char *dir_rel, uint64_t dir_ino,
-                          int32_t depth, Ent *ents, int cnt) {
+                          int32_t depth, Ent *ents, int cnt,
+                          int64_t *nchild) {
     char rel[4400];
     for (int k = 0; k < cnt; k++) {
         if (!ents[k].valid) continue;
@@ -1120,6 +1146,7 @@ static void process_batch(Worker *w, const char *dir_rel, uint64_t dir_ino,
         if (emit) {
             sb_row(&w->b, rel, rl, &ents[k].stx, dir_ino, depth + 1);
             atomic_fetch_add(&G.emitted, 1);
+            (*nchild)++;    /* one decrement of this dir (unlink or rmdir) */
         }
         if (S_ISDIR(ents[k].stx.stx_mode)) {
             Work *nw = malloc(sizeof(Work) + (size_t)rl + 1);
@@ -1143,6 +1170,7 @@ static void *scan_worker(void *arg) {
         int dfd = open(abs, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {
             atomic_fetch_add(&G.dirs_opened, 1);
+            int64_t nchild = 0;
             int a = 0, cntA = 0, cntB = 0, eof = 0;
             read_batch(w, dfd, w->batch[a], &cntA, &eof);
             cntA = filter_batch(wk->rel, w->batch[a], cntA);
@@ -1163,10 +1191,15 @@ static void *scan_worker(void *arg) {
                     atomic_fetch_add(&G.statx_done, cntA);
                 }
                 process_batch(w, wk->rel, wk->dir_ino, wk->depth,
-                              w->batch[a], cntA);
+                              w->batch[a], cntA, &nchild);
                 a = 1 - a; cntA = cntB;
             }
             close(dfd);
+            if (G.emit_closes) {                /* dir fully walked */
+                if (w->b.n >= SCAN_BATCH) sb_flush(&w->b);
+                sb_close(&w->b, wk->rel, (int64_t)strlen(wk->rel),
+                         nchild, wk->depth);
+            }
         }
         free(wk);
         if (atomic_fetch_sub(&G.in_flight, 1) == 1) {
@@ -1180,10 +1213,10 @@ static void *scan_worker(void *arg) {
 }
 
 static int run_scan(const char *root, int use_uring, int threads,
-                    const char *prefix, const char *glob) {
+                    const char *prefix, const char *glob, int emit_closes) {
     emit_schema(1, STAT_SCHEMA_META, STAT_SCHEMA_LEN);
     G.root = root; G.use_uring = use_uring;
-    G.prefix = prefix; G.glob = glob;
+    G.prefix = prefix; G.glob = glob; G.emit_closes = emit_closes;
     pthread_mutex_init(&G.mu, NULL); pthread_cond_init(&G.cv, NULL);
     pthread_mutex_init(&G.out_mu, NULL);
     pthread_mutex_init(&G.gd_mu, NULL); pthread_cond_init(&G.gd_cv, NULL);
@@ -1240,9 +1273,11 @@ int main(int argc, char **argv) {
         }
         const char *prefix = argc > 5 ? argv[5] : "";
         const char *glob = argc > 6 ? argv[6] : "";
+        int emit_closes = argc > 7 && argv[7][0] == '1';
         fprintf(stderr, "quiver-exec scan: engine=%s threads=%d\n",
                 use_uring ? "uring" : "sync", threads);
-        return run_scan(argv[2], use_uring, threads, prefix, glob);
+        return run_scan(argv[2], use_uring, threads, prefix, glob,
+                        emit_closes);
     }
 
     struct io_uring ring;

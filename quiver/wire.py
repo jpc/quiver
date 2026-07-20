@@ -141,12 +141,12 @@ SCAN_PL = pl.Schema({
     "mtime_ns": pl.Int64, "atime_ns": pl.Int64, "ctime_ns": pl.Int64,
     "ino": pl.UInt64, "parent_ino": pl.UInt64, "dev": pl.UInt64,
     "mode": pl.Int32, "uid": pl.Int32, "gid": pl.Int32, "nlink": pl.Int32,
-    "depth": pl.Int32, "is_dir": pl.Boolean})
+    "depth": pl.Int32, "is_dir": pl.Boolean, "child_count": pl.Int64})
 
 
 def scan_iter(root: str, engine: str = "auto", threads: int = 8,
               prefix: str = "", glob: str = "", exe: str = EXE,
-              transport: list[str] | None = None):
+              transport: list[str] | None = None, closes: bool = False):
     """Streaming scan: yields one stat frame per IPC batch as the
     scanner produces them. The stream invariant that makes pipelined
     execution correct: a directory's row is always emitted in an
@@ -154,7 +154,8 @@ def scan_iter(root: str, engine: str = "auto", threads: int = 8,
     only because its parent was already processed and queued)."""
     root = root if transport else os.path.abspath(root)
     proc = subprocess.Popen((transport or []) + [exe, "scan", root,
-                            _engine(engine), str(threads), prefix, glob],
+                            _engine(engine), str(threads), prefix, glob,
+                            "1" if closes else "0"],
                             stdout=subprocess.PIPE)
     try:
         for b in StreamReader(proc.stdout):
@@ -166,14 +167,16 @@ def scan_iter(root: str, engine: str = "auto", threads: int = 8,
 
 def scan(root: str, engine: str = "auto", threads: int = 8,
          prefix: str = "", glob: str = "",
-         exe: str = EXE, transport: list[str] | None = None) -> pl.DataFrame:
+         exe: str = EXE, transport: list[str] | None = None,
+         closes: bool = False) -> pl.DataFrame:
     """quiver-exec scan → stat frame. `prefix` prunes whole subtrees
     (stage-1 pushdown: their getdents/statx never happen); `glob`
     filters basenames and skips statx for known-regular misses
     (stage 2)."""
     root2 = root if transport else os.path.abspath(root)
     proc = subprocess.Popen((transport or []) + [exe, "scan", root2,
-                            _engine(engine), str(threads), prefix, glob],
+                            _engine(engine), str(threads), prefix, glob,
+                            "1" if closes else "0"],
                             stdout=subprocess.PIPE)
     dfs = [_to_pl(b) for b in StreamReader(proc.stdout)]
     assert proc.wait() == 0, "scanner failed"
