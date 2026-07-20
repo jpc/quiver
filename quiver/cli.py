@@ -26,6 +26,7 @@ def main(argv=None):
     sp.add_argument("out"); sp.add_argument("inputs", nargs="+")
     sp.add_argument("--batch-mb", type=float, default=16.0)
     sp.add_argument("--level", type=int, default=10)
+    sp.add_argument("--workers", type=int, default=None)
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling)")
     a = p.parse_args(argv)
@@ -51,9 +52,24 @@ def main(argv=None):
         print(f"{len(nock.extract(a.paths[0], a.paths[1], engine=eng))} extracted")
     elif a.cmd == "recompress":
         from .nock import zframe
+
+        def _prog(s):
+            pct = 100 * s["cin"] / s["cin_total"] if s["cin_total"] else 0
+            rate = s["cin"] / s["elapsed"] if s["elapsed"] else 0     # comp B/s
+            eta = (s["cin_total"] - s["cin"]) / rate if rate else 0
+            sys.stderr.write(
+                f"\r[{pct:5.1f}%] {s['members']:>12,} members  "
+                f"{s['cin']/1e9:6.1f}/{s['cin_total']/1e9:.0f} GB in  "
+                f"{s['cout']/1e9:5.1f} GB out  {s['frames']:>7,} frames  "
+                f"{rate/1e6:5.0f} MB/s  ETA {int(eta)//3600:d}:"
+                f"{int(eta)%3600//60:02d}:{int(eta)%60:02d}   ")
+            sys.stderr.flush()
+
         df = zframe.recompress(a.inputs, a.out,
                                batch_bytes=int(a.batch_mb * (1 << 20)),
-                               level=a.level, limit=a.limit)
+                               level=a.level, workers=a.workers,
+                               limit=a.limit, progress=_prog)
+        sys.stderr.write("\n")
         print(f"{df.height} members, {df['frame'].n_unique()} frames "
               f"-> {a.out}")
 

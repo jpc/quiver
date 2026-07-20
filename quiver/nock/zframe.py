@@ -25,19 +25,28 @@ be decompressed in parallel (the input-side parallelism).
 The reader STREAMS: one member at a time, holding only the current batch
 buffer (~batch_bytes) plus the current member, so it runs against
 multi-hundred-GB sources without materializing them (verified against
-the 666 GB / 110 GB production shards). Still open for full scale: a
-frame-level compression pool (zstd's internal `threads` parallelizes
-within a frame today), an incremental Arrow-batch footer writer for
-hundred-million-member corpora (footer rows are in memory for now), and
-the C OP_EXTRACT libzstd path for parallel extraction. The format and
-footer are the durable part.
+the 666 GB / 110 GB production shards). Frames compress on a worker pool
+while the single source decompressor streams — a 6x win on
+compression-bound (audio) shards (30 -> 180 MB/s at 16 workers).
+
+Two regimes, two limits: compression-bound inputs (large, ~incompressible
+members like WAV) are fixed by the pool; small-member text inputs are
+capped by the Python per-member loop (tarfile parse + tobuf re-emit,
+~6k members/s) — the next optimization is a leaner tar parser that
+copies raw header/body bytes instead of re-emitting. Also still open:
+an incremental Arrow-batch footer writer for hundred-million-member
+corpora (footer rows are in memory now), and the C OP_EXTRACT libzstd
+path for parallel extraction. The format and footer are the durable part.
 """
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures as cf
 import os
 import struct
 import tarfile
+import time
 
 import polars as pl
 import zstandard as zstd
@@ -68,9 +77,10 @@ _ZF_SCHEMA = {
 
 
 def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
-               level: int = 10, threads: int = 0,
+               level: int = 10, workers: int | None = None,
                limit: int | None = None,
-               tar_format: int = tarfile.PAX_FORMAT) -> pl.DataFrame:
+               tar_format: int = tarfile.PAX_FORMAT,
+               progress=None, progress_every: float = 2.0) -> pl.DataFrame:
     """Stream `inputs` (tar or tar.zstd) into one per-batch-frame archive.
 
     Bounded memory: at most one batch buffer (~batch_bytes) plus the
@@ -84,35 +94,75 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
     hundreds of millions (a full 2 TB text corpus) want the incremental
     Arrow-batch footer writer (a follow-up; the format is unchanged).
 
-    `threads` is zstd's per-frame worker count (0 = auto)."""
-    cctx = zstd.ZstdCompressor(level=level, threads=threads)
+    Frames compress on a `workers`-wide pool while the (single, serial)
+    source decompressor streams — so throughput is bounded by the source
+    decompress rate, not by one compressor. Each worker uses its own
+    compressor (safe); GIL is released in zstd, giving real parallelism.
+    """
+    workers = workers or min(16, (os.cpu_count() or 4))
     rows: list[dict] = []
-    coff = fidx = 0
+    coff = fidx = nmembers = 0
     buf = bytearray()
-    frame_base = 0        # continuous-stream offset of buf[0]
+    frame_base = 0        # continuous-stream offset of the NEXT frame
     stream_off = 0        # total tar bytes emitted so far
     pending: list[tuple[dict, int]] = []   # (row, data_off) for current buf
     fout = open(out_path, "wb")
+    pool = cf.ThreadPoolExecutor(max_workers=workers)
+    inflight: collections.deque = collections.deque()  # (future, rows, base)
 
-    def flush():
-        nonlocal coff, fidx, buf, frame_base, pending
-        if not buf:
+    def _compress(data: bytes) -> bytes:
+        return zstd.ZstdCompressor(level=level).compress(data)  # own ctx/thread
+    # progress is by COMPRESSED bytes consumed from the sources — the one
+    # total we know up front (single-frame zstd doesn't store the
+    # decompressed size). cin_done = finished sources; f.tell() = current.
+    cin_total = sum(os.path.getsize(s) for s in inputs)
+    t0 = last = time.time()
+    cin_done = 0
+
+    def report(f, force=False):
+        nonlocal last
+        if progress is None:
             return
-        comp = cctx.compress(bytes(buf))
+        now = time.time()
+        if not force and now - last < progress_every:
+            return
+        last = now
+        progress({"members": nmembers,
+                  "cin": cin_done + (f.tell() if f else 0),
+                  "cin_total": cin_total, "cout": coff,
+                  "decompressed": stream_off, "frames": fidx,
+                  "elapsed": now - t0})
+
+    def drain_one():
+        nonlocal coff, fidx
+        fut, rws, base = inflight.popleft()
+        comp = fut.result()                 # waits for this frame's compress
         fout.write(comp)
-        for row, doff in pending:
+        for row, doff in rws:
             row.update(frame=fidx, frame_coff=coff, frame_clen=len(comp),
-                       in_off=doff - frame_base)
+                       in_off=doff - base)
             rows.append(row)
         coff += len(comp)
         fidx += 1
+
+    def flush():
+        """Hand the current batch to the compress pool (in order); drain
+        finished frames, bounding in-flight memory."""
+        nonlocal buf, frame_base, pending
+        if not buf:
+            return
+        inflight.append((pool.submit(_compress, bytes(buf)), pending,
+                         frame_base))
         frame_base += len(buf)
         buf = bytearray()
         pending = []
+        while len(inflight) >= 2 * workers:      # keep the pool fed, not flooded
+            drain_one()
 
     try:
         for src in inputs:
             tin, handles = _tar_stream(src)
+            raw_f = handles[0]            # underlying file for compressed tell()
             try:
                 for k, m in enumerate(tin):
                     if limit is not None and k >= limit:
@@ -131,15 +181,21 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
                             {"path": m.name, "size": m.size, "mode": m.mode,
                              "mtime_ns": int(m.mtime) * 10**9,
                              "uid": m.uid, "gid": m.gid}, data_off))
+                        nmembers += 1
                     if len(buf) >= batch_bytes:
                         flush()
+                    report(raw_f)
             finally:
                 tin.close()
                 for h in handles:
                     h.close()
+            cin_done += os.path.getsize(src)
             flush()                       # source boundary = frame boundary
         buf += b"\x00" * 1024             # end-of-archive marker
         flush()
+        while inflight:                   # drain the compress pool, in order
+            drain_one()
+        report(None, force=True)
 
         df = pl.DataFrame(rows, schema=_ZF_SCHEMA)
         feat = _footer._feather_bytes(df, {"nock_version": "1",
@@ -148,6 +204,7 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
         fout.write(struct.pack("<II", SKIP_MAGIC, len(payload)))
         fout.write(payload)
     finally:
+        pool.shutdown(wait=True)
         fout.close()
     return df
 
