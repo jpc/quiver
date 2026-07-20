@@ -45,9 +45,11 @@ from __future__ import annotations
 import collections
 import concurrent.futures as cf
 import io
+import queue
 import os
 import struct
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -211,111 +213,141 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
                progress=None, progress_every: float = 2.0) -> pl.DataFrame:
     """Stream `inputs` (tar or tar.zstd) into one per-batch-frame archive.
 
-    Bounded memory: at most one batch buffer (~batch_bytes) plus the
-    current member is held, so this runs against multi-hundred-GB sources
-    without materializing them. Copies each member's raw tar bytes
-    (byte-preserving) and cuts frames at member boundaries; each source
-    ends on a frame boundary so sources stay independently framed (future
-    parallel input). `limit` caps file members per source (sampling).
+    Parallel input: `workers` producer threads each own a subset of the
+    sources and run the FULL pipeline — decompress, raw-copy parse
+    (`_iter_raw`), and compress each batch frame inline — then serialize
+    only the frame write + footer append under one lock. zstd releases
+    the GIL, so decompress and compress genuinely overlap across
+    producers; profiling the sequential version showed one producer left
+    the compressors ~52% idle, which this fills.
 
-    Footer rows accumulate in memory — fine up to millions of members;
-    hundreds of millions (a full 2 TB text corpus) want the incremental
-    Arrow-batch footer writer (a follow-up; the format is unchanged).
+    Frames from different producers interleave in the output; that's
+    fine — each frame is a whole number of members with no interior
+    zero blocks (only the final end-of-archive frame has them), so the
+    concatenation is still one valid tar, and the footer records every
+    frame's real offset. in_off is the member's offset WITHIN its frame,
+    so frames are self-contained (no global stream offset needed).
 
-    Frames compress on a `workers`-wide pool while the (single, serial)
-    source decompressor streams — so throughput is bounded by the source
-    decompress rate, not by one compressor. Each worker uses its own
-    compressor (safe); GIL is released in zstd, giving real parallelism.
-    """
-    workers = workers or min(16, (os.cpu_count() or 4))
-    coff = fidx = nmembers = 0
-    buf = bytearray()
-    frame_base = 0        # continuous-stream offset of the NEXT frame
-    stream_off = 0        # total tar bytes emitted so far
-    pending: list[tuple] = []      # (path,size,mode,mtime,uid,gid,doff) per buf
+    Bounded memory: ~workers x batch_bytes of live buffers plus the
+    streaming footer. Copies raw member bytes (byte-preserving); cuts
+    frames at member boundaries; each source ends on a frame boundary.
+    `limit` caps file members per source (sampling)."""
+    inputs = list(inputs)
+    workers = workers or (os.cpu_count() or 4)       # compress-pool size
+    # A few reader threads decompress+parse sources in parallel and feed
+    # ONE shared compress pool. So all cores keep compressing even when a
+    # single huge source (the 666 GB one) is all that's left — the pure
+    # inline-compress producer would serialize that tail. A semaphore
+    # bounds outstanding frames (memory).
+    readers = max(1, min(12, len(inputs)))
     fout = open(out_path, "wb")
     ftmp = tempfile.TemporaryFile()        # footer IPC stream, spills to disk
     fw = _FooterStream(ftmp)
-    pool = cf.ThreadPoolExecutor(max_workers=workers)
-    inflight: collections.deque = collections.deque()  # (future, rows, base)
-
-    def _compress(data: bytes) -> bytes:
-        return zstd.ZstdCompressor(level=level).compress(data)  # own ctx/thread
-    # progress is by COMPRESSED bytes consumed from the sources — the one
-    # total we know up front (single-frame zstd doesn't store the
-    # decompressed size). cin_done = finished sources; f.tell() = current.
+    wlock = threading.Lock()               # serializes writes + footer + stats
+    st = {"coff": 0, "fidx": 0, "members": 0}
     cin_total = sum(os.path.getsize(s) for s in inputs)
-    t0 = last = time.time()
     cin_done = 0
+    partial = [0] * readers                # each reader's in-progress tell()
+    t0 = time.time()
+    last = [t0]
+    errors: list = []
+    pool = cf.ThreadPoolExecutor(max_workers=workers)
+    slots = threading.Semaphore(workers * 2)   # bound in-flight frames
+    tls = threading.local()
 
-    def report(f, force=False):
-        nonlocal last
+    def maybe_report(force=False):
         if progress is None:
             return
         now = time.time()
-        if not force and now - last < progress_every:
+        if not force and now - last[0] < progress_every:
             return
-        last = now
-        progress({"members": nmembers,
-                  "cin": cin_done + (f.tell() if f else 0),
-                  "cin_total": cin_total, "cout": coff,
-                  "decompressed": stream_off, "frames": fidx,
+        last[0] = now
+        progress({"members": st["members"], "cin": cin_done + sum(partial),
+                  "cin_total": cin_total, "cout": st["coff"],
+                  "decompressed": 0, "frames": st["fidx"],
                   "elapsed": now - t0})
 
-    def drain_one():
-        nonlocal coff, fidx
-        fut, rws, base = inflight.popleft()
-        comp = fut.result()                 # waits for this frame's compress
-        fout.write(comp)
-        clen = len(comp)
-        for (path, size, mode, mtime, uid, gid, doff) in rws:
-            fw.add(path, size, mode, mtime, uid, gid,
-                   fidx, coff, clen, doff - base)
-        coff += clen
-        fidx += 1
+    def write_frame(comp: bytes, rows: list):
+        """Serialize one compressed frame to the output + footer."""
+        with wlock:
+            fout.write(comp)
+            coff, fidx, clen = st["coff"], st["fidx"], len(comp)
+            for (path, size, mode, mtime, uid, gid, in_off) in rows:
+                fw.add(path, size, mode, mtime, uid, gid,
+                       fidx, coff, clen, in_off)
+            st["coff"] += clen
+            st["fidx"] += 1
+            st["members"] += len(rows)
+            maybe_report()
 
-    def flush():
-        """Hand the current batch to the compress pool (in order); drain
-        finished frames, bounding in-flight memory."""
-        nonlocal buf, frame_base, pending
-        if not buf:
-            return
-        inflight.append((pool.submit(_compress, bytes(buf)), pending,
-                         frame_base))
-        frame_base += len(buf)
-        buf = bytearray()
-        pending = []
-        while len(inflight) >= 2 * workers:      # keep the pool fed, not flooded
-            drain_one()
+    def _compress_write(data: bytes, rows: list):
+        try:
+            c = getattr(tls, "c", None)
+            if c is None:
+                c = tls.c = zstd.ZstdCompressor(level=level)   # per worker
+            write_frame(c.compress(data), rows)
+        finally:
+            slots.release()
+
+    def _submit(data: bytes, rows: list):
+        slots.acquire()                    # backpressure on fast readers
+        pool.submit(_compress_write, data, rows)
+
+    srcq: queue.Queue = queue.Queue()
+    for s in inputs:
+        srcq.put(s)
+
+    def reader(rid: int):
+        nonlocal cin_done
+        while True:
+            try:
+                src = srcq.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                rd, handles = _open_stream(src)
+                raw_f = handles[0]
+                buf = bytearray()
+                rows: list = []
+                try:
+                    for (name, size, mode, mtime, uid, gid, mraw, boff) in \
+                            _iter_raw(rd, limit):
+                        in_off = len(buf) + boff       # offset within THIS frame
+                        buf += mraw
+                        if name is not None:
+                            rows.append((
+                                name.decode("utf-8", "surrogateescape"),
+                                size, mode, mtime * 10**9, uid, gid, in_off))
+                        if len(buf) >= batch_bytes:
+                            _submit(bytes(buf), rows)
+                            buf, rows = bytearray(), []
+                            partial[rid] = raw_f.tell()
+                    if buf:                            # source's final frame
+                        _submit(bytes(buf), rows)
+                finally:
+                    for h in handles:
+                        h.close()
+            except Exception as e:                     # isolate a bad source
+                errors.append((src, e))
+            with wlock:
+                cin_done += os.path.getsize(src)
+                partial[rid] = 0
 
     try:
-        for src in inputs:
-            reader, handles = _open_stream(src)
-            raw_f = handles[0]            # underlying file for compressed tell()
-            try:
-                for (name, size, mode, mtime, uid, gid, mraw, boff) in \
-                        _iter_raw(reader, limit):
-                    data_off = stream_off + boff    # file body in the stream
-                    buf += mraw
-                    stream_off += len(mraw)
-                    if name is not None:
-                        pending.append((
-                            name.decode("utf-8", "surrogateescape"),
-                            size, mode, mtime * 10**9, uid, gid, data_off))
-                        nmembers += 1
-                    if len(buf) >= batch_bytes:
-                        flush()
-                    report(raw_f)
-            finally:
-                for h in handles:
-                    h.close()
-            cin_done += os.path.getsize(src)
-            flush()                       # source boundary = frame boundary
-        buf += b"\x00" * 1024             # end-of-archive marker
-        flush()
-        while inflight:                   # drain the compress pool, in order
-            drain_one()
-        report(None, force=True)
+        threads = [threading.Thread(target=reader, args=(i,), daemon=True)
+                   for i in range(readers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        pool.shutdown(wait=True)           # drain outstanding compress+writes
+        if errors:
+            raise RuntimeError(f"{len(errors)} source(s) failed; "
+                               f"first: {errors[0][0]}: {errors[0][1]!r}")
+        # end-of-archive marker as its own final frame
+        write_frame(zstd.ZstdCompressor(level=level).compress(b"\x00" * 1024),
+                    [])
+        maybe_report(force=True)
 
         # footer is now a finished IPC stream on `ftmp` (bounded memory).
         fw.close()
@@ -343,10 +375,10 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
                     side.write(chunk)
                 side.write(trailer)
     finally:
-        pool.shutdown(wait=True)
+        pool.shutdown(wait=False, cancel_futures=True)
         ftmp.close()
         fout.close()
-    return Result(members=fw.members, frames=fidx)
+    return Result(members=fw.members, frames=st["fidx"])
 
 
 def _footer_bytes(path: str) -> bytes:
