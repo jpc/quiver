@@ -164,7 +164,7 @@ def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
     without materializing them. Copies each member's raw tar bytes
     (byte-preserving) and cuts frames at member boundaries; each source
     ends on a frame boundary so sources stay independently framed (future
-    parallel input). `limit` caps file members per source (sampling)."""
+    parallel input). `limit` caps file members per source (sampling).
 
     Footer rows accumulate in memory — fine up to millions of members;
     hundreds of millions (a full 2 TB text corpus) want the incremental
