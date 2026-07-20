@@ -391,6 +391,34 @@ def test_ssh(tmp):
     ok("ssh: remote scan+sync (inline chunk chains)+verify, corruption "
        "caught by wire-crossing hashes only")
 
+def test_multi(tmp):
+    # distributed cp/rm across two LOCAL executors: exercises the Polars
+    # subtree partition, the fan-out/barrier, and the root-op handling
+    # (real ssh/srun only change how the executor is spawned).
+    from quiver.remotes.multi import LocalTransport, partition_plan
+    src = tmp/"multi"; make_tree(src, n=300, seed=17)
+    tr = [LocalTransport(), LocalTransport()]
+    dst = tmp/"multi_dst"
+    tools.cp(str(src), str(dst), engine="uring", transports=tr)
+    for p in src.rglob("*"):
+        if p.is_file():
+            assert (dst/p.relative_to(src)).read_bytes() == p.read_bytes()
+    # partition invariants: affinity (no subtree split) + root separated
+    from quiver.wire import cmd_df, OP_UNLINK
+    paths = [f"{src}/a/f{i}" for i in range(5)] + [f"{src}/b/f{i}"
+             for i in range(9)] + [os.path.abspath(str(src))]
+    cmds = cmd_df(len(paths), opcode=[OP_UNLINK]*len(paths), path=paths)
+    root_ops, shards = partition_plan(cmds, os.path.abspath(str(src)), 2)
+    assert len(root_ops) == 1
+    seen = {}
+    for i, sh in enumerate(shards):
+        for p in sh["path"]:
+            sub = p.split("/")[-2]
+            assert seen.setdefault(sub, i) == i, "subtree split across shards"
+    tools.rm(str(dst), engine="uring", transports=tr)
+    assert not dst.exists()
+    ok("multi: distributed cp/rm (2 executors), subtree affinity + root")
+
 def test_cksum_parallel(tmp):
     import hashlib
     big = os.urandom(23 * (1 << 20) + 12345)      # 5 parts, parallel path
@@ -422,7 +450,7 @@ def main():
     for t in (test_scan, test_pack, test_tools, test_retrofit,
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
-              test_streaming, test_ssh, test_cksum_parallel,
+              test_streaming, test_ssh, test_multi, test_cksum_parallel,
               test_p1_barrier):
         t(tmp)
     shutil.rmtree(tmp)

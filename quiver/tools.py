@@ -30,8 +30,16 @@ DEPTH = (pl.col("path").str.count_matches("/")).alias("depth")
 
 
 def _run(cmds: pl.DataFrame, engine: str, wal_path: str | None,
-         archive: str = "-") -> pl.DataFrame | None:
-    """Execute directly, or persist to a WAL and execute resumably."""
+         archive: str = "-", distributed=None) -> pl.DataFrame | None:
+    """Execute directly, across nodes, or via a resumable WAL.
+    `distributed` = (root, transports, affinity_col) fans the plan over
+    nodes by subtree affinity (batch only — no WAL combination yet)."""
+    if distributed is not None and wal_path is None:
+        from .remotes.multi import run_distributed
+        root, transports, aff = distributed
+        comp = run_distributed(cmds, root, transports, aff, archive, engine)
+        _check(comp, cmds)
+        return comp
     if wal_path is None:
         comp = run_commands(cmds, archive, engine)
         _check(comp, cmds)
@@ -81,10 +89,17 @@ def du(root: str, depth: int = 1, apparent: bool = False,
 
 def rm(root: str, select: pl.Expr | None = None,
        engine: str = "auto", wal: str | None = None,
-       scheduler: str = "refcount", threads: int = 8) -> int:
+       scheduler: str = "refcount", threads: int = 8,
+       transports=None) -> int:
     """Recursive delete of root's contents (and root itself unless a
     `select` filter keeps survivors). Files in epoch 0, rmdirs deepest-
     first — the executor barrier makes -ENOTEMPTY structurally impossible."""
+    if transports is not None:
+        # refcount orders via parent_row (a positional index into the
+        # whole frame); subtree partitioning re-indexes each shard, so
+        # those indices break. Depth epochs are position-independent and
+        # partition cleanly — use them for distributed rm.
+        scheduler = "epochs"
     df = scan(root, engine, threads)
     if select is not None:
         df = df.filter(select)
@@ -140,7 +155,8 @@ def rm(root: str, select: pl.Expr | None = None,
                                     dtype=pl.Int64),
                 path=[os.path.abspath(root)])
             cmds = pl.concat([cmds, root_row])
-    _run(cmds, engine, wal)
+    dist = (os.path.abspath(root), transports, "path") if transports else None
+    _run(cmds, engine, wal, distributed=dist)
     return n
 
 
@@ -160,14 +176,16 @@ def _setmeta_cmds(dst_root: str, df: pl.DataFrame,
 
 def cp(src_root: str, dst_root: str, engine: str = "auto",
        wal: str | None = None, threads: int = 8,
-       preserve_times: bool = True) -> int:
+       preserve_times: bool = True, transports=None) -> int:
     """cp -r = sync into emptiness (S8)."""
     src = scan(src_root, engine, threads).with_columns(DEPTH)
     os.makedirs(dst_root, exist_ok=True)
     cmds, _ = sync_cmds(src, empty_stat(), src_root, dst_root,
                         delete=False, preserve_times=preserve_times)
     if len(cmds):
-        _run(cmds, engine, wal)
+        dist = (os.path.abspath(dst_root), transports, "dst_path") \
+            if transports else None
+        _run(cmds, engine, wal, distributed=dist)
     return len(src)
 
 def empty_stat() -> pl.DataFrame:

@@ -82,16 +82,30 @@ def _to_pl(batch: dict) -> pl.DataFrame:
                          for k, v in batch.items()})
 
 
+def _popen_spawn(argv: list[str]):
+    return subprocess.Popen(argv, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+
+
 class PipeExecutor:
-    """transport is an argv prefix: [] = local, ["ssh", host] = remote.
-    The protocol is transport-agnostic bytes over stdin/stdout — an
-    executor on the far side of ssh is driven verbatim."""
+    """Drives one quiver-exec over stdin/stdout Arrow frames. The
+    protocol is transport-agnostic bytes, so where the executor RUNS is
+    decoupled from how it is DRIVEN:
+
+    - `transport` is an argv prefix — [] local, ["ssh", host], or
+      ["srun", "-w", node] — spawned with Popen (the default `spawn`).
+    - `spawn` overrides process creation entirely for backends that are
+      not argv-prefixable (e.g. a Modal Sandbox). It takes the argv and
+      returns a handle exposing `.stdin` (write bytes), `.stdout` (read
+      bytes) and `.wait() -> int`. subprocess.Popen already satisfies
+      this; a Modal adapter wraps a ContainerProcess to match."""
 
     def __init__(self, archive_path: str = "-", engine: str = "auto",
-                 exe: str = EXE, transport: list[str] | None = None):
-        self.proc = subprocess.Popen(
-            (transport or []) + [exe, "exec", archive_path, _engine(engine)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                 exe: str = EXE, transport: list[str] | None = None,
+                 spawn=None):
+        argv = (transport or []) + [exe, "exec", archive_path,
+                                    _engine(engine)]
+        self.proc = (spawn or _popen_spawn)(argv)
         self.writer = StreamWriter(self.proc.stdin, CMD_SCHEMA)
         self.proc.stdin.flush()
         self.reader = StreamReader(self.proc.stdout)
