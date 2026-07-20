@@ -60,7 +60,13 @@
  * header_offset, payload (padded to pad_align) at data_offset. */
 enum { OP_UNLINK = 2, OP_RMDIR = 3, OP_MKDIR = 4,
        OP_COPY = 5, OP_CKSUM = 6, OP_FBARRIER = 7, OP_SETMETA = 8,
-       OP_EXTRACT = 9 };   /* archive[data_offset,size] -> path */
+       OP_EXTRACT = 9,      /* archive[data_offset,size] -> path */
+       OP_COMPRESS = 10 };  /* zstd(header payload, level=pad_align) -> append
+                             * to the archive; completion reports the frame's
+                             * (coff in read_size, clen in cksum). This is the
+                             * un-plannable half of the zframe layout: the plan
+                             * assigns members->frames, the executor assigns the
+                             * compressed offsets and returns them. */
 /* mode/uid/gid/mtime_ns use -1 as "unspecified": COPY/MKDIR fall back
  * to 0644/0755, SETMETA leaves the attribute untouched. */
 #define DEFAULT_FILE_MODE 0644
@@ -68,6 +74,13 @@ enum { OP_UNLINK = 2, OP_RMDIR = 3, OP_MKDIR = 4,
 
 #include "md5.h"   /* vendored public-domain MD5 (Solar Designer);
                       -DHAVE_OPENSSL -lcrypto swaps in OpenSSL's asm */
+#include <zstd.h>  /* OP_COMPRESS: zframe frame compression */
+
+/* Serialized append point for OP_COMPRESS: frames from the pool are
+ * appended in completion order, each getting the current offset. (The
+ * multi-node path gives each node its own shard so this stays local.) */
+static pthread_mutex_t g_append_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t g_append_off = 0;
 
 /* ── CRC-64/NVME: reflected, poly 0xad93d23594c93659, composable ────────
  * Table-driven reference (~1 GB/s); the production path is PCLMULQDQ
@@ -565,6 +578,30 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
         }
         out->read_size = got;
         close(dfd);
+        return;
+    }
+    case OP_COMPRESS: {
+        /* zstd the frame's inline payload (header column) and append it to
+         * the archive; report (coff, clen) so the planner finalizes the
+         * footer's frame offsets from completions. */
+        int64_t hlen = c->hdr_off[i + 1] - c->hdr_off[i];
+        const void *src = c->hdr_data + c->hdr_off[i];
+        int lvl = align > 0 ? (int)align : 3;         /* level via pad_align */
+        size_t bound = ZSTD_compressBound((size_t)hlen);
+        uint8_t *comp = malloc(bound);
+        if (!comp) { out->res = -ENOMEM; return; }
+        size_t clen = ZSTD_compress(comp, bound, src, (size_t)hlen, lvl);
+        if (ZSTD_isError(clen)) { out->res = -EIO; free(comp); return; }
+        pthread_mutex_lock(&g_append_mu);
+        int64_t coff = g_append_off;
+        if (pwrite(afd, comp, clen, coff) != (ssize_t)clen)
+            out->res = -errno;
+        else
+            g_append_off += (int64_t)clen;
+        pthread_mutex_unlock(&g_append_mu);
+        out->read_size = coff;                        /* frame offset */
+        out->cksum = (uint64_t)clen;                  /* compressed length */
+        free(comp);
         return;
     }
     default:
@@ -1315,7 +1352,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "exec")) {
         int afd = -1;
         if (strcmp(argv[2], "-") != 0) {
-            afd = open(argv[2], O_RDWR);   /* R for EXTRACT, W for COPY */
+            afd = open(argv[2], O_RDWR | O_CREAT, 0644);  /* R:EXTRACT W:COPY/COMPRESS */
             if (afd < 0) { perror("archive"); return 2; }
         }
         return run_exec(afd, use_uring, &ring);
