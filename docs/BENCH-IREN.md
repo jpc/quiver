@@ -68,8 +68,10 @@ What profiling found, in order (each step verified by re-benchmark):
    threads avoid. Fix: the executor's pool executes whole rows via
    row_sync at 64 workers. cp 36.9→2.5s.
 
-utimensat/chmod on WEKA measured ~17 µs (client-cached) — the SETMETA
-tail is noise, now pooled anyway.
+(The `/proc/wekafs/stat` avg column suggested the SETMETA tail was
+~17 µs noise. BPF kretprobes later showed the truth — setattr is a
+full ~1.5 ms backend RPC; that avg was diluted by boot history. See
+the BPF section below and the `--no-preserve-times` win.)
 
 ## tar — pack / list / extract, same 20k tree
 
@@ -150,14 +152,17 @@ non-executor cost.
   fixed scan+plan+spawn ~0.2 s, which amortizes with tree size.
 - Python startup (~0.3–0.4 s) dominates only trivial jobs.
 
-## Profiling notes (perf_event_paranoid=4 on nodes — no perf/BPF)
+## Profiling toolkit
 
-Unprivileged substitutes that were enough to find everything above:
-strace -c (syscall time), /proc/PID/task/*/wchan sampling (off-CPU
-wait channels), cProfile (Python side), and targeted C experiments.
-Getting real perf/bpftrace on the fleet needs a research-infra change
-(`kernel.perf_event_paranoid=1` + linux-tools) — worth doing before
-the next optimization round.
+`perf_event_paranoid=4` blocks unprivileged perf, but the nodes grant
+passwordless sudo, so kernel BPF is available: a static bpftrace
+AppImage on weka + `sudo bpftrace` attaches kretprobes to the wekafs
+module directly (see the BPF section). Unprivileged substitutes that
+also carried real weight: strace -c (syscall time), /proc/PID/task/
+*/wchan sampling (off-CPU wait channels), /proc/wekafs/stat (client
+op counts — but its avg-latency column is a boot-lifetime average, so
+trust counts, not the µs), cProfile (Python side), and targeted C
+experiments. Each finding was confirmed by re-benchmark before acting.
 
 ## Reproduction
 
