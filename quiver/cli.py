@@ -26,9 +26,14 @@ def main(argv=None):
     sp.add_argument("out"); sp.add_argument("inputs", nargs="+")
     sp.add_argument("--batch-mb", type=float, default=16.0)
     sp.add_argument("--level", type=int, default=10)
-    sp.add_argument("--workers", type=int, default=None)
+    sp.add_argument("--workers", type=int, default=None,
+                    help="compress-pool workers (C engine) / threads (py)")
+    sp.add_argument("--readers", type=int, default=8,
+                    help="C-engine reader threads (parse fans out per source)")
+    sp.add_argument("--py", action="store_true",
+                    help="use the pure-Python engine (GIL-bound; supports --limit)")
     sp.add_argument("--limit", type=int, default=None,
-                    help="max members per input (sampling)")
+                    help="max members per input (sampling; --py only)")
     sp = sub.add_parser("serve", help="browse a zframe archive over HTTP")
     sp.add_argument("archive"); sp.add_argument("--port", type=int, default=8756)
     a = p.parse_args(argv)
@@ -56,21 +61,30 @@ def main(argv=None):
         from .nock import zframe
 
         def _prog(s):
-            pct = 100 * s["cin"] / s["cin_total"] if s["cin_total"] else 0
-            rate = s["cin"] / s["elapsed"] if s["elapsed"] else 0     # comp B/s
-            eta = (s["cin_total"] - s["cin"]) / rate if rate else 0
+            # C engine reports cout (no cin consumed); py engine reports cin.
+            done = s.get("cin", s.get("cout", 0))
+            total = s["cin_total"]
+            pct = 100 * done / total if total else 0
+            el = s["elapsed"]
+            rate = done / el if el else 0
+            eta = (total - done) / rate if rate and "cin" in s else 0
             sys.stderr.write(
                 f"\r[{pct:5.1f}%] {s['members']:>12,} members  "
-                f"{s['cin']/1e9:6.1f}/{s['cin_total']/1e9:.0f} GB in  "
                 f"{s['cout']/1e9:5.1f} GB out  {s['frames']:>7,} frames  "
-                f"{rate/1e6:5.0f} MB/s  ETA {int(eta)//3600:d}:"
-                f"{int(eta)%3600//60:02d}:{int(eta)%60:02d}   ")
+                f"{s['cout']/1e6/el if el else 0:5.0f} MB/s out  "
+                f"{int(el)//3600:d}:{int(el)%3600//60:02d}:{int(el)%60:02d}   ")
             sys.stderr.flush()
 
-        res = zframe.recompress(a.inputs, a.out,
-                                batch_bytes=int(a.batch_mb * (1 << 20)),
-                                level=a.level, workers=a.workers,
-                                limit=a.limit, progress=_prog)
+        if a.py:
+            res = zframe.recompress(a.inputs, a.out,
+                                    batch_bytes=int(a.batch_mb * (1 << 20)),
+                                    level=a.level, workers=a.workers,
+                                    limit=a.limit, progress=_prog)
+        else:
+            res = zframe.recompress_c(a.inputs, a.out,
+                                      batch_bytes=int(a.batch_mb * (1 << 20)),
+                                      level=a.level, readers=a.readers,
+                                      compressors=a.workers, progress=_prog)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
     elif a.cmd == "serve":

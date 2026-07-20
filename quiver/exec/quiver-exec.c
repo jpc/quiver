@@ -1304,6 +1304,281 @@ static int run_scan(const char *root, int use_uring, int threads,
 
 /* ── main ──────────────────────────────────────────────────────────────── */
 
+/* ── zpack: tar.zstd → per-batch-frame nock, fully in C (GIL-free) ─────────
+ * Reader threads decompress+parse sources and batch members into frame
+ * buffers; a compress pool zstd's each frame, appends it, and assigns the
+ * frame index + compressed offset (the un-plannable half). Per-member footer
+ * records go to stdout; Python writes the trailing skippable-frame index.
+ * Parse AND compress are both off the GIL — the Python thread version capped
+ * at ~10 cores; this saturates all of them. */
+
+typedef struct { uint8_t *ib, *ob; size_t icap, isz, ipos, ocap, osz, opos;
+                 int fd, eof; ZSTD_DStream *ds; } Zsrc;
+
+static int zsrc_open(Zsrc *z, const char *p) {
+    z->fd = open(p, O_RDONLY);
+    if (z->fd < 0) return -1;
+    z->ds = ZSTD_createDStream(); ZSTD_initDStream(z->ds);
+    z->icap = ZSTD_DStreamInSize(); z->ib = malloc(z->icap);
+    z->ocap = ZSTD_DStreamOutSize(); z->ob = malloc(z->ocap);
+    z->isz = z->ipos = z->osz = z->opos = 0; z->eof = 0;
+    return 0;
+}
+static void zsrc_close(Zsrc *z) {
+    ZSTD_freeDStream(z->ds); free(z->ib); free(z->ob); close(z->fd);
+}
+static size_t zsrc_read(Zsrc *z, uint8_t *dst, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        while (z->opos >= z->osz) {                 /* refill decompressed */
+            if (z->ipos >= z->isz && !z->eof) {
+                ssize_t r = read(z->fd, z->ib, z->icap);
+                if (r <= 0) z->eof = 1; else { z->isz = r; z->ipos = 0; }
+            }
+            if (z->ipos >= z->isz && z->eof) return got;
+            ZSTD_inBuffer in = {z->ib, z->isz, z->ipos};
+            ZSTD_outBuffer out = {z->ob, z->ocap, 0};
+            size_t rc = ZSTD_decompressStream(z->ds, &out, &in);
+            if (ZSTD_isError(rc)) return got;
+            z->ipos = in.pos; z->osz = out.pos; z->opos = 0;
+        }
+        size_t take = z->osz - z->opos;
+        if (take > n - got) take = n - got;
+        memcpy(dst + got, z->ob + z->opos, take);
+        z->opos += take; got += take;
+    }
+    return got;
+}
+
+static int64_t zoctal(const uint8_t *b, int n) {
+    if (b[0] & 0x80) {                      /* GNU base-256 */
+        int64_t v = b[0] & 0x7f;
+        for (int i = 1; i < n; i++) v = (v << 8) | b[i];
+        return v;
+    }
+    int64_t v = 0;
+    for (int i = 0; i < n; i++) {
+        if (b[i] < '0' || b[i] > '7') continue;
+        v = v * 8 + (b[i] - '0');
+    }
+    return v;
+}
+
+
+typedef struct { char *path; int64_t size, mtime, in_off; int32_t mode, uid, gid; } ZRec;
+typedef struct ZJob { struct ZJob *next; uint8_t *buf; int64_t len;
+                      ZRec *recs; int nrecs; } ZJob;
+
+static struct {
+    const char **srcs; int nsrc; _Atomic int src_i;
+    ZJob *qh, *qt; int qn, readers_done, nreaders_left;
+    pthread_mutex_t qmu; pthread_cond_t qcv;
+    int afd; int level; int64_t batch;
+    pthread_mutex_t amu; int64_t append_off, frame_idx;
+    pthread_mutex_t omu;
+} Z;
+
+static void z_emit(ZRec *r, int32_t frame, int64_t coff, int64_t clen) {
+    uint16_t plen = (uint16_t)strlen(r->path);
+    /* one record: [u16 plen][path][i64 size][i64 mtime][i32 mode]
+     *             [i32 uid][i32 gid][i32 frame][i64 coff][i64 clen][i64 in_off] */
+    fwrite(&plen, 2, 1, stdout); fwrite(r->path, plen, 1, stdout);
+    fwrite(&r->size, 8, 1, stdout); fwrite(&r->mtime, 8, 1, stdout);
+    fwrite(&r->mode, 4, 1, stdout); fwrite(&r->uid, 4, 1, stdout);
+    fwrite(&r->gid, 4, 1, stdout); fwrite(&frame, 4, 1, stdout);
+    fwrite(&coff, 8, 1, stdout); fwrite(&clen, 8, 1, stdout);
+    fwrite(&r->in_off, 8, 1, stdout);
+}
+
+static void z_push(ZJob *j) {
+    pthread_mutex_lock(&Z.qmu);
+    while (Z.qn >= 96) pthread_cond_wait(&Z.qcv, &Z.qmu);   /* backpressure */
+    j->next = NULL;
+    if (Z.qt) Z.qt->next = j; else Z.qh = j;
+    Z.qt = j; Z.qn++;
+    pthread_cond_broadcast(&Z.qcv);
+    pthread_mutex_unlock(&Z.qmu);
+}
+static ZJob *z_pop(void) {
+    pthread_mutex_lock(&Z.qmu);
+    while (!Z.qh && !Z.readers_done)
+        pthread_cond_wait(&Z.qcv, &Z.qmu);
+    ZJob *j = Z.qh;
+    if (j) { Z.qh = j->next; if (!Z.qh) Z.qt = NULL; Z.qn--;
+             pthread_cond_broadcast(&Z.qcv); }
+    pthread_mutex_unlock(&Z.qmu);
+    return j;
+}
+
+static void z_parse_pax(const uint8_t *b, int64_t n, char *path, int *hp,
+                        int64_t *psize) {
+    int64_t i = 0;
+    while (i < n) {
+        int64_t s = i;
+        while (i < n && b[i] != ' ') i++;      /* "LEN key=value\n" */
+        i++;                                    /* skip space */
+        const uint8_t *kv = b + i;
+        int64_t end = s + strtol((const char *)b + s, NULL, 10);
+        int64_t klen = 0;
+        while (kv[klen] != '=' && (b + i + klen) < b + end) klen++;
+        if (klen == 4 && !memcmp(kv, "path", 4)) {
+            int64_t vlen = end - (i + klen + 1) - 1;   /* minus trailing \n */
+            if (vlen > 4094) vlen = 4094;
+            memcpy(path, kv + klen + 1, vlen); path[vlen] = 0; *hp = 1;
+        } else if (klen == 4 && !memcmp(kv, "size", 4)) {
+            *psize = strtoll((const char *)kv + klen + 1, NULL, 10);
+        }
+        i = end;
+    }
+}
+
+static void *z_reader(void *arg) {
+    (void)arg;
+    for (;;) {
+        int si = atomic_fetch_add(&Z.src_i, 1);
+        if (si >= Z.nsrc) break;
+        Zsrc z;
+        if (zsrc_open(&z, Z.srcs[si])) continue;
+        size_t bcap = (size_t)Z.batch + (4 << 20);
+        uint8_t *buf = malloc(bcap); int64_t blen = 0;
+        int rcap = 8192, nrec = 0;
+        ZRec *recs = malloc(sizeof(ZRec) * rcap);
+        char pax_path[4096], gnu[4096];
+        int has_pax = 0, has_gnu = 0; int64_t pax_size = -1;
+        uint8_t hdr[512];
+        for (;;) {
+            if (zsrc_read(&z, hdr, 512) < 512) break;
+            int allz = 1;
+            for (int k = 0; k < 512; k++) if (hdr[k]) { allz = 0; break; }
+            if (allz) break;
+            int typ = hdr[156];
+            int64_t size = zoctal(hdr + 124, 12);
+            int64_t bl = (size + 511) / 512 * 512;
+            if (blen + 512 + bl + 1024 > (int64_t)bcap) {
+                bcap = (blen + 512 + bl + 1024) * 2; buf = realloc(buf, bcap);
+            }
+            if (typ == 'x' || typ == 'g') {
+                memcpy(buf + blen, hdr, 512);
+                zsrc_read(&z, buf + blen + 512, bl);
+                z_parse_pax(buf + blen + 512, size, pax_path, &has_pax, &pax_size);
+                blen += 512 + bl; continue;
+            }
+            if (typ == 'L') {
+                memcpy(buf + blen, hdr, 512);
+                zsrc_read(&z, buf + blen + 512, bl);
+                int nl = size < 4095 ? (int)size : 4095;
+                memcpy(gnu, buf + blen + 512, nl);
+                while (nl && gnu[nl - 1] == 0) nl--;
+                gnu[nl] = 0; has_gnu = 1;
+                blen += 512 + bl; continue;
+            }
+            char name[4096];
+            if (has_pax) strcpy(name, pax_path);
+            else if (has_gnu) strcpy(name, gnu);
+            else {
+                char nm[101], pre[156];
+                memcpy(nm, hdr, 100); nm[100] = 0;
+                memcpy(pre, hdr + 345, 155); pre[155] = 0;
+                if (pre[0]) snprintf(name, sizeof name, "%s/%s", pre, nm);
+                else { strncpy(name, nm, sizeof name - 1); name[sizeof name-1]=0; }
+            }
+            int64_t rsize = pax_size >= 0 ? pax_size : size;
+            int64_t rbl = (rsize + 511) / 512 * 512;
+            if (blen + 512 + rbl + 1024 > (int64_t)bcap) {
+                bcap = (blen + 512 + rbl + 1024) * 2; buf = realloc(buf, bcap);
+            }
+            int64_t body_off = blen + 512;
+            memcpy(buf + blen, hdr, 512);
+            zsrc_read(&z, buf + blen + 512, rbl);
+            blen += 512 + rbl;
+            if (typ == '0' || typ == 0) {
+                if (nrec >= rcap) { rcap *= 2; recs = realloc(recs, sizeof(ZRec)*rcap); }
+                recs[nrec].path = strdup(name);
+                recs[nrec].size = rsize;
+                recs[nrec].mode = zoctal(hdr + 100, 8);
+                recs[nrec].mtime = zoctal(hdr + 136, 12) * 1000000000LL;
+                recs[nrec].uid = zoctal(hdr + 108, 8);
+                recs[nrec].gid = zoctal(hdr + 116, 8);
+                recs[nrec].in_off = body_off;
+                nrec++;
+            }
+            has_pax = 0; has_gnu = 0; pax_size = -1;
+            if (blen >= Z.batch) {
+                ZJob *j = malloc(sizeof *j);
+                j->buf = buf; j->len = blen; j->recs = recs; j->nrecs = nrec;
+                z_push(j);
+                bcap = (size_t)Z.batch + (4 << 20);
+                buf = malloc(bcap); blen = 0;
+                rcap = 8192; nrec = 0; recs = malloc(sizeof(ZRec) * rcap);
+            }
+        }
+        if (blen) {                                    /* source's final frame */
+            ZJob *j = malloc(sizeof *j);
+            j->buf = buf; j->len = blen; j->recs = recs; j->nrecs = nrec;
+            z_push(j);
+        } else { free(buf); free(recs); }
+        zsrc_close(&z);
+    }
+    /* last reader out flips readers_done */
+    pthread_mutex_lock(&Z.qmu);
+    if (--Z.nreaders_left == 0) { Z.readers_done = 1;
+        pthread_cond_broadcast(&Z.qcv); }
+    pthread_mutex_unlock(&Z.qmu);
+    return NULL;
+}
+
+static void *z_compressor(void *arg) {
+    (void)arg;
+    ZSTD_CCtx *cc = ZSTD_createCCtx();
+    for (;;) {
+        ZJob *j = z_pop();
+        if (!j) break;
+        size_t bound = ZSTD_compressBound((size_t)j->len);
+        uint8_t *comp = malloc(bound);
+        size_t clen = ZSTD_compressCCtx(cc, comp, bound, j->buf,
+                                        (size_t)j->len, Z.level);
+        pthread_mutex_lock(&Z.amu);
+        int64_t coff = Z.append_off, fidx = Z.frame_idx;
+        if (pwrite(Z.afd, comp, clen, coff) < 0) perror("pwrite");
+        Z.append_off += (int64_t)clen; Z.frame_idx++;
+        pthread_mutex_unlock(&Z.amu);
+        pthread_mutex_lock(&Z.omu);
+        for (int r = 0; r < j->nrecs; r++)
+            z_emit(&j->recs[r], (int32_t)fidx, coff, (int64_t)clen);
+        pthread_mutex_unlock(&Z.omu);
+        for (int r = 0; r < j->nrecs; r++) free(j->recs[r].path);
+        free(comp); free(j->buf); free(j->recs); free(j);
+    }
+    ZSTD_freeCCtx(cc);
+    return NULL;
+}
+
+static int run_zpack(const char **srcs, int nsrc, const char *out,
+                     int level, int64_t batch, int readers, int compressors) {
+    memset(&Z, 0, sizeof Z);
+    Z.srcs = srcs; Z.nsrc = nsrc; Z.level = level; Z.batch = batch;
+    Z.nreaders_left = readers;
+    pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
+    pthread_mutex_init(&Z.amu, NULL); pthread_mutex_init(&Z.omu, NULL);
+    Z.afd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (Z.afd < 0) { perror("output"); return 2; }
+    pthread_t rt[64], ct[128];
+    if (readers > 64) readers = 64;
+    if (compressors > 128) compressors = 128;
+    for (int i = 0; i < compressors; i++)
+        pthread_create(&ct[i], NULL, z_compressor, NULL);
+    for (int i = 0; i < readers; i++)
+        pthread_create(&rt[i], NULL, z_reader, NULL);
+    for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
+    for (int i = 0; i < compressors; i++) pthread_join(ct[i], NULL);
+    fflush(stdout);
+    close(Z.afd);
+    fprintf(stderr, "zpack: %ld frames, %ld bytes\n",
+            (long)Z.frame_idx, (long)Z.append_off);
+    return 0;
+}
+
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s exec <archive|-> [uring|sync]\n"
@@ -1330,6 +1605,14 @@ int main(int argc, char **argv) {
                 use_uring ? "uring" : "sync", threads);
         return run_scan(argv[2], use_uring, threads, prefix, glob,
                         emit_closes);
+    }
+
+    if (!strcmp(argv[1], "zpack")) {
+        /* zpack <out> <level> <batch> <readers> <compressors> <src...> */
+        if (argc < 8) { fprintf(stderr, "zpack: too few args\n"); return 2; }
+        return run_zpack((const char **)&argv[7], argc - 7, argv[2],
+                         atoi(argv[3]), atoll(argv[4]), atoi(argv[5]),
+                         atoi(argv[6]));
     }
 
     struct io_uring ring;

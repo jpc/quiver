@@ -399,6 +399,78 @@ def _footer_bytes(path: str) -> bytes:
         return f.read(n)
 
 
+def recompress_c(inputs, out_path: str, level: int = 6,
+                 batch_bytes: int = 16 << 20, readers: int = 8,
+                 compressors: int | None = None, progress=None,
+                 progress_every: float = 2.0) -> Result:
+    """The fold: quiver-exec `zpack` does decompress + tar-parse + batch +
+    compress + append entirely in C (no GIL, reader threads + compress
+    pool), streaming per-member footer records here; we finalize the
+    trailing skippable-frame footer. The un-plannable frame offsets come
+    from C (assigned at append), exactly the completion-driven model."""
+    import subprocess
+    import time
+    from ..wire import EXE
+    compressors = compressors or (os.cpu_count() or 8)
+    cin_total = sum(os.path.getsize(p) for p in inputs)
+    rec = struct.Struct("<qqiiiiqqq")           # 56B fixed tail per member
+    ftmp = tempfile.TemporaryFile()
+    fw = _FooterStream(ftmp)
+    proc = subprocess.Popen(
+        [EXE, "zpack", out_path, str(level), str(batch_bytes),
+         str(readers), str(compressors), *inputs],
+        stdout=subprocess.PIPE, bufsize=1 << 22)
+    buf = b""
+    frames = 0
+    members = 0
+    t0 = last = time.time()
+    f = proc.stdout
+    while True:
+        chunk = f.read(1 << 20)
+        if not chunk:
+            break
+        buf += chunk
+        i = 0
+        n = len(buf)
+        while True:
+            if i + 2 > n:
+                break
+            plen = buf[i] | (buf[i + 1] << 8)
+            if i + 2 + plen + 56 > n:
+                break
+            path = buf[i + 2:i + 2 + plen].decode("utf-8", "surrogateescape")
+            (size, mtime, mode, uid, gid, frame, coff, clen, in_off) = \
+                rec.unpack_from(buf, i + 2 + plen)
+            fw.add(path, size, mode, mtime, uid, gid, frame, coff, clen, in_off)
+            members += 1
+            if frame + 1 > frames:
+                frames = frame + 1
+            i += 2 + plen + 56
+        buf = buf[i:]
+        now = time.time()
+        if progress and now - last >= progress_every:
+            last = now
+            cout = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+            progress({"members": members, "frames": frames, "cout": cout,
+                      "cin_total": cin_total, "elapsed": now - t0})
+    if proc.wait() != 0:
+        raise RuntimeError(f"zpack exited {proc.returncode}")
+    fw.close()
+    flen = ftmp.tell()
+    with open(out_path, "ab") as fo:            # append the footer to the frames
+        trailer = struct.pack("<Q", flen) + _footer.MAGIC
+        fo.write(struct.pack("<II", SKIP_MAGIC, flen + len(trailer)))
+        ftmp.seek(0)
+        while True:
+            c = ftmp.read(1 << 20)
+            if not c:
+                break
+            fo.write(c)
+        fo.write(trailer)
+    ftmp.close()
+    return Result(members=fw.members, frames=frames)
+
+
 def read_index(path: str) -> pl.DataFrame:
     """Footer frame (member → frame + in-frame offset), read from the
     streamed IPC footer via pupyarrow (concatenating its batches)."""

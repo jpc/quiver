@@ -421,6 +421,45 @@ def test_zframe(tmp):
             tf.extractfile("b/f0100").read()
     ok("zframe: per-batch frames — tar-compatible, merge, batch extract")
 
+
+def test_zframe_c(tmp):
+    """The fold: quiver-exec `zpack` does decompress+parse+compress+append
+    in C (GIL-free), streaming footer records. Inputs are tar.zstd."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile, subprocess as sp
+    from quiver.nock import zframe
+
+    def mk_zst(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}-{i}-").encode() * (25 + i % 50)
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}"); ti.size = len(b)
+                ti.mode = 0o644; ti.mtime = 1_700_000_000 + i
+                tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    mk_zst(str(tmp/"a.tar.zstd"), "a", 300)
+    mk_zst(str(tmp/"b.tar.zstd"), "b", 170)
+    out = str(tmp/"zc.tar.zstd")
+    res = zframe.recompress_c([str(tmp/"a.tar.zstd"), str(tmp/"b.tar.zstd")],
+                              out, level=6, batch_bytes=32 << 10,
+                              readers=2, compressors=4)
+    assert res.members == 470, res.members
+    assert res.frames > 1, res.frames
+    n = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
+               capture_output=True, text=True).stdout.strip()
+    assert n == "470", n                       # still one clean tar.zstd
+    # byte-exact random access from the 2nd (merged) source
+    zframe.extract(out, str(tmp/"zcx"), pl.col("path") == "b/f0100")
+    want = (b"b-100-") * (25 + 100 % 50)
+    assert (tmp/"zcx"/"b"/"f0100").read_bytes() == want
+    ok("zframe C fold: zpack decompress+parse+compress in C, merge, extract")
+
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars
     # subtree partition, the fan-out/barrier, and the root-op handling
@@ -480,7 +519,7 @@ def main():
     for t in (test_scan, test_pack, test_tools, test_retrofit,
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
-              test_streaming, test_ssh, test_multi, test_zframe,
+              test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)
