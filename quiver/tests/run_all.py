@@ -334,8 +334,16 @@ def test_streaming(tmp):
                for p in files)
     stream.stream_rm(str(d), "uring")
     assert not d.exists()
+    # same Plan, batch granularity (source = one scan): must match
+    db = tmp/"strcp_batch"
+    stream.stream_cp(str(src), str(db), "uring", streaming=False)
+    for p in src.rglob("*"):
+        if p.is_file():
+            assert (db/p.relative_to(src)).read_bytes() == p.read_bytes()
+    stream.stream_rm(str(db), "uring", streaming=False)
+    assert not db.exists()
     ok("streaming: cp/pack/rm execute during the scan (out-of-order-"
-       "arrival safe)")
+       "arrival safe); same Plan batches or streams")
 
 def test_ssh(tmp):
     # requires a reachable sshd (tests set one up on localhost:2222);
