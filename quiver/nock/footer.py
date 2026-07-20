@@ -121,12 +121,65 @@ def read_index(path: str) -> pl.DataFrame:
 
 
 def extract(path: str, dest: str,
-            predicate: pl.Expr | None = None) -> list[str]:
-    from pathlib import Path
+            predicate: pl.Expr | None = None,
+            engine: str = "auto") -> list[str]:
+    """Extract members through the executor: mkdirs by depth, then
+    EXTRACT rows (archive[data_offset, read_size] → file) striped
+    across parent dirs, then a SETMETA mtime tail. engine=None keeps
+    the in-process loop (no executor spawn — remote/oracle use)."""
     idx = read_index(path)
     if predicate is not None:
         idx = idx.filter(predicate)
     idx = idx.sort("data_offset")
+    if engine is None:
+        return _extract_inline(path, dest, idx)
+    if not len(idx):
+        return []
+    from ..wire import OP_EXTRACT, OP_MKDIR, OP_SETMETA, cmd_df, run_commands
+    from ..tools import _check, _stripe_dirs
+    os.makedirs(dest, exist_ok=True)
+
+    dirs = (idx.select(dir=pl.col("path").str.extract(r"^(.*)/", 1))
+               .drop_nulls().unique()
+               .with_columns(depth=pl.col("dir").str.count_matches("/"))
+               .sort("depth"))
+    # ancestors of every dir so mkdir -p semantics hold epoch by epoch
+    seen, alld = set(), []
+    for d in dirs["dir"]:
+        parts = d.split("/")
+        for k in range(1, len(parts) + 1):
+            pd = "/".join(parts[:k])
+            if pd not in seen:
+                seen.add(pd); alld.append(pd)
+    alld.sort(key=lambda d: d.count("/"))
+    rows = _stripe_dirs(idx)
+    maxd = max((d.count("/") for d in alld), default=-1)
+    have_meta = "mtime_ns" in idx.columns
+    cmds = pl.concat([
+        cmd_df(len(alld), opcode=[OP_MKDIR] * len(alld),
+               dep_group=pl.Series([d.count("/") for d in alld],
+                                   dtype=pl.Int64),
+               path=[os.path.join(dest, d) for d in alld]),
+        cmd_df(len(rows), opcode=[OP_EXTRACT] * len(rows),
+               dep_group=pl.Series([maxd + 1] * len(rows), dtype=pl.Int64),
+               path=[os.path.join(dest, p) for p in rows["path"]],
+               data_offset=rows["data_offset"], size=rows["read_size"],
+               **({"mode": (rows["mode"] & 0o7777).cast(pl.Int32)}
+                  if "mode" in rows.columns else {})),
+        cmd_df(len(rows), opcode=[OP_SETMETA] * len(rows),
+               dep_group=pl.Series([maxd + 2] * len(rows), dtype=pl.Int64),
+               path=[os.path.join(dest, p) for p in rows["path"]],
+               mtime_ns=rows["mtime_ns"]) if have_meta
+        else cmd_df(0),
+    ]).with_columns(user_data=pl.int_range(
+        len(alld) + len(rows) * (2 if have_meta else 1), dtype=pl.UInt64))
+    comp = run_commands(cmds, path, engine)
+    _check(comp, cmds)
+    return rows["path"].to_list()
+
+
+def _extract_inline(path: str, dest: str, idx: pl.DataFrame) -> list[str]:
+    from pathlib import Path
     out = []
     with open(path, "rb") as f:
         for r in idx.to_dicts():

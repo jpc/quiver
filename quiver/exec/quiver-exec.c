@@ -60,7 +60,8 @@
  * else open(dst, O_CREAT|O_TRUNC, mode). header bytes (if any) land at
  * header_offset, payload (padded to pad_align) at data_offset. */
 enum { OP_UNLINK = 2, OP_RMDIR = 3, OP_MKDIR = 4,
-       OP_COPY = 5, OP_CKSUM = 6, OP_FBARRIER = 7, OP_SETMETA = 8 };
+       OP_COPY = 5, OP_CKSUM = 6, OP_FBARRIER = 7, OP_SETMETA = 8,
+       OP_EXTRACT = 9 };   /* archive[data_offset,size] -> path */
 /* mode/uid/gid/mtime_ns use -1 as "unspecified": COPY/MKDIR fall back
  * to 0644/0755, SETMETA leaves the attribute untouched. */
 #define DEFAULT_FILE_MODE 0644
@@ -535,6 +536,27 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
         if (dlen > 0) close(tfd);
         return;
     }
+    case OP_EXTRACT: {
+        /* inverse COPY: archive[data_offset, size] -> create path */
+        int dfd = open(c->path[i], O_WRONLY | O_CREAT | O_TRUNC,
+                       c->mode[i] >= 0 ? (mode_t)c->mode[i]
+                                       : DEFAULT_FILE_MODE);
+        if (dfd < 0) { out->res = -errno; return; }
+        static __thread uint8_t *buf;
+        if (!buf) buf = malloc(1 << 20);
+        int64_t left = size, got = 0;
+        while (left > 0) {
+            ssize_t want = left > (1 << 20) ? (1 << 20) : left;
+            ssize_t r = pread(afd, buf, (size_t)want,
+                              c->data_offset[i] + got);
+            if (r <= 0) { out->res = r < 0 ? -errno : -EIO; break; }
+            if (write(dfd, buf, (size_t)r) != r) { out->res = -errno; break; }
+            left -= r; got += r;
+        }
+        out->read_size = got;
+        close(dfd);
+        return;
+    }
     default:
         out->res = -EINVAL;
     }
@@ -669,9 +691,14 @@ static void probe_deferred_fd(struct io_uring *ring) {
     }
 }
 
+/* The scheduler is engine-agnostic: epochs, refcount deps, and the
+ * slot bound are identical whether rows execute as ring SQEs or on the
+ * sync pool. ring == NULL (engine=sync, or platforms without io_uring)
+ * routes every row through the pool — the macOS-shaped fallback. */
 static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                            RowResult *out) {
     int64_t n = c->n_rows;
+    int use_ring = ring != NULL;
     RowState *rs = calloc((size_t)n, sizeof *rs);
     int64_t *rc = calloc((size_t)n, sizeof(int64_t));   /* children left */
     int64_t *ready = malloc((size_t)n * sizeof(int64_t));
@@ -705,7 +732,8 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
             done++; } while (0)
 
         while (done < span) {
-            while (n_ready > 0 && io_uring_sq_space_left(ring) >= MAX_CHAIN) {
+            while (n_ready > 0 &&
+                   (!use_ring || io_uring_sq_space_left(ring) >= MAX_CHAIN)) {
                 int64_t i = ready[--n_ready];
                 uint8_t op = c->opcode[i];
                 int64_t size = c->size[i], align = c->pad_align[i];
@@ -716,7 +744,8 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 struct io_uring_sqe *sqe;
                 #define UD(st) (uint64_t)(((uint64_t)i << 8) | (st))
 
-                if (op == OP_CKSUM || op == OP_SETMETA ||
+                if (!use_ring || op == OP_EXTRACT ||
+                    op == OP_CKSUM || op == OP_SETMETA ||
                     (op == OP_FBARRIER && c->path[i][0])) {
                     if (n_free == 0) { ready[n_ready++] = i; break; }
                     r->slot = free_slots[--n_free];
@@ -915,12 +944,8 @@ static int run_exec(int afd, int use_uring, struct io_uring *ring) {
         CmdBatch cb;
         if (parse_cmd_batch(meta, body, &cb)) return 1;
         RowResult *rr = calloc((size_t)cb.n_rows, sizeof *rr);
-        if (use_uring) {
-            if (run_batch_uring(ring, &cb, afd, rr)) return 1;
-        } else {
-            for (int64_t i = 0; i < cb.n_rows; i++)
-                row_sync(&cb, i, afd, &rr[i]);
-        }
+        if (run_batch_uring(use_uring ? ring : NULL, &cb, afd, rr))
+            return 1;
         int64_t n = cb.n_rows;
         int32_t *res = malloc(4 * (size_t)n);
         int64_t *rsz = malloc(8 * (size_t)n);
@@ -1386,7 +1411,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "exec")) {
         int afd = -1;
         if (strcmp(argv[2], "-") != 0) {
-            afd = open(argv[2], O_WRONLY);
+            afd = open(argv[2], O_RDWR);   /* R for EXTRACT, W for COPY */
             if (afd < 0) { perror("archive"); return 2; }
         }
         return run_exec(afd, use_uring, &ring);

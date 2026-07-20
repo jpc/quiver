@@ -17,7 +17,7 @@ import polars as pl
 from .pupyarrow.writer import StreamReader, StreamWriter
 
 OP_UNLINK, OP_RMDIR, OP_MKDIR, OP_COPY, OP_CKSUM = 2, 3, 4, 5, 6
-OP_FBARRIER, OP_SETMETA = 7, 8
+OP_FBARRIER, OP_SETMETA, OP_EXTRACT = 7, 8, 9
 
 CMD_SCHEMA = [
     ("user_data", "u64"), ("opcode", "u8"), ("dep_group", "i64"),

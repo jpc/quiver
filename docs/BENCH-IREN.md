@@ -77,17 +77,17 @@ tail is noise, now pooled anyway.
 |----------------------------------|-------:|--------:|
 | pack (create archive)            |    2.3 |     8.4 |
 | list                             |    0.6 |    ~0.0 |
-| extract (all 20k)                |   79.1 |    79.8 |
-| selective extract (100 of 20k)   |    1.0 |     0.5 |
+| extract (all 20k)                |    2.0 |    79.8 |
+| selective extract (100 of 20k)   |    0.8 |     0.5 |
 
 - **pack is 3.7×**: cum_sum layout → concurrent reads + offset writes
   into one archive fd beat tar's serial append. Output verified by
   GNU tar; 50 random members byte-identical.
-- **extract is the open gap**: quiver's extract is still a serial
-  Python loop, and both it and GNU tar hit the same ~4 ms/file create
-  wall (79s). The cp result bounds the fix: planning extraction as
-  executor rows (an archive-read mirror of COPY) should land near
-  cp's 2.5s — ~30× headroom. P2/P3 item.
+- **extract is 40×**: planned as executor rows (OP_EXTRACT, the
+  archive-read mirror of COPY) — mkdirs by depth, extract rows striped
+  across parent dirs, SETMETA mtime tail. The serial-Python original
+  tied GNU tar at 79s on the same create wall cp had; through the
+  pooled executor it lands at 2.0s, byte-verified, mtimes restored.
 - list/selective on a 20 MB page-cache-hot archive can't show the
   footer's advantage (tar full-scans 20 MB in noise time); the
   scale story — one footer read vs 10M header parses, ranged reads

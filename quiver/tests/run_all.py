@@ -56,6 +56,16 @@ def test_pack(tmp):
     got = nock.extract(tar, str(tmp/"z"), pl.col("size") > 4000)
     assert all((tmp/"z"/g).stat().st_size > 4000 for g in got)
     ok("raw roundtrip + predicate extract via nock index")
+    # executor engines vs the inline loop, plus the SETMETA mtime tail
+    d3 = tmp/"y-inline"; nock.extract(raw, str(d3), engine=None)
+    d4 = tmp/"y-sync";   nock.extract(raw, str(d4), engine="sync")
+    for p in src.rglob("*"):
+        if p.is_file():
+            rel = p.relative_to(src)
+            b = p.read_bytes()
+            assert (d3/rel).read_bytes() == b == (d4/rel).read_bytes()
+            assert (d2/rel).stat().st_mtime_ns == p.stat().st_mtime_ns
+    ok("extract: uring/sync engines == inline oracle; mtimes restored")
 
 def test_tools(tmp):
     src = tmp/"tools"; make_tree(src)

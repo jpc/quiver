@@ -18,6 +18,7 @@ def main(argv=None):
     sp = sub.add_parser("pack"); sp.add_argument("paths", nargs=2)
     sp.add_argument("--tar", action="store_true")
     sp = sub.add_parser("nock"); sp.add_argument("paths", nargs=1)
+    sp = sub.add_parser("extract"); sp.add_argument("paths", nargs=2)
     a = p.parse_args(argv)
     eng, thr = a.engine, a.threads
     if a.cmd == "du":
@@ -37,6 +38,8 @@ def main(argv=None):
         print(f"{len(idx)} members")
     elif a.cmd == "nock":
         print(nock.index_tar(a.paths[0]).height, "members indexed")
+    elif a.cmd == "extract":
+        print(f"{len(nock.extract(a.paths[0], a.paths[1], engine=eng))} extracted")
 
 
 if __name__ == "__main__":
