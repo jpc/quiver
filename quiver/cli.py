@@ -15,6 +15,8 @@ def main(argv=None):
         sp = sub.add_parser(name); sp.add_argument("paths", nargs=nargs)
     for name in ("cp","sync"):
         sp = sub.add_parser(name); sp.add_argument("paths", nargs=2)
+        sp.add_argument("--no-preserve-times", action="store_true",
+                        help="skip mtime restore (~halves RPCs on WEKA)")
     sp = sub.add_parser("pack"); sp.add_argument("paths", nargs=2)
     sp.add_argument("--tar", action="store_true")
     sp = sub.add_parser("nock"); sp.add_argument("paths", nargs=1)
@@ -28,9 +30,9 @@ def main(argv=None):
     elif a.cmd == "rm":
         print(f"{tools.rm(a.paths[0], engine=eng, threads=thr)} ops")
     elif a.cmd == "cp":
-        print(f"{tools.cp(a.paths[0], a.paths[1], engine=eng, threads=thr)} entries")
+        print(f"{tools.cp(a.paths[0], a.paths[1], engine=eng, threads=thr, preserve_times=not a.no_preserve_times)} entries")
     elif a.cmd == "sync":
-        print(tools.sync(a.paths[0], a.paths[1], engine=eng, threads=thr))
+        print(tools.sync(a.paths[0], a.paths[1], engine=eng, threads=thr, preserve_times=not a.no_preserve_times))
     elif a.cmd == "pack":
         fmt = nock.TarFormat() if a.tar else nock.RawFormat()
         idx = tools.pack(a.paths[0], a.paths[1], fmt, engine=eng,

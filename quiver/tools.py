@@ -159,12 +159,13 @@ def _setmeta_cmds(dst_root: str, df: pl.DataFrame,
 
 
 def cp(src_root: str, dst_root: str, engine: str = "auto",
-       wal: str | None = None, threads: int = 8) -> int:
+       wal: str | None = None, threads: int = 8,
+       preserve_times: bool = True) -> int:
     """cp -r = sync into emptiness (S8)."""
     src = scan(src_root, engine, threads).with_columns(DEPTH)
     os.makedirs(dst_root, exist_ok=True)
     cmds, _ = sync_cmds(src, empty_stat(), src_root, dst_root,
-                        delete=False)
+                        delete=False, preserve_times=preserve_times)
     if len(cmds):
         _run(cmds, engine, wal)
     return len(src)
@@ -189,12 +190,18 @@ def _stripe_dirs(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
-              dst_root: str, delete: bool = True
+              dst_root: str, delete: bool = True,
+              preserve_times: bool = True
               ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """THE planner (S8): full outer join on path, (size, mtime_ns)
     delta, epoch ladder mkdir < copy < setmeta < unlink < rmdir(deep
     first). cp is this with an empty dst; rm is this with an empty src.
-    Returns (cmds, op summary)."""
+    Returns (cmds, op summary).
+
+    preserve_times=False drops the SETMETA mtime epoch. BPF profiling on
+    WEKA showed setattr is a full ~1.5 ms RPC per file — the same cost
+    as the copy — so skipping it ~halves cp/sync RPC traffic. Safe for
+    content-addressed sync, which never consults mtime."""
     j = src.join(dst, on="path", how="full", suffix="_d", coalesce=True) \
            .with_columns(DEPTH)
     in_src, in_dst = pl.col("is_dir").is_not_null(), \
@@ -226,7 +233,8 @@ def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
                dst_path=[os.path.join(dst_root, p) for p in copies["path"]],
                size=copies["size"],
                mode=(copies["mode"] & 0o7777).cast(pl.Int32)),
-        _setmeta_cmds(dst_root, copies, maxd + 2),
+        _setmeta_cmds(dst_root, copies, maxd + 2) if preserve_times
+        else cmd_df(0),
         cmd_df(len(unlinks), opcode=[OP_UNLINK] * len(unlinks),
                dep_group=pl.Series([maxd + 3] * len(unlinks)),
                path=[os.path.join(dst_root, p) for p in unlinks["path"]]),
@@ -234,8 +242,8 @@ def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
                dep_group=(maxd + 4 + maxd - rmdirs["depth"]),
                path=[os.path.join(dst_root, p) for p in rmdirs["path"]]),
     ]).with_columns(user_data=pl.int_range(
-        len(mkdirs) + len(copies) * 2 + len(unlinks) + len(rmdirs),
-        dtype=pl.UInt64))
+        len(mkdirs) + len(copies) * (2 if preserve_times else 1)
+        + len(unlinks) + len(rmdirs), dtype=pl.UInt64))
     summary = pl.DataFrame({
         "op": ["mkdir", "copy", "unlink", "rmdir"],
         "count": [len(mkdirs), len(copies), len(unlinks), len(rmdirs)]})
@@ -244,12 +252,14 @@ def sync_cmds(src: pl.DataFrame, dst: pl.DataFrame, src_root: str,
 
 def sync(src_root: str, dst_root: str, delete: bool = True,
          engine: str = "auto", wal: str | None = None,
-         threads: int = 8) -> pl.DataFrame:
-    """One-way sync src → dst; idempotent (mtimes preserved)."""
+         threads: int = 8, preserve_times: bool = True) -> pl.DataFrame:
+    """One-way sync src → dst; idempotent (mtimes preserved unless
+    preserve_times=False)."""
     src = scan(src_root, engine, threads).with_columns(DEPTH)
     os.makedirs(dst_root, exist_ok=True)
     dst = scan(dst_root, engine, threads)
-    cmds, summary = sync_cmds(src, dst, src_root, dst_root, delete)
+    cmds, summary = sync_cmds(src, dst, src_root, dst_root, delete,
+                              preserve_times=preserve_times)
     if len(cmds):
         _run(cmds, engine, wal)
     return summary

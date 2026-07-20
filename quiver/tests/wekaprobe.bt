@@ -1,0 +1,21 @@
+kprobe:wekafs_atomic_open { @s_open[tid] = nsecs; }
+kretprobe:wekafs_atomic_open /@s_open[tid]/ {
+    @us_atomic_open = hist((nsecs - @s_open[tid]) / 1000); delete(@s_open[tid]); }
+kprobe:wekafs_lookup { @s_lk[tid] = nsecs; }
+kretprobe:wekafs_lookup /@s_lk[tid]/ {
+    @us_lookup = hist((nsecs - @s_lk[tid]) / 1000); delete(@s_lk[tid]); }
+kprobe:wekafs_setattr { @s_sa[tid] = nsecs; }
+kretprobe:wekafs_setattr /@s_sa[tid]/ {
+    @us_setattr = hist((nsecs - @s_sa[tid]) / 1000); delete(@s_sa[tid]); }
+kprobe:wekafs_unlink { @s_ul[tid] = nsecs; }
+kretprobe:wekafs_unlink /@s_ul[tid]/ {
+    @us_unlink = hist((nsecs - @s_ul[tid]) / 1000); delete(@s_ul[tid]); }
+kprobe:commit_blocking_request {
+    @s_rpc[tid] = nsecs; @inflight++;
+    if (@inflight > @inflight_max) { @inflight_max = @inflight; } }
+kretprobe:commit_blocking_request /@s_rpc[tid]/ {
+    @us_rpc = hist((nsecs - @s_rpc[tid]) / 1000);
+    @rpc_total = count(); delete(@s_rpc[tid]); @inflight--; }
+interval:s:30 { printf("TIMES UP\n"); exit(); }
+END { clear(@s_open); clear(@s_lk); clear(@s_sa); clear(@s_ul);
+      clear(@s_rpc); clear(@inflight); }

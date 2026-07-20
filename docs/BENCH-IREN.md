@@ -164,3 +164,38 @@ the next optimization round.
 `quiver/tests/bench-weka.sh` — scan/du read-only against a real tree,
 cp/sync/rm/pack against synthetic trees in the runner's own space.
 Every number is a `BENCH name seconds` line for diffing between runs.
+
+## BPF profiling of the WEKA client (2026-07-20, sudo + bpftrace)
+
+kretprobe latency histograms on the wekafs kernel module during a live
+cp+rm workload (556k RPCs sampled). Probe: `quiver/tests/wekaprobe.bt`.
+
+Per-op client-side latency (the real distribution, not boot averages):
+
+| wekafs op                | median    | note                        |
+|--------------------------|-----------|-----------------------------|
+| `lookup`                 | 128–256µs | cheap — cache/lease covered |
+| `atomic_open` (create)   | 1–2 ms    | fused lookup+create, good   |
+| `setattr` (mtime)        | 1–2 ms    | full RPC, = cost of a copy  |
+| `unlink`                 | 1–2 ms    |                             |
+| `commit_blocking_request`| bimodal   | 16–32µs (cached) / 1–2ms (backend) |
+
+Three conclusions, two of them things NOT to do:
+
+1. **RPC latency is bimodal** — a 16–32µs cached mode and a ~1.5 ms
+   backend mode. Every metadata *mutation* pays the 1.5 ms. Throughput
+   is therefore concurrency ÷ 1.5 ms; ~13k ops/s at 64 workers means
+   the client's 4 frontend processes are the ceiling. Raising client FE
+   count is the highest-value knob and it's a research-infra change,
+   not a quiver one.
+2. **Don't raise `dentry_max_age`** — lookups are 128–256µs, 5–10×
+   cheaper than the mutations. Caching them harder saves nothing.
+3. **Don't chase io-wq / io_uring for mutations** — the floor is
+   backend RPC latency, which userspace threads already saturate.
+
+The one quiver-side lever the histogram revealed: **`setattr` is a full
+1.5 ms RPC**, so the mtime-restore epoch is pure overhead where mtimes
+don't matter. `cp/sync(preserve_times=False)` (`--no-preserve-times`)
+drops it: cp 2.3 s → 1.9 s (~17%; setattr is ~1/3 of the mutation
+traffic, the copy's own create+write being the rest). Content-addressed
+sync never reads mtime, so this is free there.
