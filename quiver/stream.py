@@ -146,47 +146,84 @@ class CpPlan(Plan):
                       mtime_ns=dirs["mtime_ns"])
 
 
-# ── rm: unlink files (monotone), rmdir deepest-first in the finish tail ────
+# ── rm: streaming forest-refcount over the scan's close-events ─────────────
 
 class RmPlan(Plan):
+    """Files unlink as they arrive; a directory is rmdir'd the instant
+    its emitted-child count (the scan close-event) is fully accounted
+    for by removals — mid-stream, not in a finish tail. Pure path
+    arithmetic: removing a child 'd/f' decrements the parent 'd'; the
+    root's children have dirname '' which is the root's own rel, so the
+    refcount closes at the top too. Needs scan(closes=True).
+
+    Ordering inside one frame: unlinks at epoch 0, cascade-ready rmdirs
+    at depth-ordered later epochs (deeper first). The executor's
+    per-epoch barrier makes every unlink complete before any rmdir and
+    every child-dir rmdir before its parent's — so no completion
+    feedback loop is needed; readiness is decided at emit time because
+    emission guarantees completion before any later epoch."""
+    MAXD = 1 << 20                       # depth ceiling for epoch layering
+
     def __init__(self, root: str, remove_root: bool = True):
         self.root, self.remove_root = root, remove_root
 
     def init(self):
-        return {"dir_frames": [], "n": 0}
+        import collections
+        return {"gone": collections.defaultdict(int),  # child removals emitted
+                "total": {},                            # child_count once closed
+                "done": set(), "n": 0}
+
+    def _drain(self, state) -> list[str]:
+        """Dirs now rmdir-able, cascading bottom-up (a rmdir frees its
+        parent's slot, which may make the parent ready in the same pass)."""
+        gone, total, done = state["gone"], state["total"], state["done"]
+        out, changed = [], True
+        while changed:
+            changed = False
+            for d in list(total):
+                if d in done or gone[d] != total[d]:
+                    continue
+                done.add(d)
+                if d == "" and not self.remove_root:
+                    continue                      # keep the root
+                out.append(d)
+                changed = True
+                if d != "":
+                    gone[os.path.dirname(d)] += 1  # this dir's own removal
+        return out
+
+    def _emit(self, state, files: list[str], rmdirs: list[str]):
+        n = len(files) + len(rmdirs)
+        if not n:
+            return None
+        state["n"] += n
+        rmdirs = sorted(rmdirs, key=lambda d: -d.count("/"))   # deepest first
+        parts = [
+            cmd_df(len(files), opcode=[OP_UNLINK] * len(files),
+                   dep_group=pl.zeros(len(files), pl.Int64, eager=True),
+                   path=[os.path.join(self.root, p) for p in files]),
+            cmd_df(len(rmdirs), opcode=[OP_RMDIR] * len(rmdirs),
+                   dep_group=pl.Series([1 + self.MAXD - d.count("/")
+                                        for d in rmdirs], dtype=pl.Int64),
+                   path=[os.path.abspath(self.root) if d == ""
+                         else os.path.join(self.root, d) for d in rmdirs]),
+        ]
+        return pl.concat(parts).with_columns(
+            user_data=pl.int_range(n, dtype=pl.UInt64)).sort(
+            "dep_group", maintain_order=True)
 
     def step(self, batch, state):
-        state["dir_frames"].append(batch.filter(pl.col("is_dir")))
-        files = batch.filter(~pl.col("is_dir"))
-        if not len(files):
-            return None
-        state["n"] += len(files)
-        return cmd_df(len(files), opcode=[OP_UNLINK] * len(files),
-                      path=[os.path.join(self.root, p)
-                            for p in files["path"]])
+        cl = batch.filter(pl.col("child_count") >= 0)      # close-events
+        for p, c in zip(cl["path"], cl["child_count"]):
+            state["total"][p] = int(c)
+        files = batch.filter((pl.col("child_count") < 0)
+                             & ~pl.col("is_dir"))["path"].to_list()
+        for p in files:
+            state["gone"][os.path.dirname(p)] += 1
+        return self._emit(state, files, self._drain(state))
 
     def finish(self, state):
-        dirs = (pl.concat(state["dir_frames"]).with_columns(DEPTH)
-                if state["dir_frames"] else None)
-        tail = []
-        if dirs is not None and len(dirs):
-            maxd = dirs["depth"].max()
-            tail.append(cmd_df(
-                len(dirs), opcode=[OP_RMDIR] * len(dirs),
-                dep_group=(maxd - dirs["depth"]).cast(pl.Int64),
-                path=[os.path.join(self.root, p) for p in dirs["path"]]))
-            state["n"] += len(dirs)
-        if self.remove_root:
-            tail.append(cmd_df(1, opcode=[OP_RMDIR],
-                               dep_group=pl.Series([10**6], dtype=pl.Int64),
-                               path=[os.path.abspath(self.root)]))
-            state["n"] += 1
-        if not tail:
-            return None
-        return pl.concat(tail).with_columns(
-            user_data=pl.int_range(sum(len(t) for t in tail),
-                                   dtype=pl.UInt64)).sort(
-            "dep_group", maintain_order=True)
+        return self._emit(state, [], self._drain(state))    # root, late dirs
 
 
 # pack is the one tool that does NOT fit (step, finish): it consumes the
@@ -199,12 +236,13 @@ class RmPlan(Plan):
 
 # ── public entry points: stream via scan_iter, batch via [scan] ────────────
 
-def _source(root: str, engine: str, threads: int, streaming: bool):
+def _source(root: str, engine: str, threads: int, streaming: bool,
+            closes: bool = False):
     """The only difference between streaming and batch: many scan
     batches, or one. The Plan and the driver are identical."""
     if streaming:
-        return scan_iter(root, engine, threads)
-    return [scan(root, engine, threads)]
+        return scan_iter(root, engine, threads, closes=closes)
+    return [scan(root, engine, threads, closes=closes)]
 
 
 def stream_cp(src_root: str, dst_root: str, engine: str = "auto",
@@ -217,8 +255,8 @@ def stream_cp(src_root: str, dst_root: str, engine: str = "auto",
 def stream_rm(root: str, engine: str = "auto", threads: int = 8,
               remove_root: bool = True, streaming: bool = True) -> int:
     plan = RmPlan(root, remove_root)
-    return drive(plan, _source(root, engine, threads, streaming),
-                 engine)["n"]
+    return drive(plan, _source(root, engine, threads, streaming,
+                               closes=True), engine)["n"]
 
 
 def stream_pack(root: str, archive_path: str, fmt=None,

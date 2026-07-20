@@ -342,8 +342,20 @@ def test_streaming(tmp):
             assert (db/p.relative_to(src)).read_bytes() == p.read_bytes()
     stream.stream_rm(str(db), "uring", streaming=False)
     assert not db.exists()
+    # deep + wide + empty-dir tree to exercise the streaming rmdir
+    # refcount cascade; _check raises on any ENOTEMPTY (res<0)
+    deep = tmp/"deeprm"
+    for i in range(400):
+        p = deep
+        for lvl in range(i % 6 + 1):
+            p = p/f"L{lvl}_{(i>>lvl)%4}"
+        p.mkdir(parents=True, exist_ok=True)
+        (p/f"f{i}").write_bytes(b"x")
+    (deep/"a/b/c/emptyleaf").mkdir(parents=True)
+    assert stream.stream_rm(str(deep), "uring", threads=8) > 400
+    assert not deep.exists()
     ok("streaming: cp/pack/rm execute during the scan (out-of-order-"
-       "arrival safe); same Plan batches or streams")
+       "arrival safe); same Plan batches or streams; deep rmdir cascade")
 
 def test_ssh(tmp):
     # requires a reachable sshd (tests set one up on localhost:2222);

@@ -460,7 +460,18 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
         if (unlink(c->path[i]) < 0) out->res = -errno;
         return;
     case OP_RMDIR:
-        if (rmdir(c->path[i]) < 0) out->res = -errno;
+        /* WEKA (and other distributed filesystems) can briefly report a
+         * just-emptied directory as ENOTEMPTY: a child unlink/rmdir that
+         * completed on one client frontend is not yet visible to this
+         * rmdir on another. The epoch barrier guarantees the children's
+         * syscalls returned; this absorbs the cross-frontend visibility
+         * lag. Bounded (~0.2s worst case) so a genuinely non-empty dir —
+         * a planner bug — still surfaces instead of hanging. */
+        for (int t = 0; ; t++) {
+            if (rmdir(c->path[i]) == 0) break;
+            if (errno != ENOTEMPTY || t >= 40) { out->res = -errno; break; }
+            usleep(t < 8 ? 100 * (t + 1) : 5000);
+        }
         return;
     case OP_MKDIR:
         if (mkdir(c->path[i], c->mode[i] >= 0 ? (mode_t)c->mode[i]
@@ -713,8 +724,11 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
 
                 /* Ring handles only single-op metadata; all data movement
                  * (and everything when there's no ring) goes to the pool. */
+                /* RMDIR runs on the pool (row_sync) so it gets the
+                 * ENOTEMPTY-retry that a distributed fs needs; the ring
+                 * keeps the other single-op metadata. */
                 int ring_op = use_ring &&
-                    (op == OP_UNLINK || op == OP_RMDIR || op == OP_MKDIR ||
+                    (op == OP_UNLINK || op == OP_MKDIR ||
                      (op == OP_FBARRIER && !c->path[i][0]));
                 if (!ring_op) {
                     if (n_free == 0) { ready[n_ready++] = i; break; }
