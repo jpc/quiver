@@ -1210,9 +1210,10 @@ static void *scan_worker(void *arg) {
             }
             close(dfd);
             if (G.emit_closes) {                /* dir fully walked */
-                if (w->b.n >= SCAN_BATCH) sb_flush(&w->b);
+                if (w->b.n >= SCAN_BATCH) sb_flush(&w->b);   /* ensure room */
                 sb_close(&w->b, wk->rel, (int64_t)strlen(wk->rel),
                          nchild, wk->depth);
+                if (w->b.n >= SCAN_BATCH) sb_flush(&w->b);   /* keep n<cap */
             }
         }
         free(wk);
