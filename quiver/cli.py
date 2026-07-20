@@ -29,6 +29,8 @@ def main(argv=None):
     sp.add_argument("--workers", type=int, default=None)
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling)")
+    sp = sub.add_parser("serve", help="browse a zframe archive over HTTP")
+    sp.add_argument("archive"); sp.add_argument("--port", type=int, default=8756)
     a = p.parse_args(argv)
     eng, thr = a.engine, a.threads
     if a.cmd == "du":
@@ -71,6 +73,9 @@ def main(argv=None):
                                 limit=a.limit, progress=_prog)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
+    elif a.cmd == "serve":
+        from .nock import zserve
+        zserve.main([a.archive, "--port", str(a.port)])
 
 
 if __name__ == "__main__":
