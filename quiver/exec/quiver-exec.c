@@ -51,8 +51,7 @@
 #include "ipc_gen.h"
 
 #define QD 1024
-#define WINDOW 128            /* fd slots; COPY_FILE row uses s and s+WINDOW */
-#define MAX_CHAIN 6
+#define WINDOW 128            /* max data-movement rows in flight on the pool */
 #define SCAN_BATCH 4096       /* stat rows per emitted batch */
 #define STATX_CHUNK 256       /* statx SQEs in flight per directory chunk */
 
@@ -562,22 +561,20 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
     }
 }
 
-/* ── io_uring engine: row state + epoch barriers ───────────────────────── */
+/* ── engine: sync pool + single-op ring, one epoch/refcount scheduler ─────
+ *
+ * Division of labour, settled by measurement (see docs/BENCH-IREN.md):
+ *   • the io_uring ring runs ONLY single-op, native-opcode metadata —
+ *     unlinkat / mkdirat / rmdir / fsync-on-archive. rm is ~20× coreutils
+ *     this way and it is kernel-portable back to 5.6.
+ *   • everything that moves bytes — COPY, EXTRACT, CKSUM, SETMETA,
+ *     path-fsync — runs on the sync thread pool. On wekafs the pool beat
+ *     io_uring read→write chains ~15× (io-wq punting serializes there),
+ *     and it is the ONLY path when there is no ring (engine=sync, macOS).
+ * So there is no io_uring data path, no fixed-file table, no direct-fd
+ * chains, no pre-5.17 probe: the pool is the data plane on every kernel. */
 
-typedef struct {
-    int pending; int32_t first_err; int64_t read_res;
-    int short_read; uint8_t *buf; int slot; int sfd, dfd;
-} RowState;
-
-/* Pre-5.17 kernels assign fixed-file slots at submit time, so a linked op
- * cannot see the slot its own chain's openat_direct fills ("io_uring:
- * defer file assignment", v5.17) — the read gets -EBADF. Probe once at
- * init; without the capability, COPY rows take the thread-open path:
- * open(2) runs in a small pool (the getdents pattern from the scanner),
- * then the read→write chain references the plain fds — every opcode
- * there is ≥5.6. fds are closed in userspace at row completion so a
- * severed chain can't leak them. */
-static int g_deferred_fd = 1;
+typedef struct { int slot; } RowState;   /* pool rows carry only their slot */
 
 #define OPEN_POOL 64
 typedef struct {
@@ -665,36 +662,10 @@ static int pool_outstanding(OpenPool *p) {
     return n;
 }
 
-static void probe_deferred_fd(struct io_uring *ring) {
-    char b;
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_openat_direct(sqe, AT_FDCWD, "/dev/null", O_RDONLY, 0, 0);
-    sqe->flags |= IOSQE_IO_LINK; sqe->user_data = 1;
-    sqe = io_uring_get_sqe(ring);
-    io_uring_prep_read(sqe, 0, &b, 1, 0);
-    sqe->flags |= IOSQE_FIXED_FILE; sqe->user_data = 2;
-    if (io_uring_submit_and_wait(ring, 2) < 0) { g_deferred_fd = 0; return; }
-    struct io_uring_cqe *cqe;
-    unsigned head, seen = 0;
-    io_uring_for_each_cqe(ring, head, cqe) {
-        seen++;
-        if (cqe->user_data == 2 && cqe->res == -EBADF) g_deferred_fd = 0;
-    }
-    io_uring_cq_advance(ring, seen);
-    sqe = io_uring_get_sqe(ring);        /* free slot 0 (EBADF if empty: fine) */
-    io_uring_prep_close_direct(sqe, 0);
-    sqe->user_data = 3;
-    if (io_uring_submit_and_wait(ring, 1) == 1) {
-        seen = 0;
-        io_uring_for_each_cqe(ring, head, cqe) seen++;
-        io_uring_cq_advance(ring, seen);
-    }
-}
-
-/* The scheduler is engine-agnostic: epochs, refcount deps, and the
- * slot bound are identical whether rows execute as ring SQEs or on the
- * sync pool. ring == NULL (engine=sync, or platforms without io_uring)
- * routes every row through the pool — the macOS-shaped fallback. */
+/* The scheduler is engine-agnostic: epochs, refcount deps, and the slot
+ * bound are identical whether a row executes as a single ring SQE or on
+ * the pool. ring == NULL (engine=sync, or platforms without io_uring)
+ * routes every row through the pool. */
 static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                            RowResult *out) {
     int64_t n = c->n_rows;
@@ -733,20 +704,19 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
 
         while (done < span) {
             while (n_ready > 0 &&
-                   (!use_ring || io_uring_sq_space_left(ring) >= MAX_CHAIN)) {
+                   (!use_ring || io_uring_sq_space_left(ring) >= 1)) {
                 int64_t i = ready[--n_ready];
                 uint8_t op = c->opcode[i];
-                int64_t size = c->size[i], align = c->pad_align[i];
-                int64_t hlen = c->hdr_off[i + 1] - c->hdr_off[i];
                 RowState *r = &rs[i];
-                r->slot = -1; r->sfd = -1; r->dfd = -1; r->read_res = size;
-                out[i].res = 0; out[i].read_size = size;
-                struct io_uring_sqe *sqe;
-                #define UD(st) (uint64_t)(((uint64_t)i << 8) | (st))
+                r->slot = -1;
+                out[i].res = 0; out[i].read_size = c->size[i];
 
-                if (!use_ring || op == OP_EXTRACT ||
-                    op == OP_CKSUM || op == OP_SETMETA ||
-                    (op == OP_FBARRIER && c->path[i][0])) {
+                /* Ring handles only single-op metadata; all data movement
+                 * (and everything when there's no ring) goes to the pool. */
+                int ring_op = use_ring &&
+                    (op == OP_UNLINK || op == OP_RMDIR || op == OP_MKDIR ||
+                     (op == OP_FBARRIER && !c->path[i][0]));
+                if (!ring_op) {
                     if (n_free == 0) { ready[n_ready++] = i; break; }
                     r->slot = free_slots[--n_free];
                     if (!pool_on) { pool_start(&pool, c, rs, out, afd);
@@ -754,103 +724,18 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                     pool_push(&pool, i);
                     continue;
                 }
-                if (op == OP_FBARRIER) {
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_fsync(sqe, afd, 0);
-                    sqe->user_data = UD(1);
-                    r->pending = 1; chains_inflight++;
-                    continue;
-                }
-                if (op == OP_UNLINK || op == OP_RMDIR || op == OP_MKDIR) {
-                    sqe = io_uring_get_sqe(ring);
-                    if (op == OP_MKDIR)
-                        io_uring_prep_mkdirat(sqe, AT_FDCWD, c->path[i],
-                                c->mode[i] >= 0 ? (mode_t)c->mode[i]
-                                                : DEFAULT_DIR_MODE);
-                    else
-                        io_uring_prep_unlinkat(sqe, AT_FDCWD, c->path[i],
-                                op == OP_RMDIR ? AT_REMOVEDIR : 0);
-                    sqe->user_data = UD(1);
-                    r->pending = 1; chains_inflight++;
-                    continue;
-                }
-                /* unified COPY */
-                int64_t dlen = c->dst[i][0] ? (int64_t)strlen(c->dst[i]) : 0;
-                int has_dst = dlen > 0;
-                if ((size > 0 || has_dst) && !g_deferred_fd) {
-                    if (n_free == 0) { ready[n_ready++] = i; break; }
-                    r->slot = free_slots[--n_free];
-                    if (!pool_on) { pool_start(&pool, c, rs, out, afd);
-                                    pool_on = 1; }
-                    pool_push(&pool, i);
-                    continue;
-                }
-                if ((size > 0 || has_dst) && n_free == 0) {
-                    ready[n_ready++] = i;          /* retry when a slot frees */
-                    break;
-                }
-                if (size == 0 && !has_dst && hlen == 0) { COMPLETE(i); continue; }
-
-                int s = -1;
-                if (size > 0 || has_dst) s = free_slots[--n_free];
-                r->slot = s;
-                int64_t padded = (size + align - 1) / align * align;
-                if (size > 0) {
-                    r->buf = calloc(1, (size_t)padded);
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_openat_direct(sqe, AT_FDCWD, c->path[i],
-                                                O_RDONLY, 0, s);
-                    sqe->flags |= IOSQE_IO_LINK; sqe->user_data = UD(0);
-                    r->pending++;
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_read(sqe, s, r->buf, (unsigned)size, 0);
-                    sqe->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
-                    sqe->user_data = UD(2); r->pending++;
-                }
-                if (has_dst) {
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_openat_direct(sqe, AT_FDCWD, c->dst[i],
-                            O_WRONLY | O_CREAT |
-                            ((c->header_offset[i] == 0 &&
-                              c->data_offset[i] == 0) ? O_TRUNC : 0),
+                struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+                if (op == OP_MKDIR)
+                    io_uring_prep_mkdirat(sqe, AT_FDCWD, c->path[i],
                             c->mode[i] >= 0 ? (mode_t)c->mode[i]
-                                            : DEFAULT_FILE_MODE,
-                            (unsigned)(s + WINDOW));
-                    sqe->flags |= IOSQE_IO_LINK; sqe->user_data = UD(6);
-                    r->pending++;
-                }
-                int tfd = has_dst ? s + WINDOW : afd;
-                unsigned tflags = has_dst ? IOSQE_FIXED_FILE : 0;
-                if (hlen > 0) {
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_write(sqe, tfd,
-                                        c->hdr_data + c->hdr_off[i],
-                                        (unsigned)hlen, c->header_offset[i]);
-                    sqe->flags |= tflags;
-                    if (size > 0 || has_dst) sqe->flags |= IOSQE_IO_LINK;
-                    sqe->user_data = UD(3); r->pending++;
-                }
-                if (size > 0) {
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_write(sqe, tfd, r->buf, (unsigned)padded,
-                                        c->data_offset[i]);
-                    sqe->flags |= tflags | IOSQE_IO_LINK;
-                    sqe->user_data = UD(4); r->pending++;
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_close_direct(sqe, (unsigned)s);
-                    if (has_dst) sqe->flags |= IOSQE_IO_LINK;
-                    sqe->user_data = UD(5); r->pending++;
-                }
-                if (has_dst) {
-                    sqe = io_uring_get_sqe(ring);
-                    io_uring_prep_close_direct(sqe, (unsigned)(s + WINDOW));
-                    sqe->user_data = UD(7); r->pending++;
-                }
-                if (r->pending == 0) {
-                    if (s >= 0) { free_slots[n_free++] = s; r->slot = -1; }
-                    COMPLETE(i);
-                } else chains_inflight++;
-                #undef UD
+                                            : DEFAULT_DIR_MODE);
+                else if (op == OP_FBARRIER)
+                    io_uring_prep_fsync(sqe, afd, 0);
+                else
+                    io_uring_prep_unlinkat(sqe, AT_FDCWD, c->path[i],
+                            op == OP_RMDIR ? AT_REMOVEDIR : 0);
+                sqe->user_data = (uint64_t)i;
+                chains_inflight++;
             }
             if (pool_on) {      /* rows come back from the pool fully
                                    executed — just release and account */
@@ -881,32 +766,12 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
             unsigned head, seen = 0;
             io_uring_for_each_cqe(ring, head, cqe) {
                 seen++;
-                int64_t i = (int64_t)(cqe->user_data >> 8);
-                int stage = cqe->user_data & 0xff;
-                RowState *r = &rs[i];
-                if (stage == 2) {
-                    if (cqe->res >= 0) {
-                        r->read_res = cqe->res;
-                        if (cqe->res < c->size[i]) r->short_read = 1;
-                    } else if (!r->first_err) r->first_err = cqe->res;
-                } else if (cqe->res < 0 && cqe->res != -ECANCELED) {
-                    if (!(c->opcode[i] == OP_MKDIR && cqe->res == -EEXIST))
-                        if (!r->first_err) r->first_err = cqe->res;
-                }
-                if (--r->pending == 0) {
-                    chains_inflight--;
-                    if (r->sfd >= 0) { close(r->sfd); r->sfd = -1; }
-                    if (r->dfd >= 0) { close(r->dfd); r->dfd = -1; }
-                    if (r->short_read && !r->first_err)
-                        row_sync(c, i, afd, &out[i]);
-                    else {
-                        out[i].res = r->first_err;
-                        out[i].read_size = r->read_res;
-                    }
-                    free(r->buf); r->buf = NULL;
-                    if (r->slot >= 0) free_slots[n_free++] = r->slot;
-                    COMPLETE(i);
-                }
+                int64_t i = (int64_t)cqe->user_data;   /* single op per row */
+                if (cqe->res < 0 && !(c->opcode[i] == OP_MKDIR &&
+                                      cqe->res == -EEXIST))
+                    out[i].res = cqe->res;
+                chains_inflight--;
+                COMPLETE(i);
             }
             io_uring_cq_advance(ring, seen);
         }
@@ -1382,18 +1247,10 @@ int main(int argc, char **argv) {
 
     struct io_uring ring;
     if (use_uring) {
+        /* metadata-only ring: no registered files needed (single-op SQEs
+         * against AT_FDCWD / the archive fd), so this works on every
+         * kernel with io_uring_queue_init — back to 5.6. */
         int rc = io_uring_queue_init(QD, &ring, 0);
-        if (rc == 0) {
-            rc = io_uring_register_files_sparse(&ring, 2 * WINDOW);
-            if (rc == -EINVAL) {
-                /* pre-5.19 kernel: no RSRC sparse registration; a plain
-                 * register with -1 entries gives the same direct-fd table
-                 * (sparse entries since 5.12, file_index opens since 5.15) */
-                int fds[2 * WINDOW];
-                for (int i = 0; i < 2 * WINDOW; i++) fds[i] = -1;
-                rc = io_uring_register_files(&ring, fds, 2 * WINDOW);
-            }
-        }
         if (rc < 0) {
             if (strcmp(mode, "uring") == 0) {
                 fprintf(stderr, "io_uring: %s\n", strerror(-rc));
@@ -1401,12 +1258,9 @@ int main(int argc, char **argv) {
             }
             use_uring = 0;
         }
-        if (use_uring) probe_deferred_fd(&ring);
     }
-    fprintf(stderr, "quiver-exec %s: engine=%s%s\n", argv[1],
-            use_uring ? "uring" : "sync",
-            use_uring && !g_deferred_fd
-                ? " (copy=thread-open: pre-5.17 kernel)" : "");
+    fprintf(stderr, "quiver-exec %s: engine=%s\n", argv[1],
+            use_uring ? "uring" : "sync");
 
     if (!strcmp(argv[1], "exec")) {
         int afd = -1;
