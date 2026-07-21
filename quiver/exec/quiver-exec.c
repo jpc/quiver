@@ -624,31 +624,55 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
 typedef struct { int slot; } RowState;   /* pool rows carry only their slot */
 
 #define OPEN_POOL 64
+
+/* Leaf group ops (defined below); the persistent worker calls them by kind. */
+static void decode_group(const CmdBatch *c, int64_t g, int afd, RowResult *out,
+                         uint8_t **cb, size_t *ccap, uint8_t **ub, size_t *ucap);
+static void encode_group(const CmdBatch *c, int64_t d, int afd, RowResult *out,
+                         uint8_t **buf, size_t *bcap);
+
+/* ── persistent unified worker pool ────────────────────────────────────────
+ * ONE pool for the whole exec session — spawned once, reused across every
+ * batch and epoch. (Measured: spawning+joining 64 threads per batch cost
+ * ~12 ms/round-trip and capped the Python↔executor loop at ~80 rt/s; a
+ * persistent pool lifts that ~8× and drops the viable stream block from
+ * ~100 MB to ~15 MB.) It dispatches three work-item kinds:
+ *   WK_ROW    → row_sync   (metadata, raw EXTRACT, COPY, CKSUM)
+ *   WK_DECODE → decode_group (INFLATE a frame, scatter members)
+ *   WK_ENCODE → encode_group (gather a frame, DEFLATE it)
+ * Each worker keeps its own decode/encode scratch buffers, recycled across the
+ * whole session (this also subsumes the per-frame malloc the old epochs did).
+ * On wekafs, N plain threads scale where 5.15's io-wq punting doesn't
+ * (measured: 20k copies t16 2.6s / t64 0.7s vs 36s through chains). */
+enum { WK_ROW = 0, WK_DECODE = 1, WK_ENCODE = 2 };
 typedef struct {
-    const CmdBatch *c; RowState *rs; RowResult *out; int afd;
+    const CmdBatch *c; RowResult *out; int afd;
     pthread_mutex_t mu; pthread_cond_t cv_work, cv_done;
-    int64_t q[WINDOW];  int qn;      /* rows waiting for a worker */
-    int64_t dq[WINDOW]; int dn;      /* rows fully executed */
-    int active, stop;
-    pthread_t tid[OPEN_POOL]; int nthreads;
+    int64_t q[WINDOW]; uint8_t qk[WINDOW]; int qn;   /* work items waiting */
+    int64_t dq[WINDOW]; int dn;                      /* rows fully executed */
+    int active, stop, nthreads;
+    pthread_t tid[OPEN_POOL];
 } OpenPool;
 
-/* Workers run the ENTIRE row via row_sync (thread-safe: __thread bufs,
- * per-row out slots, distinct offsets on the shared archive fd). On
- * wekafs, N plain threads scale where 5.15's io-wq punting doesn't
- * (measured: 20k copies t16 2.6s / t64 0.7s vs 36s through chains). */
 static void *open_worker(void *arg) {
     OpenPool *p = arg;
+    uint8_t *cb = NULL, *ub = NULL, *eb = NULL;      /* per-worker scratch */
+    size_t ccap = 0, ucap = 0, ecap = 0;
     for (;;) {
         pthread_mutex_lock(&p->mu);
         while (p->qn == 0 && !p->stop)
             pthread_cond_wait(&p->cv_work, &p->mu);
-        if (p->qn == 0 && p->stop) { pthread_mutex_unlock(&p->mu); return NULL; }
-        int64_t i = p->q[--p->qn];
+        if (p->qn == 0 && p->stop) { pthread_mutex_unlock(&p->mu); break; }
+        int idx = --p->qn;
+        int64_t i = p->q[idx]; uint8_t k = p->qk[idx];
         p->active++;
         pthread_mutex_unlock(&p->mu);
 
-        row_sync(p->c, i, p->afd, &p->out[i]);
+        if (k == WK_ROW)         row_sync(p->c, i, p->afd, &p->out[i]);
+        else if (k == WK_DECODE) decode_group(p->c, i, p->afd, p->out,
+                                              &cb, &ccap, &ub, &ucap);
+        else                     encode_group(p->c, i, p->afd, p->out,
+                                              &eb, &ecap);
 
         pthread_mutex_lock(&p->mu);
         p->dq[p->dn++] = i;
@@ -656,18 +680,24 @@ static void *open_worker(void *arg) {
         pthread_cond_signal(&p->cv_done);
         pthread_mutex_unlock(&p->mu);
     }
+    free(cb); free(ub); free(eb);
+    return NULL;
 }
 
-static void pool_start(OpenPool *p, const CmdBatch *c, RowState *rs,
-                       RowResult *out, int afd) {
+static void pool_start(OpenPool *p) {
     memset(p, 0, sizeof *p);
-    p->c = c; p->rs = rs; p->out = out; p->afd = afd;
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->cv_work, NULL);
     pthread_cond_init(&p->cv_done, NULL);
     p->nthreads = OPEN_POOL;
     for (int t = 0; t < p->nthreads; t++)
         pthread_create(&p->tid[t], NULL, open_worker, p);
+}
+
+/* Point the (idle) pool at the current batch. Safe because a batch fully
+ * drains before the next begins, so no worker references the old CmdBatch. */
+static void pool_bind(OpenPool *p, const CmdBatch *c, RowResult *out, int afd) {
+    p->c = c; p->out = out; p->afd = afd;
 }
 
 static void pool_stop(OpenPool *p) {
@@ -681,14 +711,14 @@ static void pool_stop(OpenPool *p) {
     pthread_cond_destroy(&p->cv_done);
 }
 
-static void pool_push(OpenPool *p, int64_t i) {
+static void pool_push(OpenPool *p, uint8_t kind, int64_t i) {
     pthread_mutex_lock(&p->mu);
-    p->q[p->qn++] = i;
+    p->qk[p->qn] = kind; p->q[p->qn] = i; p->qn++;
     pthread_cond_signal(&p->cv_work);
     pthread_mutex_unlock(&p->mu);
 }
 
-/* Harvest opened rows. If `block`, wait until at least one is ready
+/* Harvest completed items. If `block`, wait until at least one is ready
  * (caller guarantees work is outstanding). Returns count. */
 static int pool_harvest(OpenPool *p, int64_t *out, int block) {
     pthread_mutex_lock(&p->mu);
@@ -709,19 +739,40 @@ static int pool_outstanding(OpenPool *p) {
     return n;
 }
 
+/* Run a buffered epoch [e0,e1) through the persistent pool: push each group's
+ * header row (INFLATE for decode, DEFLATE for encode) and wait for all to
+ * retire. Bounded to WINDOW queued so q[] never overflows; worker scratch
+ * buffers cap resident frame memory to OPEN_POOL frames. Members ride inside
+ * their group (dispatched by the leaf op), so only header rows are queued. */
+static void run_group_epoch(OpenPool *p, uint8_t kind, uint8_t hop,
+                            int64_t e0, int64_t e1) {
+    const CmdBatch *c = p->c;
+    for (int64_t i = e0; i < e1; i++) {
+        p->out[i].res = 0; p->out[i].read_size = c->size[i];
+    }
+    int64_t ng = 0;
+    for (int64_t i = e0; i < e1; i++) if (c->opcode[i] == hop) ng++;
+    int64_t got[WINDOW];
+    int64_t i = e0, done = 0;
+    while (done < ng) {
+        pthread_mutex_lock(&p->mu);
+        while (i < e1 && p->qn < WINDOW) {
+            if (c->opcode[i] == hop) { p->qk[p->qn] = kind; p->q[p->qn++] = i; }
+            i++;
+        }
+        pthread_cond_broadcast(&p->cv_work);
+        pthread_mutex_unlock(&p->mu);
+        done += pool_harvest(p, got, 1);
+    }
+}
+
 /* ── buffered decode groups (docs/ISA.md §3-§4) ────────────────────────────
  * A decode group is one INFLATE row (archive[data_offset,size] → a worker-owned
  * buffer) immediately followed by K = header_offset member EXTRACT rows, each
  * scattering a buffer slice [header_offset, +size] to its file. One worker owns
  * one grow-on-demand buffer for a whole group and decodes the frame exactly
  * once — no cache, no refcount, no single-flight; decode-once is structural.
- * Buffers resident = min(#groups, DECODE_POOL). */
-#define DECODE_POOL OPEN_POOL
-
-typedef struct {
-    const CmdBatch *c; RowResult *out; int afd;
-    const int64_t *groups; int ng; _Atomic int next;
-} DecodePool;
+ * Buffers resident = min(#groups, OPEN_POOL). */
 
 /* Source-file table for sharded decode (docs/ISA.md §10.5). The planner knows
  * the shard set ahead of time, so the files are declared on argv and opened
@@ -780,37 +831,6 @@ static void decode_group(const CmdBatch *c, int64_t g, int afd, RowResult *out,
     }
 }
 
-static void *decode_worker(void *arg) {
-    DecodePool *p = arg;
-    uint8_t *cb = NULL, *ub = NULL; size_t ccap = 0, ucap = 0;
-    for (;;) {
-        int i = atomic_fetch_add(&p->next, 1);
-        if (i >= p->ng) break;
-        decode_group(p->c, p->groups[i], p->afd, p->out, &cb, &ccap, &ub, &ucap);
-    }
-    free(cb); free(ub);
-    return NULL;
-}
-
-/* Run a whole decode epoch [e0,e1) — every INFLATE-headed group in parallel. */
-static void run_decode_epoch(const CmdBatch *c, int64_t e0, int64_t e1,
-                             int afd, RowResult *out) {
-    for (int64_t i = e0; i < e1; i++) { out[i].res = 0; out[i].read_size = c->size[i]; }
-    int64_t *groups = malloc(sizeof(int64_t) * (size_t)(e1 - e0));
-    int ng = 0;
-    for (int64_t i = e0; i < e1; i++)
-        if (c->opcode[i] == OP_INFLATE) groups[ng++] = i;
-    DecodePool p = { c, out, afd, groups, ng, 0 };
-    int nt = ng < DECODE_POOL ? ng : DECODE_POOL;
-    if (nt >= 1) {
-        pthread_t tid[DECODE_POOL];
-        for (int t = 0; t < nt; t++)
-            pthread_create(&tid[t], NULL, decode_worker, &p);
-        for (int t = 0; t < nt; t++) pthread_join(tid[t], NULL);
-    }
-    free(groups);
-}
-
 /* ── buffered encode groups (the dual: pack_fs, docs/ISA.md §3-§4) ──────────
  * A DEFLATE row heads a group: size = total assembled frame length, K =
  * header_offset = member count, pad_align = zstd level. Its K member rows
@@ -860,54 +880,18 @@ static void encode_group(const CmdBatch *c, int64_t d, int afd, RowResult *out,
     free(comp);
 }
 
-typedef struct {
-    const CmdBatch *c; RowResult *out; int afd;
-    const int64_t *groups; int ng; _Atomic int next;
-} EncodePool;
-
-static void *encode_worker(void *arg) {
-    EncodePool *p = arg;
-    uint8_t *buf = NULL; size_t bcap = 0;
-    for (;;) {
-        int i = atomic_fetch_add(&p->next, 1);
-        if (i >= p->ng) break;
-        encode_group(p->c, p->groups[i], p->afd, p->out, &buf, &bcap);
-    }
-    free(buf);
-    return NULL;
-}
-
-/* Run a whole encode epoch [e0,e1) — every DEFLATE-headed group in parallel. */
-static void run_encode_epoch(const CmdBatch *c, int64_t e0, int64_t e1,
-                             int afd, RowResult *out) {
-    for (int64_t i = e0; i < e1; i++) { out[i].res = 0; out[i].read_size = c->size[i]; }
-    int64_t *groups = malloc(sizeof(int64_t) * (size_t)(e1 - e0));
-    int ng = 0;
-    for (int64_t i = e0; i < e1; i++)
-        if (c->opcode[i] == OP_DEFLATE) groups[ng++] = i;
-    EncodePool p = { c, out, afd, groups, ng, 0 };
-    int nt = ng < DECODE_POOL ? ng : DECODE_POOL;
-    if (nt >= 1) {
-        pthread_t tid[DECODE_POOL];
-        for (int t = 0; t < nt; t++)
-            pthread_create(&tid[t], NULL, encode_worker, &p);
-        for (int t = 0; t < nt; t++) pthread_join(tid[t], NULL);
-    }
-    free(groups);
-}
-
 /* The scheduler is engine-agnostic: epochs, refcount deps, and the slot
  * bound are identical whether a row executes as a single ring SQE or on
  * the pool. ring == NULL (engine=sync, or platforms without io_uring)
  * routes every row through the pool. */
-static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
-                           RowResult *out) {
+static int run_batch_uring(struct io_uring *ring, OpenPool *pool,
+                           const CmdBatch *c, int afd, RowResult *out) {
     int64_t n = c->n_rows;
     int use_ring = ring != NULL;
     RowState *rs = calloc((size_t)n, sizeof *rs);
     int64_t *rc = calloc((size_t)n, sizeof(int64_t));   /* children left */
     int64_t *ready = malloc((size_t)n * sizeof(int64_t));
-    OpenPool pool; int pool_on = 0;    /* started on first thread-open row */
+    pool_bind(pool, c, out, afd);      /* persistent pool → this batch */
     int free_slots[WINDOW], n_free = WINDOW;
     for (int i = 0; i < WINDOW; i++) free_slots[i] = i;
 
@@ -929,11 +913,11 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
          * planner keeps each INFLATE + its members contiguous and in one epoch,
          * with parent_row=-1 (intra-group order is worker-sequential). */
         if (c->opcode[e0] == OP_INFLATE) {
-            run_decode_epoch(c, e0, e1, afd, out);
+            run_group_epoch(pool, WK_DECODE, OP_INFLATE, e0, e1);
             e0 = e1; continue;
         }
         if (c->opcode[e0] == OP_DEFLATE) {
-            run_encode_epoch(c, e0, e1, afd, out);
+            run_group_epoch(pool, WK_ENCODE, OP_DEFLATE, e0, e1);
             e0 = e1; continue;
         }
         int64_t done = 0, span = e1 - e0, n_ready = 0;
@@ -967,9 +951,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 if (!ring_op) {
                     if (n_free == 0) { ready[n_ready++] = i; break; }
                     r->slot = free_slots[--n_free];
-                    if (!pool_on) { pool_start(&pool, c, rs, out, afd);
-                                    pool_on = 1; }
-                    pool_push(&pool, i);
+                    pool_push(pool, WK_ROW, i);
                     continue;
                 }
                 struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
@@ -985,7 +967,7 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                 sqe->user_data = (uint64_t)i;
                 chains_inflight++;
             }
-            if (pool_on) {      /* rows come back from the pool fully
+            {                   /* rows come back from the pool fully
                                    executed — just release and account */
                 int64_t got[WINDOW];
                 /* block iff the pull loop can't progress either (no ready
@@ -993,8 +975,8 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                  * zero-CQE iteration would spin hot */
                 int block = chains_inflight == 0 && done < span &&
                             (n_ready == 0 || n_free == 0) &&
-                            pool_outstanding(&pool) > 0;
-                int k = pool_harvest(&pool, got, block);
+                            pool_outstanding(pool) > 0;
+                int k = pool_harvest(pool, got, block);
                 for (int q = 0; q < k; q++) {
                     int64_t i = got[q];
                     free_slots[n_free++] = rs[i].slot; rs[i].slot = -1;
@@ -1006,7 +988,6 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
                                                     pool or pull loop */
             int ret = io_uring_submit_and_wait(ring, 1);
             if (ret < 0 && ret != -EINTR) {
-                if (pool_on) pool_stop(&pool);
                 free(rs); free(rc); free(ready); return ret;
             }
 
@@ -1026,7 +1007,6 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
         #undef COMPLETE
         e0 = e1;
     }
-    if (pool_on) pool_stop(&pool);
     free(rs); free(rc); free(ready);
     return 0;
 }
@@ -1037,6 +1017,7 @@ static int run_exec(int afd, int use_uring, struct io_uring *ring) {
     emit_schema(1, COMP_SCHEMA_META, COMP_SCHEMA_LEN);
     uint8_t *meta = NULL, *body = NULL;
     size_t mcap = 0, bcap = 0;
+    OpenPool pool; pool_start(&pool);     /* one pool for the whole session */
     for (;;) {
         uint32_t hdr[2];
         int r = read_full(0, hdr, 8);
@@ -1057,7 +1038,7 @@ static int run_exec(int afd, int use_uring, struct io_uring *ring) {
         CmdBatch cb;
         if (parse_cmd_batch(meta, body, &cb)) return 1;
         RowResult *rr = calloc((size_t)cb.n_rows, sizeof *rr);
-        if (run_batch_uring(use_uring ? ring : NULL, &cb, afd, rr))
+        if (run_batch_uring(use_uring ? ring : NULL, &pool, &cb, afd, rr))
             return 1;
         int64_t n = cb.n_rows;
         int32_t *res = malloc(4 * (size_t)n);
@@ -1090,6 +1071,7 @@ static int run_exec(int afd, int use_uring, struct io_uring *ring) {
         free(ck); free(pr); free(eo); free(ed); free_cmd_batch(&cb);
         if (rc) return 1;
     }
+    pool_stop(&pool);
     emit_eos(1);
     if (afd >= 0) fsync(afd);
     return 0;

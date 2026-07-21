@@ -166,6 +166,17 @@ they need not be the whole dataset. This is the existing `(step, finish)` Plan
 framework and `drive()` loop — batched and streamed execution are the same code
 at different granularities; the block size is the single knob.
 
+**Measured round-trip floor.** One command-batch → completion exchange costs
+**~1.7 ms** (≈570 round-trips/s) — Arrow encode/decode over the pipe plus a
+minimal op. Keeping that under 10 % of wall time (block ≳ 9·L·T) puts the useful
+block at **~7 MB** (compress ~0.54 GB/s) to **~20 MB** (decode ~1.5 GB/s) — i.e.
+one frame-batch, exactly the natural streaming grain. *This depends on the pool
+being persistent:* spawning the worker pool per batch (the earlier design) cost
+~12 ms/round-trip (≈80 rt/s) and forced ~100 MB blocks. The pool is now created
+once per `exec` session and reused across every batch and epoch (one unified
+pool dispatching WK_ROW / WK_DECODE / WK_ENCODE items), so the floor is the
+protocol, not thread churn.
+
 ### Frame buffers are fixed-size and member-aligned
 
 Two questions the streaming encoder settles:
