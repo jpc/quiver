@@ -757,6 +757,53 @@ def test_zframe_unpack(tmp):
     ok("zframe unpack: parallel decode == oracle, linear + sharded + predicate")
 
 
+def test_zframe_unpack_dist(tmp):
+    """Distributed unpack: partition frames across N (local) executors, decode
+    in parallel, no reduce — must equal a single-node unpack byte-for-byte, for
+    both linear and sharded nock."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile
+    from quiver.nock import zframe
+    from quiver.remotes.multi import LocalTransport
+
+    def mk(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}{i}=".encode()) * (4 + i)
+                ti = tarfile.TarInfo(f"{pfx}/g{i:04d}.d"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    a, b = str(tmp/"da.tar.zstd"), str(tmp/"db.tar.zstd")
+    mk(a, "a", 120); mk(b, "b", 120)
+    tr = [LocalTransport(), LocalTransport(), LocalTransport()]
+    # linear: 3-way distributed unpack == single-node
+    zframe.recompress_c([a, b], str(tmp/"dl.tar.zstd"), level=4,
+                        batch_bytes=16 << 10)
+    zframe.unpack(str(tmp/"dl.tar.zstd"), str(tmp/"d1"))            # oracle
+    nd = zframe.unpack_distributed(str(tmp/"dl.tar.zstd"), str(tmp/"dN"), tr)
+    assert nd == 240, nd
+    o = {p.relative_to(tmp/"d1"): p for p in (tmp/"d1").rglob("*") if p.is_file()}
+    for rel, po in o.items():
+        assert (tmp/"dN"/rel).read_bytes() == po.read_bytes()
+    assert len(o) == 240
+    # sharded: distributed unpack of a .nockset == single-node
+    zframe.recompress_c([a], str(tmp/"ds0.tar.zstd"), level=4, batch_bytes=16 << 10)
+    zframe.recompress_c([b], str(tmp/"ds1.tar.zstd"), level=4, batch_bytes=16 << 10)
+    zframe.merge([str(tmp/"ds0.tar.zstd"), str(tmp/"ds1.tar.zstd")],
+                 str(tmp/"dm.nockset"))
+    nm = zframe.unpack_distributed(str(tmp/"dm.nockset"), str(tmp/"dsN"), tr)
+    assert nm == 240, nm
+    assert (tmp/"dsN"/"a"/"g0007.d").read_bytes() == (b"a7=") * 11
+    assert (tmp/"dsN"/"b"/"g0119.d").read_bytes() == (b"b119=") * (4 + 119)
+    ok("zframe unpack distributed: N executors, no reduce == single-node")
+
+
 def test_zframe_merge(tmp):
     """The distributed reduce: recompress sources into separate shards, then
     merge (zero-copy) into one index — must equal a single-node run over all
@@ -934,8 +981,8 @@ def main():
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
               test_zframe_plan, test_zframe_reshard, test_zframe_s3,
-              test_zframe_merge, test_zframe_unpack, test_zframe_packfs,
-              test_zframe_wal,
+              test_zframe_merge, test_zframe_unpack, test_zframe_unpack_dist,
+              test_zframe_packfs, test_zframe_wal,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)

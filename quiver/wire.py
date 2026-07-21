@@ -39,8 +39,8 @@ CMD_PL = pl.Schema({
     "uid": pl.Int32, "gid": pl.Int32, "parent_row": pl.Int64,
 })
 
-EXE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   "exec", "quiver-exec")
+EXE = os.environ.get("QUIVER_EXE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "exec", "quiver-exec")
 
 
 def _engine(e: str) -> str:

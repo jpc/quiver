@@ -80,9 +80,10 @@ def partition_plan(cmds: pl.DataFrame, root: str, n: int,
 # ── transports: where the executor runs ────────────────────────────────────
 
 class Transport:
-    """Produces a PipeExecutor bound to one node/container."""
-    def executor(self, archive: str = "-",
-                 engine: str = "auto") -> PipeExecutor:
+    """Produces a PipeExecutor bound to one node/container. `sources` are
+    extra read-only files (shard set) the executor opens once at startup."""
+    def executor(self, archive: str = "-", engine: str = "auto",
+                 sources=None) -> PipeExecutor:
         raise NotImplementedError
 
 
@@ -90,16 +91,16 @@ class LocalTransport(Transport):
     def __init__(self, exe: str = EXE):
         self.exe = exe
 
-    def executor(self, archive="-", engine="auto"):
-        return PipeExecutor(archive, engine, exe=self.exe)
+    def executor(self, archive="-", engine="auto", sources=None):
+        return PipeExecutor(archive, engine, exe=self.exe, sources=sources)
 
 
 class SshTransport(Transport):
     def __init__(self, host: str, opts=(), exe: str = EXE):
         self.host, self.opts, self.exe = host, list(opts), exe
 
-    def executor(self, archive="-", engine="auto"):
-        return PipeExecutor(archive, engine, exe=self.exe,
+    def executor(self, archive="-", engine="auto", sources=None):
+        return PipeExecutor(archive, engine, exe=self.exe, sources=sources,
                             transport=["ssh", *self.opts, self.host])
 
 
@@ -110,8 +111,8 @@ class SlurmTransport(Transport):
                  srun_opts=("--overlap", "-N1", "-n1")):
         self.node, self.exe, self.srun_opts = node, exe, list(srun_opts)
 
-    def executor(self, archive="-", engine="auto"):
-        return PipeExecutor(archive, engine, exe=self.exe,
+    def executor(self, archive="-", engine="auto", sources=None):
+        return PipeExecutor(archive, engine, exe=self.exe, sources=sources,
                             transport=["srun", *self.srun_opts,
                                        "-w", self.node])
 

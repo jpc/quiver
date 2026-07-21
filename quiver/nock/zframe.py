@@ -1240,6 +1240,50 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
     return _unpack_exec(idx, dest, path, None, engine, batch_rows)
 
 
+def unpack_distributed(path, dest, transports, predicate=None, engine="auto",
+                       batch_rows=4096):
+    """Distributed unpack (docs/ISA.md §10.5, UNPACK.md): partition the frame
+    set across N executors and decode in parallel — no reduce, since each
+    member scatters to its own dest file (disjoint outputs on shared storage).
+    Frames are the unit (a decode group can't split across nodes); round-robin
+    them across transports, balanced by frame. Sharded nock passes every shard
+    as a source to each node (weka-shared; a node reads only its frames' shards;
+    shard_id stays a global index). Returns total members unpacked."""
+    is_manifest = str(path).endswith(".nockset")
+    if is_manifest:
+        shards, idx = read_merged(path); shard_of = list(shards); afd = "-"
+    else:
+        idx = read_index(path); shard_of = None; afd = path
+    if predicate is not None:
+        idx = idx.filter(predicate)
+    os.makedirs(dest, exist_ok=True)
+    n = len(transports)
+    if not idx.height:
+        return 0
+    fkeys = (["shard_id"] if shard_of else []) + ["frame_coff"]
+    idx = idx.sort(fkeys).with_columns(
+        (pl.struct(fkeys).rle_id() % n).alias("_node"))   # frame → node
+    parts = idx.partition_by("_node", as_dict=True)
+
+    def run_one(k):
+        sub = parts.get((k,))
+        if sub is None or not sub.height:
+            return 0
+        from ..tools import _check
+        cmds, boundaries, paths = _unpack_plan(sub.drop("_node"), dest, shard_of)
+        ex = transports[k].executor(afd, engine=engine,
+                                    sources=shard_of if shard_of else None)
+        try:
+            comp = ex.execute(cmds, batch_rows=batch_rows, boundaries=boundaries)
+        finally:
+            assert ex.close() == 0
+        _check(comp, cmds)
+        return len(paths)
+
+    with cf.ThreadPoolExecutor(max_workers=n) as pool:
+        return sum(pool.map(run_one, range(n)))
+
+
 def _pack_fs_scan(root, batch_bytes, predicate, engine, threads):
     """Shared front-end: scan the tree, filter, greedy-fill frames by raw tar
     footprint (512 header + padded body), within path order."""
