@@ -458,7 +458,18 @@ def test_zframe_c(tmp):
     zframe.extract(out, str(tmp/"zcx"), pl.col("path") == "b/f0100")
     want = (b"b-100-") * (25 + 100 % 50)
     assert (tmp/"zcx"/"b"/"f0100").read_bytes() == want
-    ok("zframe C fold: zpack decompress+parse+compress in C, merge, extract")
+    # >4 GB footers can't embed in a u32-length skippable frame → .nock
+    # sidecar; the archive then stays a pristine multi-frame tar.zstd.
+    sc = str(tmp/"zs.tar.zstd")
+    zframe.recompress_c([str(tmp/"a.tar.zstd")], sc, level=6,
+                        batch_bytes=32 << 10, readers=1, compressors=2,
+                        _force_sidecar=True)
+    assert os.path.exists(sc + ".nock")
+    n2 = sp.run(f"zstd -dc {sc} | tar t | wc -l", shell=True,
+                capture_output=True, text=True).stdout.strip()
+    assert n2 == "300", n2                      # no embedded footer to trip tar
+    assert zframe.read_index(sc).height == 300  # index served from sidecar
+    ok("zframe C fold: zpack decompress+parse+compress in C, merge, sidecar")
 
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars

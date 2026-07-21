@@ -402,7 +402,8 @@ def _footer_bytes(path: str) -> bytes:
 def recompress_c(inputs, out_path: str, level: int = 6,
                  batch_bytes: int = 16 << 20, readers: int = 8,
                  compressors: int | None = None, progress=None,
-                 progress_every: float = 2.0) -> Result:
+                 progress_every: float = 2.0,
+                 _force_sidecar: bool = False) -> Result:
     """The fold: quiver-exec `zpack` does decompress + tar-parse + batch +
     compress + append entirely in C (no GIL, reader threads + compress
     pool), streaming per-member footer records here; we finalize the
@@ -457,16 +458,30 @@ def recompress_c(inputs, out_path: str, level: int = 6,
         raise RuntimeError(f"zpack exited {proc.returncode}")
     fw.close()
     flen = ftmp.tell()
-    with open(out_path, "ab") as fo:            # append the footer to the frames
-        trailer = struct.pack("<Q", flen) + _footer.MAGIC
-        fo.write(struct.pack("<II", SKIP_MAGIC, flen + len(trailer)))
-        ftmp.seek(0)
-        while True:
-            c = ftmp.read(1 << 20)
-            if not c:
-                break
-            fo.write(c)
-        fo.write(trailer)
+    # trailer: [len][MAGIC], self-locating from EOF like every nock host.
+    # ≤4 GB → one zstd skippable frame embedded in the archive (standard
+    # tools skip it); larger → a .nock sidecar so the archive stays a clean,
+    # valid multi-frame tar.zstd (a skippable frame's length field is u32).
+    trailer = struct.pack("<Q", flen) + _footer.MAGIC
+    embed = (flen + len(trailer) <= 0xFFFFFFFF) and not _force_sidecar
+    ftmp.seek(0)
+    if embed:
+        with open(out_path, "ab") as fo:        # append the footer to the frames
+            fo.write(struct.pack("<II", SKIP_MAGIC, flen + len(trailer)))
+            while True:
+                c = ftmp.read(1 << 20)
+                if not c:
+                    break
+                fo.write(c)
+            fo.write(trailer)
+    else:
+        with open(out_path + ".nock", "wb") as side:
+            while True:
+                c = ftmp.read(1 << 20)
+                if not c:
+                    break
+                side.write(c)
+            side.write(trailer)
     ftmp.close()
     return Result(members=fw.members, frames=frames)
 
