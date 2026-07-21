@@ -636,6 +636,52 @@ def test_zframe_s3(tmp):
     ok("zframe S3: reshard streamed to S3 multipart (moto), nock + byte-exact")
 
 
+def test_zframe_unpack(tmp):
+    """Parallel unpack (decode each frame once in a thread pool) must equal the
+    single-threaded extract oracle, byte-exact, for linear and sharded nock,
+    with predicate pushdown."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile
+    from quiver.nock import zframe
+
+    def mk(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}{i}-".encode()) * (6 + i)
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}.dat"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    a, b = str(tmp/"a.tar.zstd"), str(tmp/"b.tar.zstd")
+    mk(a, "a", 150); mk(b, "b", 150)
+    # linear nock: parallel unpack == extract() oracle, byte-exact
+    zframe.recompress_c([a], str(tmp/"lin.tar.zstd"), level=4, batch_bytes=16 << 10)
+    assert zframe.unpack(str(tmp/"lin.tar.zstd"), str(tmp/"ul"), workers=4) == 150
+    zframe.extract(str(tmp/"lin.tar.zstd"), str(tmp/"uo"))
+    for i in (0, 77, 149):
+        w = (f"a{i}-".encode()) * (6 + i)
+        assert (tmp/"ul"/"a"/f"f{i:04d}.dat").read_bytes() == w
+        assert (tmp/"uo"/"a"/f"f{i:04d}.dat").read_bytes() == w
+    # sharded nock: unpack resolves each member to its shard
+    zframe.recompress_c([a], str(tmp/"s0.tar.zstd"), level=4, batch_bytes=16 << 10)
+    zframe.recompress_c([b], str(tmp/"s1.tar.zstd"), level=4, batch_bytes=16 << 10)
+    zframe.merge([str(tmp/"s0.tar.zstd"), str(tmp/"s1.tar.zstd")], str(tmp/"m.nockset"))
+    assert zframe.unpack_merged(str(tmp/"m.nockset"), str(tmp/"um"), workers=4) == 300
+    assert (tmp/"um"/"a"/"f0005.dat").read_bytes() == (b"a5-") * 11
+    assert (tmp/"um"/"b"/"f0149.dat").read_bytes() == (b"b149-") * (6 + 149)
+    # predicate pushdown: only decode/write frames with matching members
+    n3 = zframe.unpack_merged(str(tmp/"m.nockset"), str(tmp/"ub"),
+                              predicate=pl.col("path").str.starts_with("b/"),
+                              workers=4)
+    assert n3 == 150 and not (tmp/"ub"/"a").exists()
+    ok("zframe unpack: parallel decode == oracle, linear + sharded + predicate")
+
+
 def test_zframe_merge(tmp):
     """The distributed reduce: recompress sources into separate shards, then
     merge (zero-copy) into one index — must equal a single-node run over all
@@ -812,7 +858,8 @@ def main():
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
-              test_zframe_plan, test_zframe_reshard, test_zframe_s3, test_zframe_merge,
+              test_zframe_plan, test_zframe_reshard, test_zframe_s3,
+              test_zframe_merge, test_zframe_unpack,
               test_zframe_wal,
               test_cksum_parallel,
               test_p1_barrier):

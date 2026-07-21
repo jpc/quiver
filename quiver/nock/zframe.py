@@ -1097,3 +1097,58 @@ def extract(path: str, dest: str, predicate: pl.Expr | None = None):
                 os.chmod(p, r["mode"] & 0o7777)
                 out.append(r["path"])
     return out
+
+
+def _unpack(idx, dest, shard_of, workers):
+    """Parallel unpack: decode each frame once in a thread pool — both the zstd
+    decode and the file writes release the GIL, so this genuinely parallelizes
+    — and scatter its members to files (the extract() loop, fanned out). The C
+    OP_EXTRACT+ZSTD_D path (docs/UNPACK.md) is the max-throughput successor;
+    this is the portable version. `shard_of(shard_id)` resolves the source file
+    — a constant for a linear nock, the shard list for a sharded one."""
+    workers = workers or (os.cpu_count() or 8)
+    has_shard = "shard_id" in idx.columns
+    keys = (["shard_id"] if has_shard else []) + ["frame_coff", "frame_clen"]
+    tl = threading.local()
+
+    def do(key, grp):
+        sid, coff, clen = key if has_shard else (0, key[0], key[1])
+        if not hasattr(tl, "d"):
+            tl.d = zstd.ZstdDecompressor()
+        with open(shard_of(sid), "rb") as f:
+            f.seek(coff)
+            raw = tl.d.decompress(f.read(clen))        # one frame, GIL released
+        for r in grp.iter_rows(named=True):
+            p = os.path.join(dest, r["path"])
+            parent = os.path.dirname(p)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(p, "wb") as w:
+                w.write(raw[r["in_off"]: r["in_off"] + r["size"]])
+            os.chmod(p, r["mode"] & 0o7777)
+            os.utime(p, ns=(r["mtime_ns"], r["mtime_ns"]))
+        return grp.height
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(do, k, g)
+                for k, g in idx.group_by(keys, maintain_order=False)]
+        return sum(f.result() for f in futs)
+
+
+def unpack(path, dest, predicate=None, workers=None):
+    """Parallel unpack of a linear nock archive → dest."""
+    idx = read_index(path)
+    if predicate is not None:
+        idx = idx.filter(predicate)
+    os.makedirs(dest, exist_ok=True)
+    return _unpack(idx, dest, lambda sid: path, workers)
+
+
+def unpack_merged(manifest, dest, predicate=None, workers=None):
+    """Parallel unpack of a sharded nock: each member resolved to its shard
+    file — the only difference from the linear case (docs/UNPACK.md)."""
+    shards, idx = read_merged(manifest)
+    if predicate is not None:
+        idx = idx.filter(predicate)
+    os.makedirs(dest, exist_ok=True)
+    return _unpack(idx, dest, lambda sid: shards[sid], workers)

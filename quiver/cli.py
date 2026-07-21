@@ -47,6 +47,12 @@ def main(argv=None):
                          "(local out); rerun with the same --wal to resume")
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling; --py only)")
+    sp = sub.add_parser("unpack",
+                        help="parallel unpack a nock archive (linear or "
+                             ".nockset manifest) → dest")
+    sp.add_argument("archive"); sp.add_argument("dest")
+    sp.add_argument("--glob", action="append", default=None, metavar="PAT")
+    sp.add_argument("--workers", type=int, default=None)
     sp = sub.add_parser("serve", help="browse a zframe archive over HTTP")
     sp.add_argument("archive"); sp.add_argument("--port", type=int, default=8756)
     a = p.parse_args(argv)
@@ -104,6 +110,13 @@ def main(argv=None):
                                       shards=a.shards, wal=a.wal)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
+    elif a.cmd == "unpack":
+        from .nock import zframe
+        pred = (pl.col("path").str.contains(zframe._globs_re(a.glob))
+                if a.glob else None)
+        fn = zframe.unpack_merged if a.archive.endswith(".nockset") else zframe.unpack
+        n = fn(a.archive, a.dest, predicate=pred, workers=a.workers)
+        print(f"{n} members unpacked -> {a.dest}")
     elif a.cmd == "serve":
         from .nock import zserve
         zserve.main([a.archive, "--port", str(a.port)])
