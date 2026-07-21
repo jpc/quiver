@@ -471,6 +471,57 @@ def test_zframe_c(tmp):
     assert zframe.read_index(sc).height == 300  # index served from sidecar
     ok("zframe C fold: zpack decompress+parse+compress in C, merge, sidecar")
 
+
+def test_zframe_plan(tmp):
+    """The plan seam: scan (C, metadata) → Polars filter/frame-assign → exec
+    (C, compress only kept members). Globs/size filters without touching C."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile, subprocess as sp
+    from quiver.nock import zframe
+
+    def mk_zst(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}-{i}-").encode() * (5 + i)      # size grows with i
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}.dat"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    mk_zst(str(tmp/"a.tar.zstd"), "a", 100)
+    mk_zst(str(tmp/"b.tar.zstd"), "b", 100)
+    srcs = [str(tmp/"a.tar.zstd"), str(tmp/"b.tar.zstd")]
+
+    # scan sees every member with source_id + ordinal
+    scan = zframe._zscan(srcs, 2)
+    assert scan.height == 200 and scan["source_id"].n_unique() == 2
+
+    # include glob: only source b's members survive
+    out = str(tmp/"only_b.tar.zstd")
+    r = zframe.recompress_c(srcs, out, level=4, batch_bytes=16 << 10,
+                            include=["b/*"])
+    idx = zframe.read_index(out)
+    assert r.members == 100 and idx.height == 100
+    assert idx["path"].str.starts_with("b/").all()
+    n = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
+               capture_output=True, text=True).stdout.strip()
+    assert n == "100", n                        # kept members form a clean tar
+    # byte-exact for a filtered member, sliced from its frame
+    zframe.extract(out, str(tmp/"bx"), pl.col("path") == "b/f0050.dat")
+    assert (tmp/"bx"/"b"/"f0050.dat").read_bytes() == (b"b-50-") * (5 + 50)
+
+    # size filter composes; frames stay valid
+    out2 = str(tmp/"big.tar.zstd")
+    r2 = zframe.recompress_c(srcs, out2, level=4, batch_bytes=16 << 10,
+                             min_size=400)
+    idx2 = zframe.read_index(out2)
+    assert (idx2["size"] >= 400).all() and r2.members == idx2.height
+    ok("zframe plan seam: scan → Polars glob/size filter → exec (kept only)")
+
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars
     # subtree partition, the fan-out/barrier, and the root-op handling
@@ -531,6 +582,7 @@ def main():
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
+              test_zframe_plan,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)

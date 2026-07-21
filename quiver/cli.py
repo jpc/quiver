@@ -32,6 +32,13 @@ def main(argv=None):
                     help="C-engine reader threads (parse fans out per source)")
     sp.add_argument("--py", action="store_true",
                     help="use the pure-Python engine (GIL-bound; supports --limit)")
+    sp.add_argument("--glob", action="append", default=None, metavar="PAT",
+                    help="keep only members matching PAT (repeatable); "
+                         "triggers the scan→plan→exec path")
+    sp.add_argument("--exclude", action="append", default=None, metavar="PAT",
+                    help="drop members matching PAT (repeatable)")
+    sp.add_argument("--min-size", type=int, default=0,
+                    help="drop members smaller than N bytes")
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling; --py only)")
     sp = sub.add_parser("serve", help="browse a zframe archive over HTTP")
@@ -84,7 +91,9 @@ def main(argv=None):
             res = zframe.recompress_c(a.inputs, a.out,
                                       batch_bytes=int(a.batch_mb * (1 << 20)),
                                       level=a.level, readers=a.readers,
-                                      compressors=a.workers, progress=_prog)
+                                      compressors=a.workers, progress=_prog,
+                                      include=a.glob, exclude=a.exclude,
+                                      min_size=a.min_size)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
     elif a.cmd == "serve":

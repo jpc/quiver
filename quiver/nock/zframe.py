@@ -399,40 +399,44 @@ def _footer_bytes(path: str) -> bytes:
         return f.read(n)
 
 
-def recompress_c(inputs, out_path: str, level: int = 6,
-                 batch_bytes: int = 16 << 20, readers: int = 8,
-                 compressors: int | None = None, progress=None,
-                 progress_every: float = 2.0,
-                 _force_sidecar: bool = False) -> Result:
-    """The fold: quiver-exec `zpack` does decompress + tar-parse + batch +
-    compress + append entirely in C (no GIL, reader threads + compress
-    pool), streaming per-member footer records here; we finalize the
-    trailing skippable-frame footer. The un-plannable frame offsets come
-    from C (assigned at append), exactly the completion-driven model."""
-    import subprocess
+def _write_footer(out_path: str, ftmp, force_sidecar: bool) -> None:
+    """Finalize the nock footer: [len][MAGIC], self-locating from EOF. ≤4 GB
+    embeds in one zstd skippable frame (standard tools skip it); larger goes
+    to a <archive>.nock sidecar, keeping the archive a clean multi-frame
+    tar.zstd (a skippable frame's length field is u32)."""
+    flen = ftmp.tell()
+    trailer = struct.pack("<Q", flen) + _footer.MAGIC
+    ftmp.seek(0)
+    if flen + len(trailer) <= 0xFFFFFFFF and not force_sidecar:
+        with open(out_path, "ab") as fo:
+            fo.write(struct.pack("<II", SKIP_MAGIC, flen + len(trailer)))
+            while (c := ftmp.read(1 << 20)):
+                fo.write(c)
+            fo.write(trailer)
+    else:
+        with open(out_path + ".nock", "wb") as side:
+            while (c := ftmp.read(1 << 20)):
+                side.write(c)
+            side.write(trailer)
+
+
+def _ingest_footer(f, out_path, force_sidecar, progress, progress_every,
+                   cin_total):
+    """Read the per-member footer records streamed by zpack/zexec (identical
+    format) and write the footer. Returns (members, frames)."""
     import time
-    from ..wire import EXE
-    compressors = compressors or (os.cpu_count() or 8)
-    cin_total = sum(os.path.getsize(p) for p in inputs)
     rec = struct.Struct("<qqiiiiqqq")           # 56B fixed tail per member
     ftmp = tempfile.TemporaryFile()
     fw = _FooterStream(ftmp)
-    proc = subprocess.Popen(
-        [EXE, "zpack", out_path, str(level), str(batch_bytes),
-         str(readers), str(compressors), *inputs],
-        stdout=subprocess.PIPE, bufsize=1 << 22)
     buf = b""
-    frames = 0
-    members = 0
+    frames = members = 0
     t0 = last = time.time()
-    f = proc.stdout
     while True:
         chunk = f.read(1 << 20)
         if not chunk:
             break
         buf += chunk
-        i = 0
-        n = len(buf)
+        i, n = 0, len(buf)
         while True:
             if i + 2 > n:
                 break
@@ -454,36 +458,186 @@ def recompress_c(inputs, out_path: str, level: int = 6,
             cout = os.path.getsize(out_path) if os.path.exists(out_path) else 0
             progress({"members": members, "frames": frames, "cout": cout,
                       "cin_total": cin_total, "elapsed": now - t0})
+    fw.close()
+    _write_footer(out_path, ftmp, force_sidecar)
+    ftmp.close()
+    return members, frames
+
+
+def _zscan(inputs, readers):
+    """scan: quiver-exec decompresses + parses each source in C (off the GIL)
+    and streams member metadata (path, stat, source_id, ordinal). No bytes
+    are compressed — this is the cheap pass that feeds the Polars planner."""
+    import subprocess
+    import numpy as np
+    from ..wire import EXE
+    proc = subprocess.Popen([EXE, "zscan", str(readers), *inputs],
+                            stdout=subprocess.PIPE, bufsize=1 << 22)
+    tail = struct.Struct("<qqiiiii")            # size,mtime,mode,uid,gid,src,ord
+    f = proc.stdout
+    paths, sizes, mtimes = [], [], []
+    modes, uids, gids, srcs, ords = [], [], [], [], []
+    buf = b""
+    while True:
+        chunk = f.read(1 << 22)
+        if not chunk:
+            break
+        buf += chunk
+        i, n = 0, len(buf)
+        while True:
+            if i + 2 > n:
+                break
+            plen = buf[i] | (buf[i + 1] << 8)
+            if i + 2 + plen + 36 > n:
+                break
+            paths.append(buf[i + 2:i + 2 + plen].decode("utf-8", "surrogateescape"))
+            (sz, mt, mo, ui, gi, sr, od) = tail.unpack_from(buf, i + 2 + plen)
+            sizes.append(sz); mtimes.append(mt); modes.append(mo)
+            uids.append(ui); gids.append(gi); srcs.append(sr); ords.append(od)
+            i += 2 + plen + 36
+        buf = buf[i:]
+    if proc.wait() != 0:
+        raise RuntimeError(f"zscan exited {proc.returncode}")
+    return pl.DataFrame({
+        "source_id": np.array(srcs, dtype=np.int32),
+        "ordinal": np.array(ords, dtype=np.int32),
+        "path": paths,
+        "size": np.array(sizes, dtype=np.int64),
+        "mode": np.array(modes, dtype=np.int32),
+        "mtime_ns": np.array(mtimes, dtype=np.int64),
+        "uid": np.array(uids, dtype=np.int32),
+        "gid": np.array(gids, dtype=np.int32)})
+
+
+def _glob_to_re(g):
+    """glob → regex without look-around (Polars' Rust engine rejects the
+    look-ahead fnmatch.translate emits). * → .*, ? → ., [..] preserved."""
+    import re
+    out, i, n = [], 0, len(g)
+    while i < n:
+        c = g[i]
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "[":
+            j = i + 1
+            if j < n and g[j] in "!^":
+                j += 1
+            if j < n and g[j] == "]":
+                j += 1
+            while j < n and g[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(r"\[")
+            else:
+                cls = g[i + 1:j]
+                out.append("[" + ("^" + cls[1:] if cls[:1] == "!" else cls) + "]")
+                i = j
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return "".join(out)
+
+
+def _globs_re(globs):
+    return "^(?:" + "|".join(_glob_to_re(g) for g in globs) + ")$"
+
+
+def plan_frames(df, include=None, exclude=None, min_size=0,
+                batch_bytes=16 << 20):
+    """The plan seam: given scanned member metadata, apply globs/size filters
+    and assign surviving members to frames (greedy fill by raw tar size,
+    within-source stream order). Returns the plan with a global `frame` id.
+    This is where arbitrary Polars policy — filters, grouping — now lives."""
+    d = df.sort(["source_id", "ordinal"])
+    if min_size:
+        d = d.filter(pl.col("size") >= min_size)
+    if include:
+        d = d.filter(pl.col("path").str.contains(_globs_re(include)))
+    if exclude:
+        d = d.filter(~pl.col("path").str.contains(_globs_re(exclude)))
+    # raw tar footprint of each member: 512 header + padded body
+    d = d.with_columns(
+        (512 + ((pl.col("size") + 511) // 512) * 512).alias("raw"))
+    # greedy per-source frame fill: a member starts frame (cum_start // batch)
+    d = d.with_columns(
+        ((pl.col("raw").cum_sum().over("source_id") - pl.col("raw"))
+         // batch_bytes).alias("lframe"))
+    # make frame ids globally unique by offsetting each source's block
+    per = (d.group_by("source_id").agg((pl.col("lframe").max() + 1).alias("nf"))
+           .sort("source_id"))
+    per = per.with_columns((pl.col("nf").cum_sum() - pl.col("nf")).alias("base"))
+    d = d.join(per.select(["source_id", "base"]), on="source_id", how="left")
+    return d.with_columns(
+        (pl.col("lframe") + pl.col("base")).cast(pl.Int32).alias("frame")
+    ).sort(["source_id", "ordinal"])
+
+
+def _write_plan(plan_df, nsrc, path):
+    """Plan file for zexec: [i32 nsrc][i32 counts[nsrc]][ents], ents being
+    per-source (i32 ordinal, i32 frame) arrays sorted by ordinal in source
+    order — C merge-joins it against the re-parsed stream."""
+    import numpy as np
+    d = plan_df.sort(["source_id", "ordinal"])
+    counts = [0] * nsrc
+    for sid, c in d.group_by("source_id").agg(pl.len().alias("c")).iter_rows():
+        counts[sid] = c
+    ords = d["ordinal"].to_numpy().astype(np.int32)
+    frames = d["frame"].to_numpy().astype(np.int32)
+    ent = np.empty(len(ords) * 2, dtype=np.int32)
+    ent[0::2] = ords
+    ent[1::2] = frames
+    with open(path, "wb") as f:
+        f.write(struct.pack("<i", nsrc))
+        f.write(np.array(counts, dtype=np.int32).tobytes())
+        f.write(ent.tobytes())
+
+
+def recompress_c(inputs, out_path: str, level: int = 6,
+                 batch_bytes: int = 16 << 20, readers: int = 8,
+                 compressors: int | None = None, progress=None,
+                 progress_every: float = 2.0, _force_sidecar: bool = False,
+                 include=None, exclude=None, min_size: int = 0) -> Result:
+    """The fold. With no filter, the fused `zpack` fast path decompresses,
+    parses, batches, compresses and appends all in C (option A). With any
+    glob/size filter, it splits into scan → Polars plan → exec (option B):
+    the plan seam where filters and frame policy live, at the cost of one
+    extra decompress-only pass (~3% of level-10 compress)."""
+    import subprocess
+    from ..wire import EXE
+    compressors = compressors or (os.cpu_count() or 8)
+    cin_total = sum(os.path.getsize(p) for p in inputs)
+
+    if include or exclude or min_size:                       # B: scan → plan → exec
+        df = _zscan(inputs, readers)
+        plan = plan_frames(df, include, exclude, min_size, batch_bytes)
+        with tempfile.NamedTemporaryFile(suffix=".plan", delete=False) as pf:
+            plan_path = pf.name
+        _write_plan(plan, len(inputs), plan_path)
+        try:
+            proc = subprocess.Popen(
+                [EXE, "zexec", plan_path, out_path, str(level),
+                 str(readers), str(compressors), *inputs],
+                stdout=subprocess.PIPE, bufsize=1 << 22)
+            members, frames = _ingest_footer(
+                proc.stdout, out_path, _force_sidecar, progress,
+                progress_every, cin_total)
+            if proc.wait() != 0:
+                raise RuntimeError(f"zexec exited {proc.returncode}")
+        finally:
+            os.unlink(plan_path)
+        return Result(members=members, frames=frames)
+
+    proc = subprocess.Popen(                                 # A: fused fast path
+        [EXE, "zpack", out_path, str(level), str(batch_bytes),
+         str(readers), str(compressors), *inputs],
+        stdout=subprocess.PIPE, bufsize=1 << 22)
+    members, frames = _ingest_footer(proc.stdout, out_path, _force_sidecar,
+                                     progress, progress_every, cin_total)
     if proc.wait() != 0:
         raise RuntimeError(f"zpack exited {proc.returncode}")
-    fw.close()
-    flen = ftmp.tell()
-    # trailer: [len][MAGIC], self-locating from EOF like every nock host.
-    # ≤4 GB → one zstd skippable frame embedded in the archive (standard
-    # tools skip it); larger → a .nock sidecar so the archive stays a clean,
-    # valid multi-frame tar.zstd (a skippable frame's length field is u32).
-    trailer = struct.pack("<Q", flen) + _footer.MAGIC
-    embed = (flen + len(trailer) <= 0xFFFFFFFF) and not _force_sidecar
-    ftmp.seek(0)
-    if embed:
-        with open(out_path, "ab") as fo:        # append the footer to the frames
-            fo.write(struct.pack("<II", SKIP_MAGIC, flen + len(trailer)))
-            while True:
-                c = ftmp.read(1 << 20)
-                if not c:
-                    break
-                fo.write(c)
-            fo.write(trailer)
-    else:
-        with open(out_path + ".nock", "wb") as side:
-            while True:
-                c = ftmp.read(1 << 20)
-                if not c:
-                    break
-                side.write(c)
-            side.write(trailer)
-    ftmp.close()
-    return Result(members=fw.members, frames=frames)
+    return Result(members=members, frames=frames)
 
 
 def read_index(path: str) -> pl.DataFrame:
