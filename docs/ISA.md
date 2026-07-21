@@ -1,303 +1,259 @@
-# The quiver IO ISA
+# The quiver IO ISA — a buffer machine
 
 Every existing and planned feature recast as operations of one machine, so that
 implementation adds *instructions and addressing modes*, not *modes*. Read
 `docs/MACHINE.md` first for the framing; this is the instruction-set detail.
 
+This is the **buffer-machine** revision. The earlier ISA had one fused
+`COMPRESS` superinstruction that internally fetched, transformed, and sank —
+and it argued *against* an explicit intermediate buffer on the grounds that
+naming a 16 MB value in the control plane "drags the byte plane into the
+control plane." That objection is wrong, and the frame-cache we built to make
+the fused form work (a runtime LRU with single-flight and refcounts) is the
+proof: it was a *runtime* mechanism rediscovering something the planner already
+knows — which members share a decompressed frame, hence exactly when each
+buffer is born and dies. **Buffer lifetimes are known ahead of time.** So the
+buffer becomes a first-class, planner-allocated ISA value, and the machine
+becomes small composable ops over explicit buffers.
+
 ## 0. Instructions vs programs vs services
 
-Three levels get confused, so pin them down:
+Three levels, pinned down:
 
-- **Instructions** — what the machine executes. Only these are the ISA. There
-  are four classes (§1).
+- **Instructions** — what the machine executes. Only these are the ISA (§2).
 - **Programs** — compiler front-ends that lower to an instruction stream, living
   entirely in Polars: `du`, `rm`, `cp`, `sync`/`rsync`, `pack`, `extract`,
-  `recompress`, `reshard`. The machine never sees them; they emit instructions.
-  (`du` emits *none* — it's a pure query over a generator's output.)
-- **Services** — runtime/µarch machinery that isn't an instruction: the linker
-  (footer writer), the WAL journal, the S3 uploader (a sink's implementation),
-  the dependency scheduler. They operate *on* the streams, not *in* them.
+  `recompress`, `reshard`, `pack_fs`, `unpack`. The machine never sees them.
+- **Services** — runtime machinery that isn't an instruction: the linker (footer
+  writer), the WAL journal, the S3 uploader (a sink's implementation), the
+  dependency scheduler, the **buffer allocator**. They operate *on* the streams,
+  not *in* them.
 
-So `rm` and `rsync` are **programs**, not instructions. `scan` is an
-**instruction** — but a generator (§1), not a transformer.
+## 1. State and ports
 
-## 1. Instruction classes
+- **Generators** (read an address space → a row stream; *1 request → N rows*).
+  `SCAN` streams `STAT` rows from a namespace subtree; `ZSCAN` streams `ZMETA`
+  rows from a `tar.zstd`; the nock **footer** is a generator with no work at all
+  (the whole member→frame table is already on disk). Generators are the operand
+  supply the compiler plans over. They run on the **scan port**; everything
+  below runs on the **execute port** (command stream in → completion stream out).
+- **The execute port** processes the instruction stream (§2) against two
+  resources: the **archive fd(s)** / remote sinks, and a **fixed pool of memory
+  buffers** — the only managed resource the whole design has.
 
-Two ports and four classes:
+## 2. The data ISA: three composable ops
 
-- **Generators** (read an address space → a row stream; *1 request → N rows*,
-  no command input). `SCAN` reads a namespace subtree via getdents+statx and
-  streams `STAT` rows; `ZSCAN` reads a `tar.zstd` via decompress+parse and
-  streams `ZMETA` rows. These are the machine's **read-state** side — the
-  operand supply the compiler plans over. They correspond to reading the `FILE`
-  and `STREAM` source address spaces (§2) *as a table*. They run on the **scan
-  port** (root in → rows out); everything below runs on the **execute port**
-  (command stream in → completion stream out).
-- **Control-path** transformers (namespace + metadata; latency-bound → io_uring
-  ring): `MKDIR`, `UNLINK`, `RMDIR`, `SETMETA` (and the natural future `LINK`,
-  `SYMLINK`, `RENAME`). Names and inode attributes, never bulk bytes.
-- **Data-path** transformers (bytes; throughput-bound → 64-worker pool): `COPY`,
-  `CKSUM`, `EXTRACT`, `COMPRESS` — *one instruction family*, see §2.
-- **Ordering**: `FBARRIER` — a fence + durability point, issuable to either
-  transformer unit.
+The law that shapes everything: **a (de)compression boundary is the only thing
+that forces bytes into a managed buffer; nothing else does.** File↔file,
+archive-range↔file, archive↔archive, ↔S3 never need one — the consumer pulls the
+byte range straight from the source (`pread`/`pwrite`/`splice`, zero-copy). zstd
+alone needs contiguous memory. So the data ISA is:
 
-Transformers are *1 command → 1 completion*; generators are *1 → N*; that
-cardinality difference is why `scan`/`zscan` have their own invocation (the
-scan port) rather than riding the command stream.
+| op | signature | crosses zstd? | touches a buffer? |
+|----|-----------|:---:|:---:|
+| **COPY** | region → region, identity | no | move-through only |
+| **INFLATE** | compressed src-range → `BUF[k]` | decode | **writes** a buffer |
+| **DEFLATE** | `BUF[k]` → sink-append | encode | **consumes** a buffer |
+| **CKSUM** | region → (checksum, no bytes) | no | no |
 
-## 2. The data-path is one instruction, parameterized
+A **region** is one of:
 
-`COPY`/`EXTRACT`/`COMPRESS`/`CKSUM` are the same operation — **move a byte
-range from a source, through a transform, to a sink, and report a result** —
-differing only in three operand fields. Naming those fields *is* the
-simplification; new features become new field values, not new opcodes.
+| region | operand | zero-copy? |
+|---|---|:---:|
+| `FILE(path[, off, len])` | a filesystem byte range | yes |
+| `ARCHIVE(off, len)` | a range of the nock host fd | yes |
+| `S3(key[, range])` | a remote object / part | yes (server-side) |
+| `INLINE(bytes)` | bytes carried in the instruction | n/a (already in-stream) |
+| `BUF(k, off, len)` | a slice of managed buffer *k* | memcpy |
 
-**Source addressing modes** — where the operand bytes come from:
-| mode | operand | used by |
-|---|---|---|
-| `FILE(path, off, len)` | a filesystem byte range | COPY, CKSUM |
-| `ARCHIVE(off, len)` | a range of the nock host | EXTRACT |
-| `INLINE(header)` | bytes carried in the instruction | small members in pack |
-| `STREAM(source_id, member)` | a member of a `tar.zstd` input | recompress |
+**COPY is the dumb mover.** It never transforms; it moves region A → region B,
+zero-copy whenever neither end is a `BUF`. It subsumes today's `COPY`
+(file→archive), `EXTRACT` (archive→file), buffer **scatter** (`BUF→file`) and
+**gather** (`file→BUF`), and inline header emission (`INLINE→BUF`). **INFLATE**
+and **DEFLATE** are the *only* ops that cross the zstd boundary and are the only
+ops that create/retire a buffer. That is the entire architecture:
 
-`STREAM` is special: the bytes don't exist until decoded, so it needs a **fetch
-stage** — the decompress+parse "reader" — that gathers members into frame
-operands. That fetch stage is the one genuinely new execution hardware the fold
-requires; everything else is a field value.
+```
+raw extract        COPY  ARCHIVE(o,l) → FILE(p)                 # zero-copy
+cp                 COPY  FILE(s) → FILE(d)                      # zero-copy
+merge / concat     COPY  ARCHIVE_a(o,l) → ARCHIVE_m            # zero-copy
+verify             CKSUM FILE(p) → ⊘
+unpack a frame     INFLATE ARCHIVE(coff,clen) → BUF[k]          # + per member:
+                   COPY  BUF[k](in_off,size) → FILE(path)       #   scatter
+pack a frame       COPY  INLINE(paxhdr) → BUF[k](hoff)          # + per member:
+                   COPY  FILE(path) → BUF[k](boff,size)         #   gather
+                   DEFLATE BUF[k] → ARCHIVE_APPEND              # then encode
+```
 
-**Transforms** — applied to the operand in flight:
-`IDENTITY` (copy), `ZSTD_C(level)` (compress), `ZSTD_D` (decompress),
-`CKSUM` (CRC-64, produce no output).
+**Sinks** for COPY/DEFLATE are `FILE`, `ARCHIVE_APPEND` (offset assigned at
+retirement — §7), `S3(sink_id)` (→ multipart uploader), or `⊘` (CKSUM). Reshard
+is just which `sink_id` a group's DEFLATE targets; S3 is a sink mode. No new
+machine for either.
 
-**Sink addressing modes** — where the result bytes go:
-| mode | operand | used by |
-|---|---|---|
-| `FILE(path, off)` | a filesystem file | cp, extract |
-| `ARCHIVE_APPEND` | append to the host, offset assigned at run time | pack, recompress |
-| `STREAM(sink_id)` | an external stream (a FIFO → S3 multipart) | reshard-to-S3 |
-| `NULL` | discard (CKSUM only) | verify |
+## 3. Buffers: explicit, planner-allocated, group-scoped
 
-So: `COPY = XFER(FILE→FILE, IDENTITY)`, `EXTRACT = XFER(ARCHIVE→FILE)`,
-`COMPRESS = XFER(STREAM/INLINE→ARCHIVE_APPEND, ZSTD_C)`,
-`CKSUM = XFER(FILE→NULL, CKSUM)`. Reshard is just the sink `sink_id`; S3 is a
-sink mode; decompress-on-extract is a transform. None of these need a new
-machine.
+Bytes crossing the zstd boundary live in a **buffered group** — the unit of
+dispatch:
 
-## 3. Static vs dynamic destinations — the plan/link boundary
+```
+decode group:   INFLATE →BUF[k];  COPY BUF[k]→…  (× members)
+encode group:   COPY …→BUF[k]  (× members);  DEFLATE BUF[k]→sink
+```
 
-A sink offset is either **compile-time** (the planner knows the layout because
-member sizes are known — pack lays out sequential offsets) or **run-time** (the
-size isn't known until the transform runs — `ZSTD_C` output length). The latter
-is why `ARCHIVE_APPEND` assigns the offset at retirement and reports it in the
-completion. The **linker** (footer writer) merges both into one relocation
-table: static offsets from the plan, dynamic offsets from completions. This is
-exactly quiver's "plannable / un-plannable" split, now named.
+One worker owns one buffer and runs a group start-to-finish in listed order,
+then reuses the slot for its next group. This is what makes the schedule AOT:
 
-## 4. Ordering model
+- **Buffer lifetime = group extent.** The planner emits INFLATE-then-scatters
+  (or gathers-then-DEFLATE) contiguously; the intra-group order *is* the
+  dependency, satisfied by the owning worker running sequentially. No LRU, no
+  refcount, no single-flight — the step-1 frame cache disappears.
+- **Buffer count = worker count** `W` (×2 if we want decode/encode-ahead
+  double-buffering). The allocator is a register-allocation pass over `W` slots;
+  a group waits for a free slot exactly as an instruction waits for a free
+  register. Because a frame is never split across workers, no buffer is ever
+  shared and no lock guards buffer contents.
+- **Sizes are known**, so slots are pre-sized and groups can be bucketed to a
+  few fixed capacities:
+  - **nock** → frame uncompressed length from the footer (`max(in_off+size)`
+    over the frame, or stored `frame_ulen`);
+  - **pack / pack_fs** → `Σ (512 + padded_body)` over the frame's members;
+  - **legacy monolithic `tar.zstd`** → bounded by the streaming block (§5).
 
-Independent instructions run in parallel (max ILP). Ordering is expressed two
-ways today, both lowerings of one partial order:
-- `dep_group` (epochs): instructions in a group are a scheduling barrier — used
-  by `rm` to put a directory's children in an earlier epoch than the `RMDIR`.
-- `parent_row` (refcount): a dependency edge — a child decrements its parent's
-  count; the parent issues when it hits zero.
-- `FBARRIER`: a full fence + fsync.
+Contrast the old fused `COMPRESS`: it kept the buffer microarchitectural
+*because the control plane couldn't size or place it*. Once the planner sizes
+and places it, explicit is strictly better — it also makes `INFLATE` and
+`DEFLATE` independently schedulable (decode near storage, encode on compute)
+the day we want a distributed pipeline, with the buffer as the cut point.
 
-The clean statement: **each instruction may declare dependencies; the scheduler
-executes the DAG.** Epochs and refcounts are two encodings; a future ISA can
-pick one.
+## 4. Two dispatch classes
 
-## 5. Result / completion model
+The executor has exactly two data schedulers, split by whether an op touches a
+buffer:
 
-Each instruction retires a completion tagged by `user_data` (the reorder-buffer
-tag — completions arrive out of order and re-associate). The result register
-file is small and currently *role-overloaded*:
-`res` (status/errno), `read_size` (bytes written **or** `coff`), `cksum`
-(checksum **or** `clen`), `etag`/`parts` (S3 multipart). A clean ISA names
-result fields by role (`out_offset`, `out_len`, `checksum`, `status`) instead
-of reusing `read_size`/`cksum`.
+- **Bufferless** — zero-copy `COPY`, `CKSUM`, and all metadata ops
+  (`MKDIR`/`UNLINK`/`RMDIR`/`SETMETA`/`FBARRIER`). Independent, dispatched
+  **per row** on the ring/pool, ordered by `dep_group` epochs — the plane that
+  already exists.
+- **Buffered groups** — `INFLATE…COPY*` and `COPY*…DEFLATE`. Dispatched **per
+  group** to a worker that owns one of the `W` buffers for the group's duration.
+  This is the zpack compress-pool generalized (that pool was already
+  buffer-per-worker — which is exactly why the *compress* side was never the
+  problem; only the per-row `EXTRACT` dispatch was).
 
-## 6. Every tool and feature, recast
+Unifying these two retired schedulers into one buffered-group scheduler is the
+core of the de-fork (§11).
 
-| feature | as a VM program |
+## 5. Streaming: plan a block at a time
+
+Only **nock** is fully AOT — its footer is the whole plan, no execution
+feedback. Every other source is discovered as you go, so the machine **streams**:
+the planner consumes the source in **blocks**, plans each block, and feeds the
+executor, overlapping planning of block *n+1* with execution of block *n*.
+
+- **live FS** (`pack_fs`, `cp`, `rm`, `rsync`) — the scan itself can take a
+  while, so block on `scan_iter` output; plan each batch of `STAT` rows as it
+  arrives. (`rsync` = block the `scan × scan` diff.)
+- **legacy monolithic `tar.zstd`** (`recompress`) — `INFLATE` the source into a
+  **double-buffer**; as the tar flows, emit the member list, plan frame cut
+  points, and — because a nock frame is a *contiguous run of the original tar* —
+  `DEFLATE` a slice of the live buffer directly (no gather).
+- **uncompressed tar** — a quick scan of the 512-byte headers up front, then
+  plan.
+
+The **only** constraint on block size is amortizing the Python↔executor call
+overhead: blocks must be big enough that per-batch fixed cost is negligible, and
+they need not be the whole dataset. This is the existing `(step, finish)` Plan
+framework and `drive()` loop — batched and streamed execution are the same code
+at different granularities; the block size is the single knob.
+
+## 6. Ordering
+
+Independent instructions run in parallel (max ILP). Ordering is a partial order
+with two encodings today, both retained:
+
+- `dep_group` (epochs) — a scheduling barrier between groups of rows (`rm` puts
+  a directory's children in an earlier epoch than its `RMDIR`; `cp` puts
+  `MKDIR` before `COPY`).
+- `parent_row` (refcount) — a dependency edge; a child decrements its parent's
+  count, the parent issues at zero.
+- `FBARRIER` — a full fence + fsync; the footer commits after it (nock §3.3).
+
+**Intra-group ordering needs neither** — the worker runs a group's ops in listed
+order, so INFLATE-before-scatter and gather-before-DEFLATE are free. Cross-group
+and metadata ordering use the epochs/refcounts above.
+
+## 7. Static vs dynamic destinations — the linker
+
+A sink offset is either **compile-time** (member sizes known → `pack`/`COPY`
+lay out sequential offsets) or **run-time** (`DEFLATE` output length is unknown
+until it runs). `ARCHIVE_APPEND` assigns the offset at retirement and reports it
+in the completion. The **linker** merges both into one footer relocation table:
+static offsets from the plan, dynamic offsets from `DEFLATE` completions. Each
+instruction retires a completion tagged by `user_data` (completions arrive out
+of order and re-associate); result fields are role-named — `out_offset`,
+`out_len`, `checksum`, `status` — not the current overloaded
+`read_size`/`cksum`.
+
+## 8. Every tool and feature, recast
+
+| feature | lowering |
 |---|---|
-| `scan` | read machine state: stream `STAT` rows (operand fetch for the compiler) |
-| `du` | a Polars **query** (aggregation) over the `scan` table — no instructions |
-| `rm` | compile `UNLINK`+`RMDIR` with child→parent ordering |
-| `cp` | compile `MKDIR`+`COPY`+`SETMETA`, dirs scheduled before files |
-| `sync` | compile a reconciliation program from a `scan`×`scan` diff |
-| `pack` | compile `COPY→ARCHIVE_APPEND` with **static** offsets; link the footer |
-| `extract` | resolve names via the footer, compile `EXTRACT`+`MKDIR`+`SETMETA` |
-| **recompress** | `zscan` = fetch `STREAM` state → plan → `COMPRESS` (`STREAM→ARCHIVE_APPEND`, `ZSTD_C`) → link from completions |
-| **reshard** | recompress with a per-instruction `sink_id` (fan the sink) |
-| **S3 stream** | sink mode `STREAM(sink_id)` → FIFO → multipart uploader |
-| **WAL resume** | journal retired instructions; on restart the compiler elides the ones already committed |
-| **distribute** | shard the instruction stream across interpreters by subtree affinity; merge results |
+| `scan` | generator: stream `STAT` rows |
+| `du` | Polars **query** over the `scan` table — no instructions |
+| `rm` | `UNLINK`+`RMDIR`, child→parent ordering (streamed over scan-close events) |
+| `cp` | `MKDIR`+`COPY`(zero-copy)+`SETMETA` |
+| `rsync` | reconciliation program from a streamed `scan × scan` diff |
+| `pack` | `COPY FILE→ARCHIVE_APPEND` (static offsets); link the footer |
+| `extract` | footer → `COPY ARCHIVE→FILE` (zero-copy) + `MKDIR` + `SETMETA` |
+| **unpack** (nock) | footer → per frame: `INFLATE`, then `COPY BUF→FILE` per member |
+| **pack_fs** | scan → per frame: `COPY INLINE(pax)→BUF` + `COPY FILE→BUF`, then `DEFLATE` |
+| **recompress** | stream-`INFLATE` source → plan cut points → `DEFLATE` live slices |
+| **reshard** | per-group `sink_id` on the `DEFLATE` (fan the sink) |
+| **S3 stream** | sink mode `S3(sink_id)` → FIFO → multipart uploader |
+| **merge** | zero-copy `COPY ARCHIVE→ARCHIVE` (or logical: manifest only) |
+| **WAL resume** | journal `DEFLATE` completions; planner elides committed frames |
+| **distribute** | shard the stream by subtree / frame-range affinity; merge results |
 
-The point of the table: recompress is *structurally pack* — same program shape
-— with source mode `STREAM` instead of `FILE` and transform `ZSTD_C` instead of
-`IDENTITY`. It became a separate machine only by accident.
+The PAX header lives in exactly one place — the planner's `tobuf(PAX_FORMAT)`,
+carried `INLINE`. The executor has **no** tar knowledge: it moves bytes, decodes
+frames, encodes buffers. That is the whole point.
 
-## 7. Current warts (what the ISA cleanup removes)
+## 9. Encoding: narrow the word per stream
 
-- **Overloaded `pad_align`**: it's both copy alignment and `ZSTD_C` level. →
-  a dedicated `xform_param`.
-- **Overloaded results**: `read_size`=`coff`, `cksum`=`clen`. → role-named
-  result fields.
-- **Implicit addressing modes**: source/sink modes are baked into the opcode
-  rather than being operand fields. → explicit `src_mode`/`sink_mode`.
-- **The forked ISA**: recompress's plan file + 60-byte records + bespoke WAL
-  are a parallel encoding of the command stream, completion stream, and
-  `wal.py`. → re-merge (this is the pending refactor).
+The command word is **wide** (`CMD_SCHEMA`, 15 columns) but any op uses few. The
+general exec stream is **not** opcode-homogeneous — `sync` interleaves
+`MKDIR`+`COPY`+`UNLINK`+`RMDIR` by epoch, and `row_sync` dispatches per row — so
+the wide word is what lets any op sit in any row; keep it for the mixed stream.
+But a **buffered-group plan stream** is intrinsically a handful of opcodes
+(`INFLATE`/`COPY`/`DEFLATE`) and rides its own stream with its own schema
+header, so it can carry a packed schema (the head-of-stream schema message says
+which encoding, like a general vs SIMD encoding on a CPU). And the whole plan
+stream zstd-compresses on the wire — the constant/zero columns vanish (measured
+1.7 B/row). Both compose because they are different streams.
 
-## 8. What this means for implementation (before writing it)
+## 10. What this replaces — the migration
 
-The refactor is "lower recompress onto the one ISA," and the ISA view fixes its
-shape:
+The old ISA's forked artifacts (the fused `COMPRESS`, the bespoke plan file +
+60-byte records, the runtime frame cache, the separate zpack/zexec/exec
+schedulers) collapse into: **three data ops over planner-allocated buffers, two
+dispatch classes, one command schema, one completion schema, one WAL.**
 
-1. **The plan is a command stream, at member granularity.** Each row is a
-   placement instruction — `opcode=COMPRESS`, operands `(source_id, ordinal,
-   frame, sink, level)` — carried in `CMD_SCHEMA` (adding `frame`/`sink` or
-   mapping `frame→dep_group`, `sink→a sink field`, `level→xform_param`). The
-   executor reads it with the normal `StreamReader`, not a bespoke plan file.
-2. **`STREAM` source ⇒ a fetch stage.** The executor keeps the decompress+parse
-   reader, but now as the operand-fetch for `COMPRESS`: it gathers a frame's
-   members (by `ordinal`, per the command rows) and hands the frame to the
-   `ZSTD_C` unit. Instructions are per-member (micro-ops); `COMPRESS` retires
-   per-frame — a legitimate decode-into-µops story, made explicit.
-3. **Completions carry the dynamic offset.** `COMPRESS` retires `(coff, clen,
-   sink)` in the completion stream (Arrow `COMP`), and the linker writes the
-   footer from it — deleting the 60-byte record format.
-4. **Resume is the existing WAL.** Journal the `COMPRESS` completions; on
-   restart the planner drops committed frames — the same "replay uncommitted
-   instructions" the executor WAL already does for `rm`.
+Re-sequenced de-fork (supersedes `docs/DEFORK.md`'s original order):
 
-Acceptance test for all of it: after the refactor there is **one** instruction
-schema in, **one** completion schema out, **one** WAL, and recompress differs
-from pack only by field values (`STREAM`/`ZSTD_C`) — no second machine.
+1. **Buffered-group scheduler in the executor** — `W` buffers, a group queue;
+   a worker owns a buffer for a group's extent. Replaces the per-row `EXTRACT`
+   dispatch *and* the zpack pool with one mechanism.
+2. **Rework unpack onto it** — `INFLATE` + `COPY BUF→FILE` group; **delete the
+   step-1 frame cache** (`g_fc`/`fc_get`/`fc_release`). Oracle: current
+   `unpack(engine=None)`.
+3. **pack_fs** — `COPY INLINE→BUF` + `COPY FILE→BUF` gather group + `DEFLATE`;
+   PAX header inline from the planner. Oracle: current `pack_fs`.
+4. **recompress** — fold `zexec`/`zpack` into a streaming (§5) `INFLATE`→plan→
+   `DEFLATE`-live-slice group; retire the plan-file + 60-byte records to the
+   command/completion streams.
+5. **Sharded / multi-file source + merge** fall out of the `sink_id` field and
+   a `shard_id → fd` table.
 
-## 10. Instruction encoding: narrow the word, don't pad it
-
-The command word is **wide** (`CMD_SCHEMA`, 15 columns) but any one opcode uses
-few — `OP_COMPRESS` uses 5 (`source_id`, `ordinal`, `frame`, `sink`, `level`).
-The other 10 are dead weight: ~100 B/row vs the ~24 B the operands need, and the
-empty `path`/`dst_path`/`header` columns still carry `n×8` offset buffers. On a
-33 M-member plan that's a multi-GB stream — and it now *travels to nodes*
-(`docs/DISTRIBUTED.md`), so compactness matters. Three ways to shrink it:
-
-1. **Nullable columns.** Mark the unused columns null: an all-null column
-   collapses to a validity bitmap (or omits its buffers entirely), and the
-   empty-string offset buffers disappear. Arrow IPC also allows per-buffer
-   LZ4/ZSTD. *Caveat:* pupyarrow and `parse_cmd_batch` assume every column's
-   buffers are fully materialized at fixed indices, so nulls/compression need
-   the reader to handle validity and absent buffers — real work, and it keeps
-   the wide word.
-2. **Narrow schema per *stream*** *(recommended — with a caveat).* Give a
-   compact schema to a stream that is *intrinsically one opcode*. This is the
-   important correction: batches are **not** opcode-homogeneous in general.
-   `row_sync` dispatches **per row** (`switch (c->opcode[i])`), `PipeExecutor`
-   chunks by **row range**, and the tools emit **mixed** batches (`sync` =
-   `MKDIR`+`COPY`+`UNLINK`+`RMDIR` in one DataFrame, ordered by `dep_group`
-   epochs that interleave opcodes). The wide word is precisely what lets any
-   opcode sit in any row — so a narrow per-opcode schema is *not* a free swap for
-   the general exec stream.
-
-   But the **recompress plan is intrinsically homogeneous** — every row is
-   `OP_COMPRESS` — and it rides its *own* stream (`zexec` reads it; `exec` reads
-   mixed commands). So it can carry a narrow `ZPLAN` schema (`{source_id,
-   ordinal, frame, sink, level}`) without touching the mixed path at all. The
-   executor already reads a schema message at the head of each stream; that
-   header says which encoding a stream uses — one general wide format for mixed
-   batches, a packed format for a single-opcode stream, like a CPU with a
-   general encoding plus a SIMD one. Needs the small `ZPLAN` reader (deferred in
-   stage 2), no validity machinery.
-3. **Just compress on the wire.** zstd the plan stream for transfer — the
-   constant/zero columns vanish under general compression. Cheap and immediate,
-   but the *parse* cost (materializing full buffers in C) is unchanged.
-
-So: **yes, nulls work**, but the cleaner answer is a narrow schema on the
-homogeneous *plan* stream (not opcode-grouping the general path, which fights
-per-row dispatch and epoch interleaving). Stage 2 took the wide word (reusing
-`parse_cmd_batch`) to land the lowering with zero new C; the narrow `ZPLAN`
-schema on the plan stream is the compacting follow-up, and it composes with the
-mixed exec stream because they're different streams with different schema
-headers.
-
-## 9. Instruction granularity: fuse the architecture, pipeline the µarch
-
-Should the data-path instruction split into separate `LOAD` (fetch/decompress
-the operand), `XFORM` (de/compress), and `SINK` (store) instructions? The
-stages are real — they already exist as the fold's reader threads, compress
-pool, and per-sink writers, with wildly different cost profiles (`ZSTD_D`
-~1 GB/s, `ZSTD_C(10)` ~25 MB/s/core, sink = disk or network). So the question
-is whether to make them **architectural** (three instructions in the stream) or
-keep one fused `COMPRESS` and leave the stages **microarchitectural**.
-
-**Keep one architectural instruction; crack it into a 3-stage pipeline in the
-executor.** Three reasons, in order of weight:
-
-1. **The intermediate value is bulk bytes.** In a CPU ISA the value between
-   instructions is a register (8 bytes); here it's a ~16 MB frame moving at
-   GB/s. Splitting makes that buffer a first-class ISA value the *instruction
-   stream* must name and the scheduler must allocate and lifetime-manage —
-   which drags the **byte plane into the control plane**, the one boundary the
-   whole design defends. Fused, the control plane says "compress member M into
-   frame F of sink S" and never touches a byte; the buffer stays a
-   microarchitectural detail.
-2. **Fusion is where the pipelining lives.** A fused op keeps the frame buffer
-   local to one dataflow — gathered, compressed, and handed to its sink without
-   a scheduler round-trip. This is why GPUs fuse kernels and databases fuse
-   operators rather than materializing intermediates; it's also literally why
-   the fold hits 540 MB/s. Splitting would materialize the intermediate through
-   a scheduler for no gain on one node.
-3. **The fetch is shared, not per-instruction.** One decompression pass of a
-   source supplies the operands for *all* its frames — you must not `LOAD` per
-   frame. So the `STREAM` fetch is a per-source **operand supply bound to the
-   addressing mode** (the reader / `zscan`), feeding many `COMPRESS` ops — a
-   shared front-end resource, not a `LOAD` instruction. That already argues
-   against a symmetric LOAD/XFORM/SINK split.
-
-The analogy is exact: x86 `add [mem], reg` is **one** architectural instruction
-the microarchitecture cracks into load + ALU + store µops. We do the same —
-`COMPRESS` is one instruction; the executor's decompress→compress→sink threads
-are its µops, tuned independently (`readers`/`compressors` counts, per-sink
-backpressure) without appearing in the ISA.
-
-**The one case that flips it: independent *placement*.** Promote the µops to
-architectural instructions only when a stage needs to run on a *different
-machine* — decode near storage, `ZSTD_C` on compute nodes, `SINK` near S3 — i.e.
-a distributed pipeline where the intermediate crosses a network anyway (so
-materializing it is no longer free). Single-node throughput doesn't need this
-today, so keep it in the back pocket: build `COMPRESS` fused, but keep the three
-stages cleanly separable in the executor so a future distributed dataflow can
-cut between them. (Checkpointing between stages is *not* a reason — §8.4's WAL
-re-decodes to fast-forward, and decode is the cheap 3%.)
-
-## 11. Why the plan is a separate stream — addressing mode, not opcode
-
-Do we mix `OP_COMPRESS` with other commands? **Yes — the `INLINE`-source form.**
-`row_sync case OP_COMPRESS` compresses the `header` column (bytes carried in the
-row), one row → one frame, and appends it — a per-row peer that sits happily in
-a mixed batch alongside `COPY`/`UNLINK`. So the opcode is *not* what segregates
-the recompress plan.
-
-What segregates it is the **`STREAM` source addressing mode**. The plan's
-`OP_COMPRESS` rows have `src = STREAM(source_id, ordinal)` — their operand bytes
-must be *fetched* by decompressing a `tar.zstd` and gathering members by ordinal
-(§3, §9). That fetch is a per-source pipeline: one decompress pass supplies many
-rows' operands, so `STREAM` rows are consumed **grouped by source** by the fetch
-coprocessor, not dispatched per row. That's a different execution model than the
-ring/pool, so it runs as its own pass (`zexec`) over a stream that is — for that
-reason — intrinsically all-`STREAM`-`OP_COMPRESS`. Nothing to mix, and a packed
-`ZPLAN` encoding (§10) fits.
-
-So the segregation is by **addressing mode** (`STREAM` needs a fetch stage), not
-by opcode — the same fact behind §3 and §9. It also names the last residue of
-the fork: `STREAM`-source `OP_COMPRESS` runs as a separate *mode* rather than
-being routed inside the one executor. The pure end-state is a single executor
-that dispatches by source mode — `INLINE`/`FILE`/`ARCHIVE` → per-row ring/pool
-(already there), `STREAM` → the fetch pipeline — at which point a
-`STREAM`-`OP_COMPRESS` could share one dependency-ordered program with other
-opcodes (e.g. compress a tar, `FBARRIER`, then `UNLINK` the sources). Not needed
-for correctness; it's the final de-fork if we ever want `STREAM` compression to
-be a fully first-class, mixable instruction rather than a mode.
+Acceptance: one instruction schema in, one completion schema out, one footer,
+one WAL; every tool differs from the others only by op + region fields; every
+existing zframe test (now an oracle) still passes byte-for-byte.

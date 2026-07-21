@@ -1,5 +1,13 @@
 # The de-fork: collapse the bespoke modes/drivers into the one machine
 
+> **Superseded plan.** The buffer-machine rewrite of `docs/ISA.md` (COPY /
+> INFLATE / DEFLATE over explicit planner-allocated buffers) replaces the fused
+> `COMPRESS` this doc was written against, and **re-sequences the steps** — see
+> ISA.md §10. In particular step 1 below (the runtime frame cache) is now a
+> *transitional* artifact: it's replaced by the buffered-group scheduler
+> (ISA.md §3–§4), which decodes each frame once by construction, no cache. The
+> rationale and the LIFO-queue finding below still stand; the mechanism changes.
+
 **Why.** We designed one machine — `scan`/generators → Polars plan → the *one*
 executor over a command stream → link the footer (`docs/ISA.md`,
 `docs/MACHINE.md`). But the zframe work was shipped as a pile of **parallel
