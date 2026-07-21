@@ -147,3 +147,53 @@ shape:
 Acceptance test for all of it: after the refactor there is **one** instruction
 schema in, **one** completion schema out, **one** WAL, and recompress differs
 from pack only by field values (`STREAM`/`ZSTD_C`) — no second machine.
+
+## 9. Instruction granularity: fuse the architecture, pipeline the µarch
+
+Should the data-path instruction split into separate `LOAD` (fetch/decompress
+the operand), `XFORM` (de/compress), and `SINK` (store) instructions? The
+stages are real — they already exist as the fold's reader threads, compress
+pool, and per-sink writers, with wildly different cost profiles (`ZSTD_D`
+~1 GB/s, `ZSTD_C(10)` ~25 MB/s/core, sink = disk or network). So the question
+is whether to make them **architectural** (three instructions in the stream) or
+keep one fused `COMPRESS` and leave the stages **microarchitectural**.
+
+**Keep one architectural instruction; crack it into a 3-stage pipeline in the
+executor.** Three reasons, in order of weight:
+
+1. **The intermediate value is bulk bytes.** In a CPU ISA the value between
+   instructions is a register (8 bytes); here it's a ~16 MB frame moving at
+   GB/s. Splitting makes that buffer a first-class ISA value the *instruction
+   stream* must name and the scheduler must allocate and lifetime-manage —
+   which drags the **byte plane into the control plane**, the one boundary the
+   whole design defends. Fused, the control plane says "compress member M into
+   frame F of sink S" and never touches a byte; the buffer stays a
+   microarchitectural detail.
+2. **Fusion is where the pipelining lives.** A fused op keeps the frame buffer
+   local to one dataflow — gathered, compressed, and handed to its sink without
+   a scheduler round-trip. This is why GPUs fuse kernels and databases fuse
+   operators rather than materializing intermediates; it's also literally why
+   the fold hits 540 MB/s. Splitting would materialize the intermediate through
+   a scheduler for no gain on one node.
+3. **The fetch is shared, not per-instruction.** One decompression pass of a
+   source supplies the operands for *all* its frames — you must not `LOAD` per
+   frame. So the `STREAM` fetch is a per-source **operand supply bound to the
+   addressing mode** (the reader / `zscan`), feeding many `COMPRESS` ops — a
+   shared front-end resource, not a `LOAD` instruction. That already argues
+   against a symmetric LOAD/XFORM/SINK split.
+
+The analogy is exact: x86 `add [mem], reg` is **one** architectural instruction
+the microarchitecture cracks into load + ALU + store µops. We do the same —
+`COMPRESS` is one instruction; the executor's decompress→compress→sink threads
+are its µops, tuned independently (`readers`/`compressors` counts, per-sink
+backpressure) without appearing in the ISA.
+
+**The one case that flips it: independent *placement*.** Promote the µops to
+architectural instructions only when a stage needs to run on a *different
+machine* — decode near storage, `ZSTD_C` on compute nodes, `SINK` near S3 — i.e.
+a distributed pipeline where the intermediate crosses a network anyway (so
+materializing it is no longer free). Single-node throughput doesn't need this
+today, so keep it in the back pocket: build `COMPRESS` fused, but keep the three
+stages cleanly separable in the executor so a future distributed dataflow can
+cut between them. (Checkpointing between stages is *not* a reason — §8.4's WAL
+re-decodes to fast-forward, and decode is the cheap 3%.)
