@@ -7,6 +7,11 @@ doc names them, points out where the zframe/recompress fold grew parallel
 bespoke formats, and sketches how to collapse them back onto the universal
 ones.
 
+In the machine vocabulary (`docs/ISA.md`, `docs/model.py`): interface 1+2 below
+are the **execute port** (transformer instructions in, completions out);
+interface 2's `STAT` batches are the **scan port** (a generator's output — the
+tools here are **programs** that compile to interface 1).
+
 ## The two universal interfaces
 
 Everything the control plane asks of the data plane, and everything it learns

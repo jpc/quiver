@@ -8,9 +8,14 @@ refactor — fall out as consequences rather than choices.
 
 ## The mapping
 
+See `docs/ISA.md` for the instruction set (and the three levels —
+**instructions**, **programs**, **services**), and `docs/model.py` for the whole
+machine as ~120 lines of simplified Python.
+
 | VM concept | quiver |
 |---|---|
 | ISA / opcodes | `OP_UNLINK … OP_COMPRESS` (`quiver/opcodes.py`) |
+| Generators (read-state, 1→N) | `scan` (namespace → `STAT`), `zscan` (tar.zstd → `ZMETA`) |
 | Instruction word | a command row: `CMD_SCHEMA` columns are the operand fields |
 | Program / bytecode | the command DataFrame, as an Arrow-IPC stream |
 | Compiler front-end | the Polars planner; each tool (`rm`/`cp`/`pack`/recompress) is a source language that lowers to opcodes |
