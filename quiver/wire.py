@@ -106,9 +106,11 @@ class PipeExecutor:
 
     def __init__(self, archive_path: str = "-", engine: str = "auto",
                  exe: str = EXE, transport: list[str] | None = None,
-                 spawn=None):
+                 spawn=None, sources: list[str] | None = None):
+        # `sources` (shard files) are opened once at startup and selected by an
+        # INFLATE's shard_id (pad_align) — AOT source table, not a runtime cache.
         argv = (transport or []) + [exe, "exec", archive_path,
-                                    _engine(engine)]
+                                    _engine(engine)] + list(sources or [])
         self.proc = (spawn or _popen_spawn)(argv)
         self.writer = StreamWriter(self.proc.stdin, CMD_SCHEMA)
         self.proc.stdin.flush()

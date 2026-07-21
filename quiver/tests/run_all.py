@@ -746,6 +746,14 @@ def test_zframe_unpack(tmp):
                               predicate=pl.col("path").str.starts_with("b/"),
                               workers=4)
     assert n3 == 150 and not (tmp/"ub"/"a").exists()
+    # de-fork invariant: sharded executor (AOT source table) == Python oracle,
+    # byte-for-byte over the whole 2-shard tree.
+    zframe.unpack_merged(str(tmp/"m.nockset"), str(tmp/"umo"), engine=None)
+    me = {p.relative_to(tmp/"um"): p for p in (tmp/"um").rglob("*") if p.is_file()}
+    mo = {p.relative_to(tmp/"umo"): p for p in (tmp/"umo").rglob("*") if p.is_file()}
+    assert me.keys() == mo.keys() and len(me) == 300
+    for rel in me:
+        assert me[rel].read_bytes() == mo[rel].read_bytes()
     ok("zframe unpack: parallel decode == oracle, linear + sharded + predicate")
 
 

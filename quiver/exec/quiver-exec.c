@@ -723,14 +723,34 @@ typedef struct {
     const int64_t *groups; int ng; _Atomic int next;
 } DecodePool;
 
+/* Source-file table for sharded decode (docs/ISA.md §10.5). The planner knows
+ * the shard set ahead of time, so the files are declared on argv and opened
+ * ONCE at startup (read-only, shared — pread is positioned + thread-safe); an
+ * INFLATE selects its source by index in pad_align (shard_id). No table → the
+ * single archive fd (linear). This is AOT, not a runtime path→fd cache. */
+#define SRC_MAX 4096
+static struct { int fds[SRC_MAX]; int n; } g_src;
+static void src_open_all(int argc, char **argv, int first) {
+    for (int i = first; i < argc && g_src.n < SRC_MAX; i++) {
+        int fd = open(argv[i], O_RDONLY);          /* -1 → INFLATE reports err */
+        if (fd < 0) perror(argv[i]);
+        g_src.fds[g_src.n++] = fd;
+    }
+}
+static inline int src_fd(int64_t sid, int afd) {
+    return (g_src.n > 0 && sid >= 0 && sid < g_src.n) ? g_src.fds[sid] : afd;
+}
+
 static void decode_group(const CmdBatch *c, int64_t g, int afd, RowResult *out,
                          uint8_t **cb, size_t *ccap, uint8_t **ub, size_t *ucap) {
     int64_t coff = c->data_offset[g], clen = c->size[g], k = c->header_offset[g];
+    int sfd = src_fd(c->pad_align[g], afd);        /* shard_id → source, or afd */
     out[g].res = 0; out[g].read_size = 0;
+    if (sfd < 0) { out[g].res = -errno; return; }
     if ((size_t)clen > *ccap) { *cb = realloc(*cb, (size_t)clen); *ccap = (size_t)clen; }
     int64_t got = 0;
     while (got < clen) {
-        ssize_t r = pread(afd, *cb + got, (size_t)(clen - got), coff + got);
+        ssize_t r = pread(sfd, *cb + got, (size_t)(clen - got), coff + got);
         if (r <= 0) { out[g].res = r < 0 ? -errno : -EIO; return; }
         got += r;
     }
@@ -2316,6 +2336,7 @@ int main(int argc, char **argv) {
             afd = open(argv[2], O_RDWR | O_CREAT, 0644);  /* R:EXTRACT W:COPY/COMPRESS */
             if (afd < 0) { perror("archive"); return 2; }
         }
+        src_open_all(argc, argv, 4);          /* argv[4..] = shard sources (AOT) */
         return run_exec(afd, use_uring, &ring);
     }
     fprintf(stderr, "unknown mode %s\n", argv[1]);

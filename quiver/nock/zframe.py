@@ -1135,17 +1135,22 @@ def _unpack(idx, dest, shard_of, workers):
         return sum(f.result() for f in futs)
 
 
-def _unpack_plan(idx, dest):
-    """Compile a linear-nock index into the buffer-machine command stream
-    (docs/ISA.md §2-§4): MKDIR epoch, then a decode epoch of INFLATE-headed
-    groups, then a SETMETA epoch. Each group is one INFLATE row (decode the
-    frame archive[frame_coff, frame_clen] into a worker buffer; header_offset
-    carries K = member count) immediately followed by its K EXTRACT rows, each
-    scattering buffer slice [in_off, +size] to a file. Returns (cmds, group
-    start-indices for boundary-aware chunking, paths)."""
+def _unpack_plan(idx, dest, shard_of=None):
+    """Compile a nock index into the buffer-machine command stream (docs/ISA.md
+    §2-§4): MKDIR epoch, then a decode epoch of INFLATE-headed groups, then a
+    SETMETA epoch. Each group is one INFLATE row (decode the frame from
+    [frame_coff, frame_clen] into a worker buffer; header_offset carries K =
+    member count) immediately followed by its K EXTRACT rows, each scattering
+    buffer slice [in_off, +size] to a file. `shard_of` (shard_id→file) makes it
+    sharded: the INFLATE's `path` names the shard file to read the frame from
+    (§10.5), and frames are keyed/sorted by (shard_id, frame_coff) since offsets
+    repeat across shards. Returns (cmds, group start-indices, paths)."""
     from ..wire import OP_INFLATE, OP_EXTRACT, OP_MKDIR, OP_SETMETA, cmd_df
-    idx = idx.sort(["frame_coff", "in_off"]).with_columns(
-        pl.col("frame_coff").rle_id().alias("_fi"))      # 0..F-1, sorted ⇒ runs
+    sharded = shard_of is not None and "shard_id" in idx.columns
+    fkeys = (["shard_id"] if sharded else []) + ["frame_coff"]
+    idx = idx.sort(fkeys + ["in_off"]).with_columns(
+        _fi=(pl.struct(fkeys).rle_id() if sharded
+             else pl.col("frame_coff").rle_id()))     # 0..F-1 (sorted ⇒ runs)
     idx = idx.with_columns(_mp=pl.int_range(pl.len()).over("_fi"))  # pos in frame
 
     dirs = (idx.select(dir=pl.col("path").str.extract(r"^(.*)/", 1))
@@ -1162,11 +1167,16 @@ def _unpack_plan(idx, dest):
     dg = maxd + 1
     n = idx.height
 
-    frames = (idx.group_by(["frame_coff", "frame_clen"], maintain_order=True)
+    frames = (idx.group_by(fkeys + ["frame_clen"], maintain_order=True)
                  .agg(k=pl.len()))
     nF = frames.height
+    # sharded: INFLATE selects its source by shard_id in pad_align; the shard
+    # files are opened once at startup (passed to the executor on argv).
+    sid = (frames["shard_id"].cast(pl.Int64) if sharded
+           else pl.Series([0] * nF, dtype=pl.Int64))
     inflate = cmd_df(nF, opcode=[OP_INFLATE] * nF,
                      dep_group=pl.Series([dg] * nF, dtype=pl.Int64),
+                     pad_align=sid,
                      data_offset=frames["frame_coff"], size=frames["frame_clen"],
                      header_offset=frames["k"]).with_columns(
         _fi=pl.int_range(nF, dtype=pl.Int64),
@@ -1196,6 +1206,24 @@ def _unpack_plan(idx, dest):
     return cmds, boundaries, idx["path"].to_list()
 
 
+def _unpack_exec(idx, dest, afd_path, shard_of, engine, batch_rows):
+    """Drive the decode-group plan through one executor. afd_path is the fd the
+    executor opens for the linear case; for the sharded case the shard files are
+    passed as `sources` and opened once at startup, selected per-frame by
+    shard_id (docs/ISA.md §10.5)."""
+    from ..wire import PipeExecutor
+    from ..tools import _check
+    cmds, boundaries, paths = _unpack_plan(idx, dest, shard_of)
+    ex = PipeExecutor(afd_path, engine=engine,
+                      sources=list(shard_of) if shard_of is not None else None)
+    try:
+        comp = ex.execute(cmds, batch_rows=batch_rows, boundaries=boundaries)
+    finally:
+        assert ex.close() == 0
+    _check(comp, cmds)
+    return len(paths)
+
+
 def unpack(path, dest, predicate=None, workers=None, engine="auto",
            batch_rows=4096):
     """Parallel unpack of a linear nock archive → dest. engine=None keeps the
@@ -1209,16 +1237,7 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
     os.makedirs(dest, exist_ok=True)
     if engine is None or not idx.height:
         return _unpack(idx, dest, lambda sid: path, workers)
-    from ..wire import PipeExecutor
-    from ..tools import _check
-    cmds, boundaries, paths = _unpack_plan(idx, dest)
-    ex = PipeExecutor(path, engine=engine)
-    try:
-        comp = ex.execute(cmds, batch_rows=batch_rows, boundaries=boundaries)
-    finally:
-        assert ex.close() == 0
-    _check(comp, cmds)
-    return len(paths)
+    return _unpack_exec(idx, dest, path, None, engine, batch_rows)
 
 
 def _pack_fs_scan(root, batch_bytes, predicate, engine, threads):
@@ -1361,11 +1380,15 @@ def _pack_fs_py(files, root, out_path, level, workers):
     return Result(members=fw.members, frames=len(results))
 
 
-def unpack_merged(manifest, dest, predicate=None, workers=None):
-    """Parallel unpack of a sharded nock: each member resolved to its shard
-    file — the only difference from the linear case (docs/UNPACK.md)."""
+def unpack_merged(manifest, dest, predicate=None, workers=None, engine="auto",
+                  batch_rows=4096):
+    """Parallel unpack of a sharded nock: each member resolved to its shard file
+    (docs/ISA.md §10.5) — the only difference from linear is that each INFLATE
+    names its shard as its source. engine=None keeps the Python oracle."""
     shards, idx = read_merged(manifest)
     if predicate is not None:
         idx = idx.filter(predicate)
     os.makedirs(dest, exist_ok=True)
-    return _unpack(idx, dest, lambda sid: shards[sid], workers)
+    if engine is None or not idx.height:
+        return _unpack(idx, dest, lambda sid: shards[sid], workers)
+    return _unpack_exec(idx, dest, "-", list(shards), engine, batch_rows)

@@ -274,7 +274,12 @@ Re-sequenced de-fork (supersedes `docs/DEFORK.md`'s original order):
    `DEFLATE`-live-slice group; retire the plan-file + 60-byte records to the
    command/completion streams.
 5. **Sharded / multi-file source + merge** fall out of the `sink_id` field and
-   a `shard_id → fd` table.
+   a `shard_id → fd` table. The table is **AOT**, not a runtime cache: the
+   planner knows the shard set, so the files are declared on the executor's argv
+   and opened once at startup; an `INFLATE` selects its source by index
+   (`shard_id` in `pad_align`), carrying no per-row path. This is the same
+   AOT-over-runtime discipline as buffers — the planner knows the resource set,
+   so acquire it up front, don't rediscover it behind a mutex per frame.
 
 Acceptance: one instruction schema in, one completion schema out, one footer,
 one WAL; every tool differs from the others only by op + region fields; every

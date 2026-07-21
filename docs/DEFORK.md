@@ -38,7 +38,18 @@
 >   round-trip). ⏳ Remaining: fold zpack's 60-byte records → `COMP` completions
 >   and its compress pool → the encode-group scheduler (the full command-stream
 >   unification), keeping the fused streaming producer as oracle.
-> - ⏳ §10.5 sharded source + merge — next.
+> - ✅ **§10.5 sharded unpack** — `unpack_merged` now runs on the decode-group
+>   scheduler. Added an **AOT source table** to the executor (`g_src` /
+>   `src_open_all` / `src_fd`): the shard files are declared on argv and opened
+>   once at startup; an `INFLATE` selects its source by `shard_id` in `pad_align`
+>   (no per-row path string). `_unpack_plan(shard_of=…)` keys/sorts frames by
+>   `(shard_id, frame_coff)`; `PipeExecutor(sources=…)` passes the shard list.
+>   Test asserts the sharded executor == Python oracle byte-for-byte over a
+>   2-shard tree. (Replaced the runtime path→fd cache first tried here, per the
+>   AOT-over-runtime discipline.) `merge` itself is already zero-copy/logical.
+> - ⏳ Remaining: recompress records→`COMP` completions (the §10.4 unification
+>   half), and distributed unpack (partition the frame/shard set across nodes —
+>   now unblocked by the portable static binary).
 
 **Why.** We designed one machine — `scan`/generators → Polars plan → the *one*
 executor over a command stream → link the footer (`docs/ISA.md`,
