@@ -153,10 +153,8 @@ executor, overlapping planning of block *n+1* with execution of block *n*.
 - **live FS** (`pack_fs`, `cp`, `rm`, `rsync`) — the scan itself can take a
   while, so block on `scan_iter` output; plan each batch of `STAT` rows as it
   arrives. (`rsync` = block the `scan × scan` diff.)
-- **legacy monolithic `tar.zstd`** (`recompress`) — `INFLATE` the source into a
-  **double-buffer**; as the tar flows, emit the member list, plan frame cut
-  points, and — because a nock frame is a *contiguous run of the original tar* —
-  `DEFLATE` a slice of the live buffer directly (no gather).
+- **legacy monolithic `tar.zstd`** (`recompress`) — the one genuinely
+  bidirectional case; see "Streaming recompress" below.
 - **uncompressed tar** — a quick scan of the 512-byte headers up front, then
   plan.
 
@@ -176,6 +174,49 @@ being persistent:* spawning the worker pool per batch (the earlier design) cost
 once per `exec` session and reused across every batch and epoch (one unified
 pool dispatching WK_ROW / WK_DECODE / WK_ENCODE items), so the floor is the
 protocol, not thread churn.
+
+### Streaming recompress: decompress once, plan the union, keep the sinks fed
+
+Recompressing a monolithic `tar.zstd` is the only case where the layout isn't
+knowable without decompressing — so it's the one **bidirectional** flow, and the
+clean form is *one pass* (not the two-pass `zscan→plan→zexec`, not the
+plan-less fused `zpack` — it subsumes both):
+
+```
+readers (INFLATE + parse) ─► metadata union ─► planner (Polars: filter/assign/in_off)
+                                                       │
+                                                       ▼
+                          frame-job queue ─► sinks (DEFLATE a live-buffer slice, append)
+  ▲ bounded buffer pool = backpressure       keep this queue non-empty = full throughput
+  └───────────── buffers recycled once all their frames retire ◄──────────────┘
+```
+
+Wire (its own `zstream` port — the `exec` port is unidirectional):
+`C→Py ZMETA(buf_id, members)` · `Py→C PLAN(buf_id, member→frame/sink/keep)` ·
+`C→Py COMP(frame→coff,clen)`. The footer is `ZMETA` (metadata) + `PLAN` (frame,
+`in_off` computed in Python) + `COMP` (coff, clen) — the 60-byte record retired.
+
+Four properties make it correct and fast:
+
+1. **Decompress once.** A frame is a contiguous run of the original tar, so the
+   sink `DEFLATE`s a slice of the *live* decompressed buffer — no re-decompress,
+   no gather. Same throughput as fused `zpack`, plus the plan step it lacked.
+2. **Plan the union, not one buffer.** Several readers decompress in parallel;
+   the planner drains whatever metadata is available across *all* of them and
+   plans it in one round-trip. This amortizes the 1.7 ms round-trip across many
+   buffers and hands Polars a big batch. Frames never span a buffer (buffer
+   boundary = frame boundary), so the union is only a *planning* batch — each
+   frame is still assigned within its own buffer.
+3. **The objective is sink non-idle.** Compression is the bottleneck
+   (~25 MB/s/core); readers (~1.5 GB/s) and the planner (Polars) are far ahead,
+   so full throughput ≡ the `DEFLATE` queue never empties. Everything upstream
+   exists only to keep that queue backed up; a 2–3 deep buffer queue does it.
+4. **Buffers are the backpressure + the recycling unit.** The fixed-size pool
+   (§ below) bounds resident memory to `queue_depth × buf` and is returned for
+   more decompression once a buffer's frames retire — the same `bp_*` pool.
+
+This is `zpack`'s reader+compressor pools (already persistent, already the right
+shape) with the plan stage spliced between them — the last fork closed.
 
 ### Frame buffers are fixed-size and member-aligned
 
