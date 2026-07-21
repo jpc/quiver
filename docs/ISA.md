@@ -192,22 +192,36 @@ empty `path`/`dst_path`/`header` columns still carry `n×8` offset buffers. On a
    buffers are fully materialized at fixed indices, so nulls/compression need
    the reader to handle validity and absent buffers — real work, and it keeps
    the wide word.
-2. **Narrow per-opcode schema** *(recommended).* Give each opcode class its own
-   compact batch schema — `OP_COMPRESS` = `{source_id, ordinal, frame, sink,
-   level}` — and make the command stream a sequence of *typed, opcode-homogeneous
-   batches* (the planner already groups by opcode/epoch). This is how real ISAs
-   use several instruction formats rather than one padded word. It needs a small
-   per-schema reader (the `ZPLAN` reader deferred in stage 2) but no validity
-   machinery, and it's the truest encoding.
+2. **Narrow schema per *stream*** *(recommended — with a caveat).* Give a
+   compact schema to a stream that is *intrinsically one opcode*. This is the
+   important correction: batches are **not** opcode-homogeneous in general.
+   `row_sync` dispatches **per row** (`switch (c->opcode[i])`), `PipeExecutor`
+   chunks by **row range**, and the tools emit **mixed** batches (`sync` =
+   `MKDIR`+`COPY`+`UNLINK`+`RMDIR` in one DataFrame, ordered by `dep_group`
+   epochs that interleave opcodes). The wide word is precisely what lets any
+   opcode sit in any row — so a narrow per-opcode schema is *not* a free swap for
+   the general exec stream.
+
+   But the **recompress plan is intrinsically homogeneous** — every row is
+   `OP_COMPRESS` — and it rides its *own* stream (`zexec` reads it; `exec` reads
+   mixed commands). So it can carry a narrow `ZPLAN` schema (`{source_id,
+   ordinal, frame, sink, level}`) without touching the mixed path at all. The
+   executor already reads a schema message at the head of each stream; that
+   header says which encoding a stream uses — one general wide format for mixed
+   batches, a packed format for a single-opcode stream, like a CPU with a
+   general encoding plus a SIMD one. Needs the small `ZPLAN` reader (deferred in
+   stage 2), no validity machinery.
 3. **Just compress on the wire.** zstd the plan stream for transfer — the
    constant/zero columns vanish under general compression. Cheap and immediate,
    but the *parse* cost (materializing full buffers in C) is unchanged.
 
-So: **yes, nulls work**, but narrowing the word per opcode is simpler, faster to
-parse, and the honest ISA answer; nulls are the fallback if we ever want to keep
-one universal word. Stage 2 deliberately took the wide word (reusing
+So: **yes, nulls work**, but the cleaner answer is a narrow schema on the
+homogeneous *plan* stream (not opcode-grouping the general path, which fights
+per-row dispatch and epoch interleaving). Stage 2 took the wide word (reusing
 `parse_cmd_batch`) to land the lowering with zero new C; the narrow `ZPLAN`
-schema is the follow-up that makes it compact.
+schema on the plan stream is the compacting follow-up, and it composes with the
+mixed exec stream because they're different streams with different schema
+headers.
 
 ## 9. Instruction granularity: fuse the architecture, pipeline the µarch
 
