@@ -272,3 +272,32 @@ today, so keep it in the back pocket: build `COMPRESS` fused, but keep the three
 stages cleanly separable in the executor so a future distributed dataflow can
 cut between them. (Checkpointing between stages is *not* a reason — §8.4's WAL
 re-decodes to fast-forward, and decode is the cheap 3%.)
+
+## 11. Why the plan is a separate stream — addressing mode, not opcode
+
+Do we mix `OP_COMPRESS` with other commands? **Yes — the `INLINE`-source form.**
+`row_sync case OP_COMPRESS` compresses the `header` column (bytes carried in the
+row), one row → one frame, and appends it — a per-row peer that sits happily in
+a mixed batch alongside `COPY`/`UNLINK`. So the opcode is *not* what segregates
+the recompress plan.
+
+What segregates it is the **`STREAM` source addressing mode**. The plan's
+`OP_COMPRESS` rows have `src = STREAM(source_id, ordinal)` — their operand bytes
+must be *fetched* by decompressing a `tar.zstd` and gathering members by ordinal
+(§3, §9). That fetch is a per-source pipeline: one decompress pass supplies many
+rows' operands, so `STREAM` rows are consumed **grouped by source** by the fetch
+coprocessor, not dispatched per row. That's a different execution model than the
+ring/pool, so it runs as its own pass (`zexec`) over a stream that is — for that
+reason — intrinsically all-`STREAM`-`OP_COMPRESS`. Nothing to mix, and a packed
+`ZPLAN` encoding (§10) fits.
+
+So the segregation is by **addressing mode** (`STREAM` needs a fetch stage), not
+by opcode — the same fact behind §3 and §9. It also names the last residue of
+the fork: `STREAM`-source `OP_COMPRESS` runs as a separate *mode* rather than
+being routed inside the one executor. The pure end-state is a single executor
+that dispatches by source mode — `INLINE`/`FILE`/`ARCHIVE` → per-row ring/pool
+(already there), `STREAM` → the fetch pipeline — at which point a
+`STREAM`-`OP_COMPRESS` could share one dependency-ordered program with other
+opcodes (e.g. compress a tar, `FBARRIER`, then `UNLINK` the sources). Not needed
+for correctness; it's the final de-fork if we ever want `STREAM` compression to
+be a fully first-class, mixable instruction rather than a mode.
