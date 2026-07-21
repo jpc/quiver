@@ -27,8 +27,18 @@
 >   thread-pool packer is retained as `_pack_fs_py` oracle. Test asserts
 >   executor == oracle on member set / sizes / in-frame offsets, and the frames
 >   still list as a clean tar (`zstd -dc | tar t`).
-> - ⏳ §10.4 recompress (streaming `INFLATE`→plan→`DEFLATE`-live-slice),
->   §10.5 sharded source + merge — next.
+> - 🟡 **§10.4 recompress — buffer discipline** — the streaming reader already
+>   cuts frames member-aligned (a member never crosses a frame boundary), so the
+>   frame buffer is the only non-fixed thing. Added a **fixed-size recycled
+>   buffer pool** (`bp_*` in quiver-exec.c) backing both the fused (`z_reader`)
+>   and plan-driven multi-sink (`z_exec_reader`) paths: recycle `batch+slack`
+>   buffers instead of malloc/free per frame, bound memory to `max_live × cap`,
+>   and grow-then-free the rare oversized-member frame. Byte-exact (all
+>   recompress/merge/reshard/WAL/S3 tests green; added an oversized-member
+>   round-trip). ⏳ Remaining: fold zpack's 60-byte records → `COMP` completions
+>   and its compress pool → the encode-group scheduler (the full command-stream
+>   unification), keeping the fused streaming producer as oracle.
+> - ⏳ §10.5 sharded source + merge — next.
 
 **Why.** We designed one machine — `scan`/generators → Polars plan → the *one*
 executor over a command stream → link the footer (`docs/ISA.md`,

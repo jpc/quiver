@@ -469,6 +469,24 @@ def test_zframe_c(tmp):
                 capture_output=True, text=True).stdout.strip()
     assert n2 == "300", n2                      # no embedded footer to trip tar
     assert zframe.read_index(sc).height == 300  # index served from sidecar
+    # oversized member: a single member larger than batch_bytes forces a
+    # grown (non-recycled) frame buffer — must still round-trip byte-exact
+    # (docs/ISA.md §5: member-aligned frames never split; big member = own frame)
+    big = os.urandom(200 << 10)                          # 200 KB > 32 KB batch
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
+        for name, data in (("small/a", b"x" * 10), ("big/huge", big),
+                           ("small/b", b"y" * 20)):
+            ti = tarfile.TarInfo(name); ti.size = len(data); ti.mode = 0o644
+            tf.addfile(ti, io.BytesIO(data))
+    with open(str(tmp/"big.tar.zstd"), "wb") as fo:
+        fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+    ob = str(tmp/"zbig.tar.zstd")
+    zframe.recompress_c([str(tmp/"big.tar.zstd")], ob, level=4,
+                        batch_bytes=32 << 10, readers=1, compressors=2)
+    zframe.unpack(ob, str(tmp/"zbigx"))
+    assert (tmp/"zbigx"/"big"/"huge").read_bytes() == big
+    assert (tmp/"zbigx"/"small"/"a").read_bytes() == b"x" * 10
     ok("zframe C fold: zpack decompress+parse+compress in C, merge, sidecar")
 
 

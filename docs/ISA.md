@@ -166,6 +166,28 @@ they need not be the whole dataset. This is the existing `(step, finish)` Plan
 framework and `drive()` loop — batched and streamed execution are the same code
 at different granularities; the block size is the single knob.
 
+### Frame buffers are fixed-size and member-aligned
+
+Two questions the streaming encoder settles:
+
+- **Do entries cross buffer boundaries?** No — and this is the load-bearing
+  invariant. A frame's cut is only ever tested *after* a whole member has landed
+  in the buffer, so **a frame is always a whole number of members** and a member
+  never straddles a frame. (This is also what makes frames independently
+  decodable and merge zero-copy — nock's frame-never-spans-a-member rule.) So
+  "crossing" is a non-problem by construction; you never split a member, you
+  choose the cut at a member boundary.
+- **Fixed-size buffers?** Yes. Because frames are member-aligned and target
+  `batch` bytes, the assembly buffer is a fixed quantum (`cap = batch + slack`)
+  in the common case, so the executor **recycles a fixed pool** of them
+  (`bp_acquire`/`bp_release`) instead of `malloc`/`free` per ~16 MB frame, and
+  resident memory is bounded to `max_live × cap`. The one exception — a single
+  member larger than `cap` — makes *its* frame oversized: the buffer is grown in
+  place for that frame and freed on release rather than recycled. So "fixed"
+  means fixed for the overwhelming common case, with an oversized member falling
+  out naturally as its own solo frame. (The pool backs both the fused reader and
+  the plan-driven multi-sink reader; each sink a reader fills holds one buffer.)
+
 ## 6. Ordering
 
 Independent instructions run in parallel (max ILP). Ordering is a partial order

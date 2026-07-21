@@ -1546,8 +1546,51 @@ typedef struct { char *path; int64_t size, mtime, in_off; int32_t mode, uid, gid
 /* lframe: logical frame label for the footer; -1 = assign physical index at
  * append (zpack fused mode). zexec sets it from the plan so a frame keeps its
  * planned id regardless of which compressor finishes first. */
-typedef struct ZJob { struct ZJob *next; uint8_t *buf; int64_t len;
+typedef struct ZJob { struct ZJob *next; uint8_t *buf; int64_t len, cap;
                       ZRec *recs; int nrecs; int64_t lframe; int sink; } ZJob;
+
+/* ── fixed-size frame-buffer pool (docs/ISA.md §5) ──────────────────────────
+ * Streaming recompress frames are member-aligned — the cut is only ever tested
+ * after a whole member lands in the buffer, so a frame is a whole number of
+ * members and no member ever crosses a frame boundary. That makes the buffer a
+ * fixed quantum (cap = batch + slack) in the common case, so we recycle a pool
+ * of them instead of malloc/free per frame (readers churn one buffer per ~16 MB
+ * frame). A member larger than the buffer makes its frame oversized — grown in
+ * place, then freed rather than recycled (cap != pool cap). bp_acquire also
+ * caps resident buffers, so memory is bounded to max_live × cap. */
+static struct {
+    pthread_mutex_t mu; pthread_cond_t cv;
+    uint8_t **freelist; int nfree; int64_t cap; int live, max_live;
+} BP;
+static void bp_init(int64_t cap, int max_live) {
+    pthread_mutex_init(&BP.mu, NULL); pthread_cond_init(&BP.cv, NULL);
+    BP.freelist = calloc((size_t)max_live, sizeof(uint8_t *));
+    BP.nfree = 0; BP.cap = cap; BP.live = 0; BP.max_live = max_live;
+}
+static uint8_t *bp_acquire(int64_t *cap_out) {
+    pthread_mutex_lock(&BP.mu);
+    while (BP.live >= BP.max_live && BP.nfree == 0)
+        pthread_cond_wait(&BP.cv, &BP.mu);
+    uint8_t *b = BP.nfree > 0 ? BP.freelist[--BP.nfree]
+                              : malloc((size_t)BP.cap);
+    BP.live++;
+    pthread_mutex_unlock(&BP.mu);
+    *cap_out = BP.cap;
+    return b;
+}
+static void bp_release(uint8_t *b, int64_t cap) {
+    if (!b) return;
+    pthread_mutex_lock(&BP.mu);
+    BP.live--;
+    if (cap == BP.cap && BP.nfree < BP.max_live) BP.freelist[BP.nfree++] = b;
+    else free(b);                          /* oversized (grown) frame buffer */
+    pthread_cond_signal(&BP.cv);
+    pthread_mutex_unlock(&BP.mu);
+}
+static void bp_destroy(void) {
+    for (int i = 0; i < BP.nfree; i++) free(BP.freelist[i]);
+    free(BP.freelist); BP.freelist = NULL;
+}
 
 static struct {
     const char **srcs; int nsrc; _Atomic int src_i;
@@ -1704,8 +1747,7 @@ static void *z_reader(void *arg) {
         if (si >= Z.nsrc) break;
         Zsrc z;
         if (zsrc_open(&z, Z.srcs[si])) continue;
-        size_t bcap = (size_t)Z.batch + (4 << 20);
-        uint8_t *buf = malloc(bcap); int64_t blen = 0;
+        int64_t bcap; uint8_t *buf = bp_acquire(&bcap); int64_t blen = 0;
         int rcap = 8192, nrec = 0;
         ZRec *recs = malloc(sizeof(ZRec) * rcap);
         char pax_path[4096], gnu[4096];
@@ -1749,8 +1791,8 @@ static void *z_reader(void *arg) {
             }
             int64_t rsize = pax_size >= 0 ? pax_size : size;
             int64_t rbl = (rsize + 511) / 512 * 512;
-            if (blen + 512 + rbl + 1024 > (int64_t)bcap) {
-                bcap = (blen + 512 + rbl + 1024) * 2; buf = realloc(buf, bcap);
+            if (blen + 512 + rbl + 1024 > bcap) {      /* oversized: grow frame */
+                bcap = (blen + 512 + rbl + 1024) * 2; buf = realloc(buf, (size_t)bcap);
             }
             int64_t body_off = blen + 512;
             memcpy(buf + blen, hdr, 512);
@@ -1770,20 +1812,19 @@ static void *z_reader(void *arg) {
             has_pax = 0; has_gnu = 0; pax_size = -1;
             if (blen >= Z.batch) {
                 ZJob *j = malloc(sizeof *j);
-                j->buf = buf; j->len = blen; j->recs = recs; j->nrecs = nrec;
-                j->lframe = -1; j->sink = 0;
+                j->buf = buf; j->cap = bcap; j->len = blen;
+                j->recs = recs; j->nrecs = nrec; j->lframe = -1; j->sink = 0;
                 z_push(j);
-                bcap = (size_t)Z.batch + (4 << 20);
-                buf = malloc(bcap); blen = 0;
+                buf = bp_acquire(&bcap); blen = 0;
                 rcap = 8192; nrec = 0; recs = malloc(sizeof(ZRec) * rcap);
             }
         }
         if (blen) {                                    /* source's final frame */
             ZJob *j = malloc(sizeof *j);
-            j->buf = buf; j->len = blen; j->recs = recs; j->nrecs = nrec;
-            j->lframe = -1; j->sink = 0;
+            j->buf = buf; j->cap = bcap; j->len = blen;
+            j->recs = recs; j->nrecs = nrec; j->lframe = -1; j->sink = 0;
             z_push(j);
-        } else { free(buf); free(recs); }
+        } else { bp_release(buf, bcap); free(recs); }
         zsrc_close(&z);
     }
     /* last reader out flips readers_done */
@@ -1835,7 +1876,7 @@ static void *z_compressor(void *arg) {
             z_emit(&j->recs[r], (int32_t)fidx, coff, (int64_t)clen, sink);
         pthread_mutex_unlock(&Z.omu);
         for (int r = 0; r < j->nrecs; r++) free(j->recs[r].path);
-        free(comp); free(j->buf); free(j->recs); free(j);
+        free(comp); bp_release(j->buf, j->cap); free(j->recs); free(j);
     }
     ZSTD_freeCCtx(cc);
     return NULL;
@@ -1857,12 +1898,14 @@ static int run_zpack(const char **srcs, int nsrc, const char *out,
     pthread_t rt[64], ct[128];
     if (readers > 64) readers = 64;
     if (compressors > 128) compressors = 128;
+    bp_init(batch + (4 << 20), readers + compressors + 96 + 32);
     for (int i = 0; i < compressors; i++)
         pthread_create(&ct[i], NULL, z_compressor, NULL);
     for (int i = 0; i < readers; i++)
         pthread_create(&rt[i], NULL, z_reader, NULL);
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
     for (int i = 0; i < compressors; i++) pthread_join(ct[i], NULL);
+    bp_destroy();
     fflush(stdout);
     close(Z.fd[0]);
     fprintf(stderr, "zpack: %ld frames, %ld bytes\n",
@@ -2039,7 +2082,7 @@ static void *z_exec_reader(void *arg) {
         int NS = Z.nsink;
         uint8_t **buf = calloc(NS, sizeof *buf);
         int64_t *blen = calloc(NS, sizeof *blen);
-        size_t  *bcap = calloc(NS, sizeof *bcap);
+        int64_t *bcap = calloc(NS, sizeof *bcap);
         int64_t *curf = malloc(NS * sizeof *curf);
         ZRec   **recs = calloc(NS, sizeof *recs);
         int     *nrec = calloc(NS, sizeof *nrec);
@@ -2104,25 +2147,24 @@ static void *z_exec_reader(void *arg) {
                 ordinal++;
             }
             if (keep) {
-                if (!buf[sk]) {                    /* lazy-alloc sink frame buf */
-                    bcap[sk] = (size_t)Z.batch + (4 << 20);
-                    buf[sk] = malloc(bcap[sk]);
+                if (!buf[sk]) {                    /* lazy-acquire sink frame buf */
+                    buf[sk] = bp_acquire(&bcap[sk]);
                     rcap[sk] = 8192; recs[sk] = malloc(sizeof(ZRec) * rcap[sk]);
                 }
                 if (blen[sk] > 0 && lframe != curf[sk]) {    /* frame boundary */
                     ZJob *j = malloc(sizeof *j);
-                    j->buf = buf[sk]; j->len = blen[sk]; j->recs = recs[sk];
-                    j->nrecs = nrec[sk]; j->lframe = curf[sk]; j->sink = sk;
+                    j->buf = buf[sk]; j->cap = bcap[sk]; j->len = blen[sk];
+                    j->recs = recs[sk]; j->nrecs = nrec[sk];
+                    j->lframe = curf[sk]; j->sink = sk;
                     z_push(j);
-                    bcap[sk] = (size_t)Z.batch + (4 << 20);
-                    buf[sk] = malloc(bcap[sk]); blen[sk] = 0;
+                    buf[sk] = bp_acquire(&bcap[sk]); blen[sk] = 0;
                     rcap[sk] = 8192; nrec[sk] = 0;
                     recs[sk] = malloc(sizeof(ZRec) * rcap[sk]);
                 }
                 curf[sk] = lframe;
-                if (blen[sk] + mlen > (int64_t)bcap[sk]) {
+                if (blen[sk] + mlen > bcap[sk]) {         /* oversized: grow */
                     bcap[sk] = (blen[sk] + mlen) * 2;
-                    buf[sk] = realloc(buf[sk], bcap[sk]);
+                    buf[sk] = realloc(buf[sk], (size_t)bcap[sk]);
                 }
                 int64_t body_off = blen[sk] + hoff + 512;
                 memcpy(buf[sk] + blen[sk], mbuf, mlen); blen[sk] += mlen;
@@ -2142,10 +2184,11 @@ static void *z_exec_reader(void *arg) {
         for (int k = 0; k < NS; k++) {             /* flush each sink's tail */
             if (buf[k] && blen[k] > 0) {
                 ZJob *j = malloc(sizeof *j);
-                j->buf = buf[k]; j->len = blen[k]; j->recs = recs[k];
-                j->nrecs = nrec[k]; j->lframe = curf[k]; j->sink = k;
+                j->buf = buf[k]; j->cap = bcap[k]; j->len = blen[k];
+                j->recs = recs[k]; j->nrecs = nrec[k];
+                j->lframe = curf[k]; j->sink = k;
                 z_push(j);
-            } else { free(buf[k]); free(recs[k]); }
+            } else { bp_release(buf[k], bcap[k]); free(recs[k]); }
         }
         free(buf); free(blen); free(bcap); free(curf);
         free(recs); free(nrec); free(rcap);
@@ -2179,12 +2222,15 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
     pthread_t rt[64], ct[128];
     if (readers > 64) readers = 64;
     if (compressors > 128) compressors = 128;
+    /* each reader may hold one filling buffer per sink at once */
+    bp_init(Z.batch + (4 << 20), readers * Z.nsink + compressors + 96 + 32);
     for (int i = 0; i < compressors; i++)
         pthread_create(&ct[i], NULL, z_compressor, NULL);
     for (int i = 0; i < readers; i++)
         pthread_create(&rt[i], NULL, z_exec_reader, NULL);
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
     for (int i = 0; i < compressors; i++) pthread_join(ct[i], NULL);
+    bp_destroy();
     fflush(stdout);
     int64_t total = 0;
     for (int i = 0; i < Z.nsink; i++) {
