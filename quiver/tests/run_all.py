@@ -577,6 +577,64 @@ def test_zframe_reshard(tmp):
     assert b["path"].str.starts_with("b/").all()
     ok("zframe reshard: one pass → N byte-exact shards (hash + attribute)")
 
+
+def test_zframe_s3(tmp):
+    """Stream reshard outputs straight into S3: C writes each sink's frames to
+    a FIFO, a per-sink uploader multipart-uploads them, footer appended — no
+    local staging of the body. Verified against moto."""
+    try:
+        import zstandard as zstd  # noqa
+        from moto import mock_aws
+        import boto3
+    except ImportError:
+        return
+    import io, os, tarfile
+    import polars as pl
+    from quiver.nock import zframe
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+
+    def mk_zst(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}-{i}-").encode() * (4 + i)
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}.dat"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    mk_zst(str(tmp/"a.tar.zstd"), "a", 150)
+    src = [str(tmp/"a.tar.zstd")]
+
+    @mock_aws
+    def run():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="quiver-test")
+        N = 2
+        res = zframe.recompress_c(src, "s3://quiver-test/out/p.tar.zstd", level=4,
+                                  batch_bytes=16 << 10, readers=1, compressors=4,
+                                  shard_by="hash", shards=N)
+        assert res.members == 150
+        keys = sorted(o["Key"] for o in
+                      s3.list_objects_v2(Bucket="quiver-test")["Contents"])
+        assert keys == ["out/p.shard0.tar.zstd", "out/p.shard1.tar.zstd"], keys
+        # download a shard, confirm it's a valid nock zframe, routed + exact
+        body = s3.get_object(Bucket="quiver-test",
+                             Key="out/p.shard0.tar.zstd")["Body"].read()
+        dl = str(tmp/"dl.tar.zstd"); open(dl, "wb").write(body)
+        idx = zframe.read_index(dl)
+        hk = pl.DataFrame({"x": idx["path"].to_list()}).with_columns(
+            (pl.col("x").hash() % N).alias("h"))
+        assert (hk["h"] == 0).all() and idx.height > 0
+        zframe.extract(dl, str(tmp/"dx"), pl.col("path") == idx["path"][0])
+        name = idx["path"][0]
+        i = int(name.split("/f")[1].split(".")[0])
+        assert (tmp/"dx"/name).read_bytes() == (f"a-{i}-".encode()) * (4 + i)
+    run()
+    ok("zframe S3: reshard streamed to S3 multipart (moto), nock + byte-exact")
+
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars
     # subtree partition, the fan-out/barrier, and the root-op handling
@@ -637,7 +695,7 @@ def main():
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
-              test_zframe_plan, test_zframe_reshard,
+              test_zframe_plan, test_zframe_reshard, test_zframe_s3,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)

@@ -1377,8 +1377,12 @@ static struct {
     ZJob *qh, *qt; int qn, readers_done, nreaders_left;
     pthread_mutex_t qmu; pthread_cond_t qcv;
     int level; int64_t batch;
-    pthread_mutex_t amu; int64_t frame_idx;
+    _Atomic int64_t frame_idx;
     int nsink; int *fd; int64_t *aoff;    /* per-sink output fd + append cursor */
+    pthread_mutex_t *slock;               /* per-sink lock: independent streams,
+                                           * so a slow (e.g. S3) sink can't stall
+                                           * the others; also serializes each
+                                           * sink's writes into offset order */
     const char *pattern;                  /* out path template with %d for sink */
     pthread_mutex_t omu;
 } Z;
@@ -1574,7 +1578,12 @@ static void *z_compressor(void *arg) {
         size_t clen = ZSTD_compressCCtx(cc, comp, bound, j->buf,
                                         (size_t)j->len, Z.level);
         int sink = j->sink;
-        pthread_mutex_lock(&Z.amu);
+        int64_t phys = atomic_fetch_add(&Z.frame_idx, 1);
+        int64_t fidx = (j->lframe >= 0) ? j->lframe : phys;
+        /* per-sink critical section: open (once), take the next offset, and
+         * write the frame — sequential, so the destination may be a pipe to a
+         * streaming uploader as readily as a seekable file. */
+        pthread_mutex_lock(&Z.slock[sink]);
         if (Z.fd[sink] < 0) {                  /* lazy-open this sink's output */
             char path[4096];
             snprintf(path, sizeof path, Z.pattern, sink);
@@ -1582,11 +1591,13 @@ static void *z_compressor(void *arg) {
             if (Z.fd[sink] < 0) perror("sink");
         }
         int64_t coff = Z.aoff[sink];
-        int64_t fidx = (j->lframe >= 0) ? j->lframe : Z.frame_idx;
-        Z.frame_idx++;                         /* count physical frames written */
-        if (pwrite(Z.fd[sink], comp, clen, coff) < 0) perror("pwrite");
         Z.aoff[sink] += (int64_t)clen;
-        pthread_mutex_unlock(&Z.amu);
+        for (size_t off = 0; off < clen; ) {   /* full write (pipes short-write) */
+            ssize_t w = write(Z.fd[sink], comp + off, clen - off);
+            if (w < 0) { perror("write"); break; }
+            off += (size_t)w;
+        }
+        pthread_mutex_unlock(&Z.slock[sink]);
         pthread_mutex_lock(&Z.omu);
         for (int r = 0; r < j->nrecs; r++)
             z_emit(&j->recs[r], (int32_t)fidx, coff, (int64_t)clen, sink);
@@ -1604,9 +1615,11 @@ static int run_zpack(const char **srcs, int nsrc, const char *out,
     Z.srcs = srcs; Z.nsrc = nsrc; Z.level = level; Z.batch = batch;
     Z.nreaders_left = readers;
     pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
-    pthread_mutex_init(&Z.amu, NULL); pthread_mutex_init(&Z.omu, NULL);
+    pthread_mutex_init(&Z.omu, NULL);
     Z.nsink = 1;                               /* single output, preopened */
     Z.fd = malloc(sizeof(int)); Z.aoff = calloc(1, sizeof(int64_t));
+    Z.slock = malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(&Z.slock[0], NULL);
     Z.fd[0] = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (Z.fd[0] < 0) { perror("output"); return 2; }
     pthread_t rt[64], ct[128];
@@ -1874,12 +1887,15 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
     Z.nreaders_left = readers;
     if (plan_load(plan_path)) return 2;
     pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
-    pthread_mutex_init(&Z.amu, NULL); pthread_mutex_init(&Z.omu, NULL);
+    pthread_mutex_init(&Z.omu, NULL);
     Z.nsink = P.nsink < 1 ? 1 : P.nsink;
     Z.pattern = pattern;                       /* %d → sink; each opened lazily */
     Z.fd = malloc(sizeof(int) * Z.nsink);
     Z.aoff = calloc(Z.nsink, sizeof(int64_t));
-    for (int i = 0; i < Z.nsink; i++) Z.fd[i] = -1;
+    Z.slock = malloc(sizeof(pthread_mutex_t) * Z.nsink);
+    for (int i = 0; i < Z.nsink; i++) {
+        Z.fd[i] = -1; pthread_mutex_init(&Z.slock[i], NULL);
+    }
     pthread_t rt[64], ct[128];
     if (readers > 64) readers = 64;
     if (compressors > 128) compressors = 128;

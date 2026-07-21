@@ -420,10 +420,11 @@ def _write_footer(out_path: str, ftmp, force_sidecar: bool) -> None:
             side.write(trailer)
 
 
-def _ingest_footer(f, sink_path, force_sidecar, progress, progress_every,
-                   cin_total):
+def _ingest_footer(f, finalize, progress, progress_every, cin_total,
+                   cout_fn=None):
     """Read the per-member footer records streamed by zpack/zexec (identical
-    60B-tail format, sink-tagged) and write one footer per sink. Returns
+    60B-tail format, sink-tagged), build one footer per sink, and hand each
+    finished footer temp file to `finalize(sink, ftmp)`. Returns
     (members, frames, sinks)."""
     import time
     rec = struct.Struct("<qqiiiiqqqi")          # 60B tail: adds i32 sink
@@ -463,15 +464,29 @@ def _ingest_footer(f, sink_path, force_sidecar, progress, progress_every,
         now = time.time()
         if progress and now - last >= progress_every:
             last = now
-            cout = sum(os.path.getsize(sink_path(s)) for s in footers
-                       if os.path.exists(sink_path(s)))
+            cout = cout_fn(footers) if cout_fn else 0
             progress({"members": members, "frames": frames, "cout": cout,
                       "cin_total": cin_total, "elapsed": now - t0})
     for sink, (ft, fw) in footers.items():
         fw.close()
-        _write_footer(sink_path(sink), ft, force_sidecar)
+        finalize(sink, ft)
         ft.close()
     return members, frames, sorted(footers)
+
+
+def _footer_payloads(ftmp):
+    """The footer bytes to place after a sink's frames. ≤4 GB → an embedded
+    zstd skippable frame appended to the archive object; larger → the ipc
+    stream for a separate <key>.nock sidecar object. Returns
+    (embed_bytes_or_None, sidecar_bytes_or_None)."""
+    flen = ftmp.tell()
+    ftmp.seek(0)
+    body = ftmp.read()
+    trailer = struct.pack("<Q", flen) + _footer.MAGIC
+    if flen + len(trailer) <= 0xFFFFFFFF:
+        return (struct.pack("<II", SKIP_MAGIC, flen + len(trailer))
+                + body + trailer), None
+    return None, body + trailer
 
 
 def _zscan(inputs, readers):
@@ -637,6 +652,120 @@ def _shard_pattern(out_path):
     return out_path + ".shard%d"
 
 
+def _parse_s3(url):
+    rest = url[len("s3://"):]
+    bucket, _, key = rest.partition("/")
+    return bucket, key
+
+
+def _s3_upload_sink(client, bucket, key, fifo_path, footer_box, done_evt,
+                    part_size=8 << 20):
+    """Stream one sink's frames from its FIFO straight into an S3 multipart
+    upload; when the frames end, append the footer (an embedded skippable
+    frame, or a separate <key>.nock object for >4 GB) and complete. Runs off
+    C's own output — no local staging of the 2 TB body."""
+    mpu = client.create_multipart_upload(Bucket=bucket, Key=key)
+    uid = mpu["UploadId"]
+    parts, pnum, buf = [], 1, bytearray()
+
+    def put_part(data):
+        nonlocal pnum
+        r = client.upload_part(Bucket=bucket, Key=key, UploadId=uid,
+                               PartNumber=pnum, Body=bytes(data))
+        parts.append({"ETag": r["ETag"], "PartNumber": pnum})
+        pnum += 1
+    try:
+        with open(fifo_path, "rb") as fr:              # blocks until C opens it
+            while (chunk := fr.read(1 << 20)):
+                buf += chunk
+                while len(buf) >= part_size:           # non-last parts ≥ 5 MB
+                    put_part(buf[:part_size]); del buf[:part_size]
+        done_evt.wait()                                # footer now available
+        embed, sidecar = footer_box[0]
+        if embed:
+            buf += embed
+        while len(buf) >= part_size:
+            put_part(buf[:part_size]); del buf[:part_size]
+        if buf or not parts:
+            put_part(buf)                              # final (any size) part
+        client.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=uid,
+            MultipartUpload={"Parts": parts})
+        if sidecar is not None:
+            client.put_object(Bucket=bucket, Key=key + ".nock", Body=sidecar)
+    except Exception:
+        client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=uid)
+        raise
+
+
+def _recompress_s3(inputs, s3_url, level, batch_bytes, readers, compressors,
+                   progress, progress_every, include, exclude, min_size,
+                   shard_by, shards, cin_total):
+    """Reshard/recompress with the outputs streamed straight into S3: C writes
+    each sink's frames sequentially to a FIFO, a per-sink uploader thread
+    multipart-uploads them, and the footer is appended once the frames end."""
+    import subprocess
+    import threading
+    import shutil
+    import boto3
+    from ..wire import EXE
+    bucket, key = _parse_s3(s3_url)
+    planned = include or exclude or min_size or shard_by is not None
+    tmpplan = None
+    if planned:
+        plan = plan_frames(_zscan(inputs, readers), include, exclude,
+                           min_size, batch_bytes, shard_by, shards)
+        with tempfile.NamedTemporaryFile(suffix=".plan", delete=False) as pf:
+            tmpplan = pf.name
+        nsink = _write_plan(plan, len(inputs), tmpplan)
+        present = (sorted({int(x) for x in plan["sink"].unique()})
+                   if plan.height else [])
+    else:
+        nsink, present = 1, [0]
+    sink_key = ((lambda s: _shard_pattern(key) % s) if nsink > 1
+                else (lambda s: key))
+
+    tmpdir = tempfile.mkdtemp(prefix="quiver-s3-")
+    fifopat = os.path.join(tmpdir, "s%d.fifo")
+    client = boto3.client("s3")
+    boxes = {s: [None] for s in present}
+    evts = {s: threading.Event() for s in present}
+    threads = {}
+    for s in present:
+        os.mkfifo(fifopat % s)
+        t = threading.Thread(target=_s3_upload_sink, daemon=True,
+                             args=(client, bucket, sink_key(s), fifopat % s,
+                                   boxes[s], evts[s]))
+        t.start(); threads[s] = t
+
+    def finalize(sink, ftmp):
+        boxes[sink][0] = _footer_payloads(ftmp)
+        evts[sink].set()
+    try:
+        if planned:
+            cmd = [EXE, "zexec", tmpplan, fifopat, str(level),
+                   str(readers), str(compressors), *inputs]
+        else:
+            cmd = [EXE, "zpack", fifopat % 0, str(level), str(batch_bytes),
+                   str(readers), str(compressors), *inputs]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=1 << 22)
+        members, frames, _ = _ingest_footer(proc.stdout, finalize, progress,
+                                            progress_every, cin_total)
+        rc = proc.wait()
+        for s in present:                      # unblock any sink with no records
+            if not evts[s].is_set():
+                boxes[s][0] = (b"", None); evts[s].set()
+        for t in threads.values():
+            t.join()
+        if rc != 0:
+            raise RuntimeError(f"exec exited {rc}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpplan:
+            os.unlink(tmpplan)
+    return Result(members=members, frames=frames)
+
+
 def recompress_c(inputs, out_path: str, level: int = 6,
                  batch_bytes: int = 16 << 20, readers: int = 8,
                  compressors: int | None = None, progress=None,
@@ -655,6 +784,12 @@ def recompress_c(inputs, out_path: str, level: int = 6,
     from ..wire import EXE
     compressors = compressors or (os.cpu_count() or 8)
     cin_total = sum(os.path.getsize(p) for p in inputs)
+
+    if out_path.startswith("s3://"):                        # stream into S3
+        return _recompress_s3(inputs, out_path, level, batch_bytes, readers,
+                              compressors, progress, progress_every, include,
+                              exclude, min_size, shard_by, shards, cin_total)
+
     planned = include or exclude or min_size or shard_by is not None
 
     if planned:                                             # B: scan → plan → exec
@@ -667,14 +802,20 @@ def recompress_c(inputs, out_path: str, level: int = 6,
         pattern = _shard_pattern(out_path) if nsink > 1 else out_path
         sink_path = ((lambda s: pattern % s) if nsink > 1
                      else (lambda s: out_path))
+
+        def fin(sink, ftmp):
+            _write_footer(sink_path(sink), ftmp, _force_sidecar)
+
+        def cout(footers):
+            return sum(os.path.getsize(sink_path(s)) for s in footers
+                       if os.path.exists(sink_path(s)))
         try:
             proc = subprocess.Popen(
                 [EXE, "zexec", plan_path, pattern, str(level),
                  str(readers), str(compressors), *inputs],
                 stdout=subprocess.PIPE, bufsize=1 << 22)
-            members, frames, sinks = _ingest_footer(
-                proc.stdout, sink_path, _force_sidecar, progress,
-                progress_every, cin_total)
+            members, frames, _ = _ingest_footer(
+                proc.stdout, fin, progress, progress_every, cin_total, cout)
             if proc.wait() != 0:
                 raise RuntimeError(f"zexec exited {proc.returncode}")
         finally:
@@ -686,8 +827,11 @@ def recompress_c(inputs, out_path: str, level: int = 6,
          str(readers), str(compressors), *inputs],
         stdout=subprocess.PIPE, bufsize=1 << 22)
     members, frames, _ = _ingest_footer(
-        proc.stdout, lambda s: out_path, _force_sidecar,
-        progress, progress_every, cin_total)
+        proc.stdout, lambda sink, ftmp: _write_footer(out_path, ftmp,
+                                                      _force_sidecar),
+        progress, progress_every, cin_total,
+        lambda footers: (os.path.getsize(out_path)
+                         if os.path.exists(out_path) else 0))
     if proc.wait() != 0:
         raise RuntimeError(f"zpack exited {proc.returncode}")
     return Result(members=members, frames=frames)
