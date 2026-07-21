@@ -791,6 +791,91 @@ static void run_decode_epoch(const CmdBatch *c, int64_t e0, int64_t e1,
     free(groups);
 }
 
+/* ── buffered encode groups (the dual: pack_fs, docs/ISA.md §3-§4) ──────────
+ * A DEFLATE row heads a group: size = total assembled frame length, K =
+ * header_offset = member count, pad_align = zstd level. Its K member rows
+ * gather into a worker-owned buffer — each carries the inline `header` (its
+ * PAX header, planner-formatted) at header_offset and its file body at
+ * data_offset (pread of `path`, length `size`). Pad bytes are the zeroed
+ * buffer. Then DEFLATE compresses [0,total], appends, and reports (coff in
+ * read_size, clen in cksum) for the footer. Structural mirror of decode. */
+static void encode_group(const CmdBatch *c, int64_t d, int afd, RowResult *out,
+                         uint8_t **buf, size_t *bcap) {
+    int64_t total = c->size[d], k = c->header_offset[d];
+    int level = c->pad_align[d] > 0 ? (int)c->pad_align[d] : 3;
+    out[d].res = 0; out[d].read_size = 0;
+    if ((size_t)total > *bcap) { *buf = realloc(*buf, (size_t)total); *bcap = (size_t)total; }
+    memset(*buf, 0, (size_t)total);
+    for (int64_t m = d + 1; m <= d + k; m++) {
+        out[m].res = 0; out[m].read_size = c->size[m];
+        int64_t hlen = c->hdr_off[m + 1] - c->hdr_off[m];
+        int64_t hoff = c->header_offset[m], boff = c->data_offset[m], sz = c->size[m];
+        if (hoff < 0 || hoff + hlen > total || boff < 0 || boff + sz > total) {
+            out[m].res = -EIO; out[d].res = -EIO; return;
+        }
+        memcpy(*buf + hoff, c->hdr_data + c->hdr_off[m], (size_t)hlen);
+        int fd = open(c->path[m], O_RDONLY);
+        if (fd < 0) { out[m].res = -errno; out[d].res = -errno; return; }
+        int64_t got = 0;
+        while (got < sz) {
+            ssize_t r = pread(fd, *buf + boff + got, (size_t)(sz - got), got);
+            if (r <= 0) { out[m].res = r < 0 ? -errno : -EIO; break; }
+            got += r;
+        }
+        close(fd);
+        if (out[m].res) { out[d].res = out[m].res; return; }
+    }
+    size_t bound = ZSTD_compressBound((size_t)total);
+    uint8_t *comp = malloc(bound);
+    if (!comp) { out[d].res = -ENOMEM; return; }
+    size_t clen = ZSTD_compress(comp, bound, *buf, (size_t)total, level);
+    if (ZSTD_isError(clen)) { out[d].res = -EIO; free(comp); return; }
+    pthread_mutex_lock(&g_append_mu);
+    int64_t coff = g_append_off;
+    if (pwrite(afd, comp, clen, coff) != (ssize_t)clen) out[d].res = -errno;
+    else g_append_off += (int64_t)clen;
+    pthread_mutex_unlock(&g_append_mu);
+    out[d].read_size = coff;                          /* frame offset */
+    out[d].cksum = (uint64_t)clen;                    /* compressed length */
+    free(comp);
+}
+
+typedef struct {
+    const CmdBatch *c; RowResult *out; int afd;
+    const int64_t *groups; int ng; _Atomic int next;
+} EncodePool;
+
+static void *encode_worker(void *arg) {
+    EncodePool *p = arg;
+    uint8_t *buf = NULL; size_t bcap = 0;
+    for (;;) {
+        int i = atomic_fetch_add(&p->next, 1);
+        if (i >= p->ng) break;
+        encode_group(p->c, p->groups[i], p->afd, p->out, &buf, &bcap);
+    }
+    free(buf);
+    return NULL;
+}
+
+/* Run a whole encode epoch [e0,e1) — every DEFLATE-headed group in parallel. */
+static void run_encode_epoch(const CmdBatch *c, int64_t e0, int64_t e1,
+                             int afd, RowResult *out) {
+    for (int64_t i = e0; i < e1; i++) { out[i].res = 0; out[i].read_size = c->size[i]; }
+    int64_t *groups = malloc(sizeof(int64_t) * (size_t)(e1 - e0));
+    int ng = 0;
+    for (int64_t i = e0; i < e1; i++)
+        if (c->opcode[i] == OP_DEFLATE) groups[ng++] = i;
+    EncodePool p = { c, out, afd, groups, ng, 0 };
+    int nt = ng < DECODE_POOL ? ng : DECODE_POOL;
+    if (nt >= 1) {
+        pthread_t tid[DECODE_POOL];
+        for (int t = 0; t < nt; t++)
+            pthread_create(&tid[t], NULL, encode_worker, &p);
+        for (int t = 0; t < nt; t++) pthread_join(tid[t], NULL);
+    }
+    free(groups);
+}
+
 /* The scheduler is engine-agnostic: epochs, refcount deps, and the slot
  * bound are identical whether a row executes as a single ring SQE or on
  * the pool. ring == NULL (engine=sync, or platforms without io_uring)
@@ -825,6 +910,10 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
          * with parent_row=-1 (intra-group order is worker-sequential). */
         if (c->opcode[e0] == OP_INFLATE) {
             run_decode_epoch(c, e0, e1, afd, out);
+            e0 = e1; continue;
+        }
+        if (c->opcode[e0] == OP_DEFLATE) {
+            run_encode_epoch(c, e0, e1, afd, out);
             e0 = e1; continue;
         }
         int64_t done = 0, span = e1 - e0, n_ready = 0;

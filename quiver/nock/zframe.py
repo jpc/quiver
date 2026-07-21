@@ -1221,27 +1221,106 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
     return len(paths)
 
 
-def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
-            predicate=None, engine="auto", threads=8):
-    """Parallel pack a filesystem tree into a per-batch-frame zstd nock — the
-    FILE-source variant of recompress (docs/ISA.md §2: COMPRESS with src=FILE
-    instead of STREAM, a simpler fetch — read files and tar-format them rather
-    than decompress+parse a tar.zstd). scan the tree, batch files into frames by
-    size, then tar-format + zstd each frame in a thread pool (file reads and
-    zstd both release the GIL). Output is a standard tar.zstd, unpackable by
-    unpack()."""
-    import tarfile
+def _pack_fs_scan(root, batch_bytes, predicate, engine, threads):
+    """Shared front-end: scan the tree, filter, greedy-fill frames by raw tar
+    footprint (512 header + padded body), within path order."""
     from .. import wire
-    workers = workers or (os.cpu_count() or 8)
-    df = wire.scan(root, engine=engine, threads=threads)
+    df = wire.scan(root, engine=engine or "auto", threads=threads)
     files = df.filter(~pl.col("is_dir"))
     if predicate is not None:
         files = files.filter(predicate)
-    # frame = greedy fill by raw tar footprint (512 header + padded body)
     files = files.sort("path").with_columns(
         (512 + ((pl.col("size") + 511) // 512) * 512).alias("raw"))
-    files = files.with_columns(
+    return files.with_columns(
         ((pl.col("raw").cum_sum() - pl.col("raw")) // batch_bytes).alias("frame"))
+
+
+def _pack_fs_plan(files, root, level):
+    """Compile scanned files into the buffer-machine encode-group command stream
+    (docs/ISA.md §3-§4): per frame one DEFLATE row (size = assembled frame
+    length, header_offset = K members, pad_align = level) followed by its K
+    gather rows — each carrying its PAX header INLINE at header_offset and its
+    file body (pread of `path`) at data_offset. Returns (cmds, boundaries,
+    frames) where frames[fid] = footer tuples (path,size,mode,mtime,uid,gid,
+    in_off) and the fid-th DEFLATE row is the fid-th boundary."""
+    import tarfile
+    from ..wire import OP_DEFLATE, OP_COPY, cmd_df
+    opc, hdr, hoff, doff, sz, pth, pad = [], [], [], [], [], [], []
+    frames = []
+    for _, grp in files.group_by("frame", maintain_order=True):
+        cursor = 0
+        members = []
+        rows = []
+        for r in grp.iter_rows(named=True):
+            ti = tarfile.TarInfo(r["path"])
+            ti.size = r["size"]; ti.mode = r["mode"] & 0o7777
+            ti.mtime = r["mtime_ns"] // 1_000_000_000
+            ti.uid = r["uid"]; ti.gid = r["gid"]
+            h = ti.tobuf(format=tarfile.PAX_FORMAT)
+            ho, do = cursor, cursor + len(h)
+            cursor = do + ((r["size"] + 511) // 512) * 512     # padded body
+            rows.append((h, ho, do, r["size"], os.path.join(root, r["path"])))
+            members.append((r["path"], r["size"], r["mode"], r["mtime_ns"],
+                            r["uid"], r["gid"], do))            # in_off = body
+        opc.append(OP_DEFLATE); hdr.append(b""); hoff.append(len(rows))
+        doff.append(0); sz.append(cursor); pth.append(""); pad.append(level)
+        for (h, ho, do, s, rp) in rows:
+            opc.append(OP_COPY); hdr.append(h); hoff.append(ho)
+            doff.append(do); sz.append(s); pth.append(rp); pad.append(1)
+        frames.append(members)
+    n = len(opc)
+    cmds = cmd_df(n, opcode=pl.Series(opc, dtype=pl.UInt8),
+                  header=pl.Series(hdr, dtype=pl.Binary),
+                  header_offset=pl.Series(hoff, dtype=pl.Int64),
+                  data_offset=pl.Series(doff, dtype=pl.Int64),
+                  size=pl.Series(sz, dtype=pl.Int64), path=pth,
+                  pad_align=pl.Series(pad, dtype=pl.Int64))
+    boundaries = np.flatnonzero(cmds["opcode"].to_numpy() == OP_DEFLATE)
+    return cmds, boundaries, frames
+
+
+def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
+            predicate=None, engine="auto", threads=8, batch_rows=4096):
+    """Parallel pack a filesystem tree into a per-batch-frame zstd nock — the
+    encode-group dual of unpack (docs/ISA.md): each frame is a DEFLATE group
+    that gathers PAX headers (INLINE, planner-formatted) + file bodies into a
+    worker buffer and compresses it. engine=None keeps the pure-Python
+    thread-pool packer (the oracle). Output is unpackable by unpack()."""
+    files = _pack_fs_scan(root, batch_bytes, predicate, engine, threads)
+    if engine is None or not files.height:
+        return _pack_fs_py(files, root, out_path, level, workers)
+    from ..wire import PipeExecutor
+    from ..tools import _check
+    open(out_path, "wb").close()                       # fresh append target
+    cmds, boundaries, frames = _pack_fs_plan(files, root, level)
+    ex = PipeExecutor(out_path, engine=engine)
+    try:
+        comp = ex.execute(cmds, batch_rows=batch_rows, boundaries=boundaries)
+    finally:
+        assert ex.close() == 0
+    _check(comp, cmds)
+    coff = dict(zip(comp["user_data"].to_list(), comp["read_size"].to_list()))
+    clen = dict(zip(comp["user_data"].to_list(), comp["cksum"].to_list()))
+    uds = cmds["user_data"].to_list()          # boundaries[fid] = DEFLATE row
+    ftmp = tempfile.TemporaryFile()
+    fw = _FooterStream(ftmp)
+    for fid, members in enumerate(frames):
+        ud = uds[int(boundaries[fid])]
+        for (path, size, mode, mtime, uid, gid, in_off) in members:
+            fw.add(path, size, mode, mtime, uid, gid, fid, coff[ud], clen[ud],
+                   in_off)
+    fw.close()
+    _write_footer(out_path, ftmp, False)
+    ftmp.close()
+    return Result(members=fw.members, frames=len(frames))
+
+
+def _pack_fs_py(files, root, out_path, level, workers):
+    """Oracle: the pure-Python thread-pool packer (file read + zstd both release
+    the GIL). Superseded by the executor encode-group path; kept as the test
+    reference."""
+    import tarfile
+    workers = workers or (os.cpu_count() or 8)
     lock = threading.Lock()
     st = {"off": 0}
     fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -1250,7 +1329,7 @@ def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
         buf, members = bytearray(), []
         for r in grp.iter_rows(named=True):
             with open(os.path.join(root, r["path"]), "rb") as f:
-                data = f.read()                        # file read: GIL released
+                data = f.read()
             ti = tarfile.TarInfo(r["path"])
             ti.size = len(data); ti.mode = r["mode"] & 0o7777
             ti.mtime = r["mtime_ns"] // 1_000_000_000
@@ -1260,10 +1339,10 @@ def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
             buf += hdr; buf += data; buf += b"\x00" * ((-len(data)) % 512)
             members.append((r["path"], len(data), r["mode"], r["mtime_ns"],
                             r["uid"], r["gid"], in_off))
-        comp = zstd.ZstdCompressor(level=level).compress(bytes(buf))  # GIL released
-        with lock:                                     # assign the append offset
+        comp = zstd.ZstdCompressor(level=level).compress(bytes(buf))
+        with lock:
             coff = st["off"]; st["off"] += len(comp)
-        os.pwrite(fd, comp, coff)                      # positioned, concurrent-safe
+        os.pwrite(fd, comp, coff)
         return coff, len(comp), members
 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1273,7 +1352,7 @@ def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
     os.close(fd)
     ftmp = tempfile.TemporaryFile()
     fw = _FooterStream(ftmp)
-    for fid, (coff, clen, members) in enumerate(results):   # coff locates frames
+    for fid, (coff, clen, members) in enumerate(results):
         for (path, size, mode, mtime, uid, gid, in_off) in members:
             fw.add(path, size, mode, mtime, uid, gid, fid, coff, clen, in_off)
     fw.close()

@@ -19,7 +19,15 @@
 >   across an Arrow batch. `g_fc`/`fc_get`/`fc_release` removed; `OP_EXTRACT`
 >   reverted to raw-only. Test asserts executor == Python oracle byte+mode exact,
 >   incl. a `batch_rows=3` run that forces cross-group chunk boundaries.
-> - ⏳ §10.3 pack_fs (gather group + `DEFLATE`), §10.4 recompress (streaming),
+> - ✅ **§10.3 pack_fs = encode group** — `run_encode_epoch`/`encode_worker`/
+>   `encode_group` in quiver-exec.c (the dual of decode): a `DEFLATE`-headed
+>   group gathers PAX headers (INLINE, planner `tobuf(PAX_FORMAT)`) + file
+>   bodies (`pread`) into a zeroed worker buffer, then compresses/appends and
+>   reports (coff, clen). `_pack_fs_plan` emits the groups; the Python
+>   thread-pool packer is retained as `_pack_fs_py` oracle. Test asserts
+>   executor == oracle on member set / sizes / in-frame offsets, and the frames
+>   still list as a clean tar (`zstd -dc | tar t`).
+> - ⏳ §10.4 recompress (streaming `INFLATE`→plan→`DEFLATE`-live-slice),
 >   §10.5 sharded source + merge — next.
 
 **Why.** We designed one machine — `scan`/generators → Polars plan → the *one*

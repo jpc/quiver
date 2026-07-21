@@ -657,6 +657,16 @@ def test_zframe_packfs(tmp):
     zframe.unpack(str(tmp/"fs.tar.zstd"), str(tmp/"fx"), workers=4)
     for rel, data in want.items():                     # pack→unpack byte-exact
         assert (tmp/"fx"/rel).read_bytes() == data
+    # de-fork invariant: executor encode-group == Python thread-pool oracle.
+    # Compressed bytes may differ (libzstd build), so compare the decoded
+    # frames: same member set, same sizes, same in-frame body offsets.
+    ro = zframe.pack_fs(str(root), str(tmp/"fs_or.tar.zstd"),
+                        batch_bytes=64 << 10, level=4, engine=None)
+    assert ro.members == 300 and ro.frames == res.frames
+    ie = zframe.read_index(str(tmp/"fs.tar.zstd")).sort("path")
+    io = zframe.read_index(str(tmp/"fs_or.tar.zstd")).sort("path")
+    for col in ("path", "size", "in_off", "frame"):
+        assert ie[col].to_list() == io[col].to_list(), col
     ok("zframe pack_fs: filesystem scan → compressed frame nock, round-trips")
 
 
