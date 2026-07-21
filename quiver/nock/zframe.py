@@ -1000,6 +1000,80 @@ def read_index(path: str) -> pl.DataFrame:
     return (pl.concat(dfs) if dfs else pl.DataFrame(schema=_ZF_SCHEMA))
 
 
+_MERGED_IPC = _FOOTER_IPC + [("shard_id", "i32")]
+
+
+def _schema_cols(df, schema):
+    """Columns of `df` in `schema` order, in the form StreamWriter wants
+    (lists for strings/binary, numpy for fixed-width)."""
+    return [df[name].to_list() if t in ("large_string", "large_binary")
+            else df[name].to_numpy() for name, t in schema]
+
+
+def merge(shards, out_path: str) -> int:
+    """The distributed reduce, logical (zero-copy): join N shard footers into
+    one index tagged with shard_id, keeping each shard's frame offsets local.
+    No byte movement — the merged archive is the shard files plus this manifest
+    (shard paths + the joined footer). Byte-indistinguishable, on extract, from
+    a single-node run over the union of the sources. Returns member count."""
+    parts, fbase = [], 0
+    for k, shard in enumerate(shards):
+        idx = read_index(shard)
+        parts.append(idx.with_columns(
+            (pl.col("frame") + fbase).cast(pl.Int32).alias("frame"),
+            pl.lit(k, dtype=pl.Int32).alias("shard_id")))
+        fbase += int(idx["frame"].n_unique())
+    merged = (pl.concat(parts) if parts
+              else pl.DataFrame(schema={**_ZF_SCHEMA, "shard_id": pl.Int32}))
+    header = ("\n".join(os.path.abspath(s) for s in shards) + "\n").encode()
+    with open(out_path, "wb") as f:                 # [u32 hlen][paths][footer ipc]
+        f.write(struct.pack("<I", len(header)))
+        f.write(header)
+        w = StreamWriter(f, _MERGED_IPC)
+        for s in range(0, merged.height, 1 << 20):
+            w.write_batch(_schema_cols(merged[s:s + (1 << 20)], _MERGED_IPC))
+        w.close()
+    return merged.height
+
+
+def read_merged(out_path: str):
+    """Return (shard_paths, joined_index) from a merge manifest."""
+    with open(out_path, "rb") as f:
+        (hlen,) = struct.unpack("<I", f.read(4))
+        shards = [ln for ln in f.read(hlen).decode().split("\n") if ln]
+        dfs = [pl.DataFrame(b) for b in StreamReader(f)]
+    idx = (pl.concat(dfs) if dfs
+           else pl.DataFrame(schema={**_ZF_SCHEMA, "shard_id": pl.Int32}))
+    return shards, idx
+
+
+def extract_merged(out_path: str, dest: str, predicate=None):
+    """Extract from a merged shard-set: resolve each member's frame in its own
+    shard file, decompress it once, slice — the same loop as extract() with a
+    shard_id lookup in front."""
+    shards, idx = read_merged(out_path)
+    if predicate is not None:
+        idx = idx.filter(predicate)
+    dctx = zstd.ZstdDecompressor()
+    fh, out = {}, []
+    for (sid, coff, clen), grp in idx.group_by(
+            ["shard_id", "frame_coff", "frame_clen"], maintain_order=True):
+        f = fh.get(sid) or fh.setdefault(sid, open(shards[sid], "rb"))
+        f.seek(coff)
+        raw = dctx.decompress(f.read(clen))
+        for r in grp.iter_rows(named=True):
+            data = raw[r["in_off"]: r["in_off"] + r["size"]]
+            p = os.path.join(dest, r["path"])
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            with open(p, "wb") as w:
+                w.write(data)
+            os.chmod(p, r["mode"] & 0o7777)
+            out.append(r["path"])
+    for f in fh.values():
+        f.close()
+    return out
+
+
 def extract(path: str, dest: str, predicate: pl.Expr | None = None):
     """Prototype extractor: group members by frame, decompress each
     needed frame once, slice members out. The C OP_EXTRACT decompress

@@ -636,6 +636,53 @@ def test_zframe_s3(tmp):
     ok("zframe S3: reshard streamed to S3 multipart (moto), nock + byte-exact")
 
 
+def test_zframe_merge(tmp):
+    """The distributed reduce: recompress sources into separate shards, then
+    merge (zero-copy) into one index — must equal a single-node run over all
+    sources, byte-exact, with members resolved to the right shard."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile
+    from quiver.nock import zframe
+
+    def mk_zst(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}-{i}-").encode() * (7 + i)
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}.dat"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    srcs = [str(tmp/f"{p}.tar.zstd") for p in ("a", "b", "c")]
+    for p, s in zip(("a", "b", "c"), srcs):
+        mk_zst(s, p, 120)
+    # map: one shard per source
+    shard_files = []
+    for k, s in enumerate(srcs):
+        sh = str(tmp/f"sh{k}.tar.zstd")
+        zframe.recompress_c([s], sh, level=4, batch_bytes=16 << 10)
+        shard_files.append(sh)
+    # reduce
+    m = zframe.merge(shard_files, str(tmp/"merged.nockset"))
+    ref = zframe.recompress_c(srcs, str(tmp/"single.tar.zstd"),
+                              level=4, batch_bytes=16 << 10)
+    assert m == ref.members == 360
+    shards, idx = zframe.read_merged(str(tmp/"merged.nockset"))
+    assert len(shards) == 3 and set(idx["shard_id"].unique().to_list()) == {0, 1, 2}
+    assert set(idx["path"]) == set(
+        zframe.read_index(str(tmp/"single.tar.zstd"))["path"])
+    # byte-exact for a member from each shard
+    zframe.extract_merged(str(tmp/"merged.nockset"), str(tmp/"mx"),
+                          pl.col("path").is_in(["a/f0005.dat", "c/f0119.dat"]))
+    assert (tmp/"mx"/"a"/"f0005.dat").read_bytes() == (b"a-5-") * 12
+    assert (tmp/"mx"/"c"/"f0119.dat").read_bytes() == (b"c-119-") * (7 + 119)
+    ok("zframe merge: shards → zero-copy reduce == single-node, byte-exact")
+
+
 def test_zframe_wal(tmp):
     """WAL resume: after a crash, re-scan/re-plan (deterministic), skip the
     frames already committed to the WAL, and append the rest — verified by
@@ -765,7 +812,7 @@ def main():
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
-              test_zframe_plan, test_zframe_reshard, test_zframe_s3,
+              test_zframe_plan, test_zframe_reshard, test_zframe_s3, test_zframe_merge,
               test_zframe_wal,
               test_cksum_parallel,
               test_p1_barrier):
