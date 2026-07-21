@@ -2243,6 +2243,173 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
     return 0;
 }
 
+/* ── zstream: one-pass planned recompress (docs/ISA.md §5) ──────────────────
+ * The last fork closed: decompress the source ONCE into a live buffer, emit
+ * member metadata (ZMETA on stdout), read back a PLAN (member→frame, from the
+ * Polars planner over stdin), compress the planned frame slices from the SAME
+ * live buffer, and report (frame→coff,clen) as COMP on a second fd — the
+ * 60-byte record retired, both directions on the standard schemas. This first
+ * cut is single-reader + synchronous per window (emit ZMETA → read PLAN →
+ * compress); the union/async pipeline (keep the sinks fed) is the follow-up.
+ * Frames are contiguous member runs, so a frame is a byte slice of the buffer
+ * (no gather; filter/reshard gather is the next increment). */
+static int read_cmd_stream(CmdBatch *cb, uint8_t **meta, size_t *mcap,
+                           uint8_t **body, size_t *bcap) {
+    for (;;) {
+        uint32_t hdr[2];
+        int r = read_full(0, hdr, 8);
+        if (r == 1 || (r == 0 && hdr[1] == 0)) return 1;      /* EOS/EOF */
+        if (r < 0 || hdr[0] != 0xFFFFFFFFu) return -1;
+        if (hdr[1] > *mcap) *meta = realloc(*meta, *mcap = hdr[1]);
+        if (read_full(0, *meta, hdr[1])) return -1;
+        int64_t rt = fb_root(*meta);
+        int64_t blp = fb_field(*meta, rt, 3);
+        int64_t blen = blp >= 0 ? fb_i64(*meta, blp) : 0;
+        if (blen > 0) {
+            if ((size_t)blen > *bcap) *body = realloc(*body, *bcap = (size_t)blen);
+            if (read_full(0, *body, (size_t)blen)) return -1;
+        }
+        int64_t htp = fb_field(*meta, rt, 1);
+        if (htp >= 0 && (*meta)[htp] == 1) continue;          /* schema msg */
+        if (parse_cmd_batch(*meta, *body, cb)) return -1;
+        return 0;
+    }
+}
+
+/* One frame's COMP row emitted per compressed slice: user_data = the frame id
+ * the planner assigned (dep_group), read_size = coff, cksum = clen. */
+static int emit_comp_batch(int fd, int64_t n, uint64_t *ud, int64_t *coff,
+                           uint64_t *clen) {
+    int32_t *res = calloc((size_t)n, 4);
+    int32_t *parts = calloc((size_t)n, 4);
+    int64_t *eo = calloc((size_t)(n + 1), 8);
+    struct WBuf bufs[COMP_N_BUFS] = {
+        {NULL,0},{ud, 8*n}, {NULL,0},{res, 4*n}, {NULL,0},{coff, 8*n},
+        {NULL,0},{clen, 8*n}, {NULL,0},{eo, 8*(n+1)},{NULL,0},
+        {NULL,0},{parts, 4*n},
+    };
+    int rc = emit_batch(fd, COMP_BATCH_TMPL, COMP_TMPL_LEN,
+                        COMP_OFF_BODYLEN, COMP_OFF_RBLEN, COMP_NODE_OFF,
+                        COMP_N_NODES, COMP_BUF_OFF, COMP_N_BUFS, n, bufs);
+    free(res); free(parts); free(eo);
+    return rc;
+}
+
+typedef struct { int64_t off, len, size, mtime; int32_t mode, uid, gid; } SMem;
+
+static int run_zstream(int comp_fd, const char **srcs, int nsrc,
+                       const char *out, int level, int64_t batch) {
+    int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ofd < 0) { perror("out"); return 2; }
+    memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
+    emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
+    emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
+
+    int64_t append = 0, nframes = 0;
+    int64_t bcap = batch + (4 << 20); uint8_t *buf = malloc((size_t)bcap);
+    int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
+    uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
+    size_t cbnd = ZSTD_compressBound((size_t)bcap); uint8_t *comp = malloc(cbnd);
+
+    for (int si = 0; si < nsrc; si++) {
+        Zsrc z;
+        if (zsrc_open(&z, srcs[si])) continue;
+        MetaBuilder mb; mb_init(&mb);
+        int64_t blen = 0; int nm = 0; int32_t ordinal = 0;
+        char pax_path[4096], gnu[4096], name[4096];
+        int has_pax = 0, has_gnu = 0; int64_t pax_size = -1;
+        uint8_t hdr[512]; int done = 0;
+        while (!done) {
+            int eof = zsrc_read(&z, hdr, 512) < 512;
+            int allz = 1;
+            if (!eof) for (int k = 0; k < 512; k++) if (hdr[k]) { allz = 0; break; }
+            if (eof || allz) done = 1;
+            else {
+                int typ = hdr[156];
+                int64_t sz = zoctal(hdr + 124, 12);
+                int64_t bl = (sz + 511) / 512 * 512;
+                if (blen + 512 + bl + 8192 > bcap) {
+                    bcap = (blen + 512 + bl + 8192) * 2;
+                    buf = realloc(buf, (size_t)bcap);
+                    comp = realloc(comp, cbnd = ZSTD_compressBound((size_t)bcap));
+                }
+                if (typ == 'x' || typ == 'g') {
+                    memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, bl);
+                    z_parse_pax(buf + blen + 512, sz, pax_path, &has_pax, &pax_size);
+                    blen += 512 + bl; continue;
+                }
+                if (typ == 'L') {
+                    memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, bl);
+                    int nl = sz < 4095 ? (int)sz : 4095;
+                    memcpy(gnu, buf + blen + 512, nl);
+                    while (nl && gnu[nl-1] == 0) nl--;
+                    gnu[nl] = 0; has_gnu = 1;
+                    blen += 512 + bl; continue;
+                }
+                if (has_pax) strcpy(name, pax_path);
+                else if (has_gnu) strcpy(name, gnu);
+                else {
+                    char nmb[101], pre[156];
+                    memcpy(nmb, hdr, 100); nmb[100] = 0;
+                    memcpy(pre, hdr + 345, 155); pre[155] = 0;
+                    if (pre[0]) snprintf(name, sizeof name, "%s/%s", pre, nmb);
+                    else { strncpy(name, nmb, sizeof name-1); name[sizeof name-1]=0; }
+                }
+                int64_t rsize = pax_size >= 0 ? pax_size : sz;
+                int64_t rbl = (rsize + 511) / 512 * 512;
+                int64_t off = blen;
+                memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, rbl);
+                blen += 512 + rbl;
+                if (typ == '0' || typ == 0) {
+                    if (nm >= mcap_m) mem = realloc(mem, sizeof(SMem)*(size_t)(mcap_m*=2));
+                    mem[nm] = (SMem){off, 512 + rbl, rsize,
+                        zoctal(hdr+136,12)*1000000000LL, (int32_t)zoctal(hdr+100,8),
+                        (int32_t)zoctal(hdr+108,8), (int32_t)zoctal(hdr+116,8)};
+                    mb_row(&mb, name, 0, ordinal++, rsize, mem[nm].mode,
+                           mem[nm].mtime, mem[nm].uid, mem[nm].gid);
+                    nm++;
+                }
+                has_pax = has_gnu = 0; pax_size = -1;
+            }
+            /* window full (or source done): plan it, compress its frames.
+             * Cap members below the ZMETA batch size so mb never auto-flushes
+             * mid-window — one ZMETA batch ↔ one PLAN batch ↔ one window. */
+            if ((blen >= batch || nm >= SCAN_BATCH / 2 || (done && nm)) && nm) {
+                mb_flush(&mb);                       /* ZMETA(window) → stdout */
+                CmdBatch pc;
+                if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) return 1;
+                /* pc: one row per member (ZMETA order); dep_group = frame id */
+                int64_t cn = pc.n_rows, wf = 0;
+                uint64_t *fud = malloc(8*(size_t)cn); int64_t *fco = malloc(8*(size_t)cn);
+                uint64_t *fcl = malloc(8*(size_t)cn);
+                int64_t r = 0;
+                while (r < cn) {
+                    int64_t g = pc.dep_group[r], a = r;
+                    while (r < cn && pc.dep_group[r] == g) r++;   /* frame [a,r) */
+                    int64_t foff = mem[a].off, flen = 0;
+                    for (int64_t m = a; m < r; m++) flen += mem[m].len;
+                    size_t cl = ZSTD_compress(comp, cbnd, buf + foff,
+                                              (size_t)flen, level);
+                    if (ZSTD_isError(cl)) return 1;
+                    if (pwrite(ofd, comp, cl, append) != (ssize_t)cl) return 1;
+                    fud[wf] = (uint64_t)g; fco[wf] = append; fcl[wf] = cl;
+                    append += (int64_t)cl; wf++; nframes++;
+                }
+                emit_comp_batch(comp_fd, wf, fud, fco, fcl);
+                free(fud); free(fco); free(fcl);
+                free_cmd_batch(&pc);
+                blen = 0; nm = 0;                    /* recycle the buffer */
+            }
+        }
+        mb_free(&mb); zsrc_close(&z);
+    }
+    emit_eos(1); emit_eos(comp_fd);
+    close(ofd);
+    free(buf); free(mem); free(comp); free(pmeta); free(pbody);
+    fprintf(stderr, "zstream: %ld frames, %ld bytes\n", (long)nframes, (long)append);
+    return 0;
+}
+
 
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -2293,6 +2460,14 @@ int main(int argc, char **argv) {
         return run_zexec(argv[2], (const char **)&argv[9], argc - 9, argv[3],
                          atoi(argv[4]), atoi(argv[5]), atoi(argv[6]),
                          atoi(argv[7]), argv[8]);
+    }
+
+    if (!strcmp(argv[1], "zstream")) {
+        /* zstream <comp_fd> <out> <level> <batch> <src...> — one-pass planned
+         * recompress: ZMETA on stdout, PLAN on stdin, COMP on comp_fd */
+        if (argc < 7) { fprintf(stderr, "zstream: too few args\n"); return 2; }
+        return run_zstream(atoi(argv[2]), (const char **)&argv[6], argc - 6,
+                           argv[3], atoi(argv[4]), atoll(argv[5]));
     }
 
     struct io_uring ring;

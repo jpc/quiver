@@ -757,6 +757,39 @@ def test_zframe_unpack(tmp):
     ok("zframe unpack: parallel decode == oracle, linear + sharded + predicate")
 
 
+def test_zframe_zstream(tmp):
+    """One-pass planned recompress via the zstream port: C yields ZMETA, the
+    planner sends PLAN, C compresses live-buffer slices and returns COMP — the
+    60-byte record retired. Must produce a clean tar.zstd that round-trips."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile, subprocess as sp
+    from quiver.nock import zframe
+    want = {}
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        for i in range(250):
+            b = (f"s{i}=".encode()) * (3 + i)
+            ti = tarfile.TarInfo(f"c/f{i:04d}"); ti.size = len(b); ti.mode = 0o644
+            ti.mtime = 1_700_000_000 + i
+            tf.addfile(ti, io.BytesIO(b)); want[f"c/f{i:04d}"] = b
+    src = str(tmp/"zss.tar.zstd")
+    with open(src, "wb") as fo:
+        fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+    out = str(tmp/"zsout.tar.zstd")
+    res = zframe.recompress_stream([src], out, level=4, batch_bytes=16 << 10)
+    assert res.members == 250 and res.frames > 1, (res.members, res.frames)
+    n = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
+               capture_output=True, text=True).stdout.strip()
+    assert n == "250", n                               # clean multi-frame tar.zstd
+    zframe.unpack(out, str(tmp/"zsx"))
+    for rel, data in want.items():
+        assert (tmp/"zsx"/rel).read_bytes() == data
+    ok("zframe zstream: one-pass ZMETA→PLAN→COMP recompress, round-trips")
+
+
 def test_zframe_unpack_dist(tmp):
     """Distributed unpack: partition frames across N (local) executors, decode
     in parallel, no reduce — must equal a single-node unpack byte-for-byte, for
@@ -982,7 +1015,7 @@ def main():
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
               test_zframe_plan, test_zframe_reshard, test_zframe_s3,
               test_zframe_merge, test_zframe_unpack, test_zframe_unpack_dist,
-              test_zframe_packfs, test_zframe_wal,
+              test_zframe_zstream, test_zframe_packfs, test_zframe_wal,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)

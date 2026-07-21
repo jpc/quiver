@@ -1240,6 +1240,65 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
     return _unpack_exec(idx, dest, path, None, engine, batch_rows)
 
 
+def recompress_stream(inputs, out_path, level=10, batch_bytes=16 << 20):
+    """One-pass planned recompress via the `zstream` port (docs/ISA.md §5) — the
+    last de-fork. C decompresses each source ONCE into a live buffer and yields
+    member metadata (ZMETA); this driver plans frames and sends the plan back
+    (PLAN); C compresses the planned slices from the *same* buffer and returns
+    (frame→coff,clen) as COMP. The footer is built from ZMETA + plan + COMP —
+    the 60-byte record retired, both directions on standard schemas.
+
+    First cut: one frame per window, synchronous, in_off computed from member
+    sizes (valid when the tar has no PAX/GNU extension blocks — long-name
+    sources need a buf_off column in ZMETA, the next increment). The union /
+    async pipeline and filter/reshard gather are follow-ups."""
+    import subprocess
+    from ..wire import EXE, CMD_SCHEMA, cmd_df, _df_cols, OP_COMPRESS, _to_pl
+    r_comp, w_comp = os.pipe()
+    argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(batch_bytes),
+            *[str(i) for i in inputs]]
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            pass_fds=(w_comp,))
+    os.close(w_comp)
+    zmeta = StreamReader(proc.stdout)
+    comp_f = os.fdopen(r_comp, "rb")
+    comp = StreamReader(comp_f)
+    plan_w = StreamWriter(proc.stdin, CMD_SCHEMA)
+    proc.stdin.flush()
+
+    ftmp = tempfile.TemporaryFile()
+    fw = _FooterStream(ftmp)
+    frame_id = 0
+    for zb in zmeta:                                # one batch per window
+        m = pl.DataFrame(zb)
+        n = m.height
+        if not n:
+            continue
+        foot = 512 + ((m["size"] + 511) // 512) * 512      # tar footprint/member
+        in_off = (foot.cum_sum() - foot) + 512             # body offset in frame
+        cmds = cmd_df(n, opcode=[OP_COMPRESS] * n,         # all → this frame
+                      dep_group=pl.Series([frame_id] * n, dtype=pl.Int64))
+        plan_w.write_batch(_df_cols(cmds)); proc.stdin.flush()
+        c = _to_pl(comp.read_batch())                      # COMP: frame coff/clen
+        coff, clen = int(c["read_size"][0]), int(c["cksum"][0])
+        io = in_off.to_list()
+        for i, r in enumerate(m.iter_rows(named=True)):
+            fw.add(r["path"], r["size"], r["mode"], r["mtime_ns"], r["uid"],
+                   r["gid"], frame_id, coff, clen, io[i])
+        frame_id += 1
+    # C reads exactly one PLAN per window and exits after the last COMP, so no
+    # PLAN terminator is sent; just close (the pipe may already be gone).
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    comp_f.close()
+    fw.close()
+    _write_footer(out_path, ftmp, False); ftmp.close()
+    assert proc.wait() == 0
+    return Result(members=fw.members, frames=frame_id)
+
+
 def unpack_distributed(path, dest, transports, predicate=None, engine="auto",
                        batch_rows=4096):
     """Distributed unpack (docs/ISA.md §10.5, UNPACK.md): partition the frame
