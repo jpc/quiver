@@ -57,16 +57,12 @@
 
 /* S4: one copy opcode. Target = archive fd when dst_path is empty,
  * else open(dst, O_CREAT|O_TRUNC, mode). header bytes (if any) land at
- * header_offset, payload (padded to pad_align) at data_offset. */
-enum { OP_UNLINK = 2, OP_RMDIR = 3, OP_MKDIR = 4,
-       OP_COPY = 5, OP_CKSUM = 6, OP_FBARRIER = 7, OP_SETMETA = 8,
-       OP_EXTRACT = 9,      /* archive[data_offset,size] -> path */
-       OP_COMPRESS = 10 };  /* zstd(header payload, level=pad_align) -> append
-                             * to the archive; completion reports the frame's
-                             * (coff in read_size, clen in cksum). This is the
-                             * un-plannable half of the zframe layout: the plan
-                             * assigns members->frames, the executor assigns the
-                             * compressed offsets and returns them. */
+ * header_offset, payload (padded to pad_align) at data_offset.
+ * OP_* are #defined in ipc_gen.h, generated from quiver/opcodes.py — the
+ * single source shared with the Python control plane. OP_EXTRACT reads
+ * archive[data_offset,size] -> path; OP_COMPRESS zstd's a header payload
+ * (level=pad_align), appends it, and reports the frame's (coff in read_size,
+ * clen in cksum) — the un-plannable half of the zframe layout. */
 /* mode/uid/gid/mtime_ns use -1 as "unspecified": COPY/MKDIR fall back
  * to 0644/0755, SETMETA leaves the attribute untouched. */
 #define DEFAULT_FILE_MODE 0644
@@ -1665,19 +1661,62 @@ static void zsrc_skip(Zsrc *z, int64_t n) {
     }
 }
 
-static void z_emit_meta(int32_t src, int32_t ord, const char *name,
-                        int64_t size, int32_t mode, int64_t mtime,
-                        int32_t uid, int32_t gid) {
-    uint16_t plen = (uint16_t)strlen(name);
-    /* [u16 plen][path][i64 size][i64 mtime][i32 mode][i32 uid][i32 gid]
-     * [i32 src][i32 ord] — 36B fixed tail. */
+/* zscan emits member metadata as ZMETA Arrow-IPC batches — the same
+ * StreamReader the planner uses for scan, not a bespoke record. */
+typedef struct {
+    int64_t n, cap;
+    char *pdata; int64_t pdata_len, pdata_cap; int64_t *poff;
+    int32_t *source_id, *ordinal, *mode, *uid, *gid;
+    int64_t *size, *mtime;
+} MetaBuilder;
+
+static void mb_init(MetaBuilder *b) {
+    memset(b, 0, sizeof *b);
+    b->cap = SCAN_BATCH;
+    b->pdata_cap = 1 << 20; b->pdata = malloc((size_t)b->pdata_cap);
+    b->poff = malloc(8 * (size_t)(b->cap + 1)); b->poff[0] = 0;
+    b->source_id = malloc(4 * (size_t)b->cap);
+    b->ordinal = malloc(4 * (size_t)b->cap);
+    b->mode = malloc(4 * (size_t)b->cap);
+    b->uid = malloc(4 * (size_t)b->cap);
+    b->gid = malloc(4 * (size_t)b->cap);
+    b->size = malloc(8 * (size_t)b->cap);
+    b->mtime = malloc(8 * (size_t)b->cap);
+}
+static void mb_free(MetaBuilder *b) {
+    free(b->pdata); free(b->poff); free(b->source_id); free(b->ordinal);
+    free(b->mode); free(b->uid); free(b->gid); free(b->size); free(b->mtime);
+}
+static int mb_flush(MetaBuilder *b) {          /* col order matches ZMETA */
+    if (b->n == 0) return 0;
+    struct WBuf bufs[ZMETA_N_BUFS] = {
+        {NULL,0},{b->poff, 8*(b->n+1)},{b->pdata, b->pdata_len},
+        {NULL,0},{b->source_id, 4*b->n}, {NULL,0},{b->ordinal, 4*b->n},
+        {NULL,0},{b->size, 8*b->n}, {NULL,0},{b->mode, 4*b->n},
+        {NULL,0},{b->mtime, 8*b->n}, {NULL,0},{b->uid, 4*b->n},
+        {NULL,0},{b->gid, 4*b->n},
+    };
     pthread_mutex_lock(&Z.omu);
-    fwrite(&plen, 2, 1, stdout); fwrite(name, plen, 1, stdout);
-    fwrite(&size, 8, 1, stdout); fwrite(&mtime, 8, 1, stdout);
-    fwrite(&mode, 4, 1, stdout); fwrite(&uid, 4, 1, stdout);
-    fwrite(&gid, 4, 1, stdout); fwrite(&src, 4, 1, stdout);
-    fwrite(&ord, 4, 1, stdout);
+    int rc = emit_batch(1, ZMETA_BATCH_TMPL, ZMETA_TMPL_LEN,
+                        ZMETA_OFF_BODYLEN, ZMETA_OFF_RBLEN,
+                        ZMETA_NODE_OFF, ZMETA_N_NODES,
+                        ZMETA_BUF_OFF, ZMETA_N_BUFS, b->n, bufs);
     pthread_mutex_unlock(&Z.omu);
+    b->n = 0; b->pdata_len = 0; b->poff[0] = 0;
+    return rc;
+}
+static void mb_row(MetaBuilder *b, const char *name, int32_t src, int32_t ord,
+                   int64_t size, int32_t mode, int64_t mtime,
+                   int32_t uid, int32_t gid) {
+    int64_t nl = (int64_t)strlen(name);
+    while (b->pdata_len + nl > b->pdata_cap)
+        b->pdata = realloc(b->pdata, (size_t)(b->pdata_cap *= 2));
+    memcpy(b->pdata + b->pdata_len, name, (size_t)nl); b->pdata_len += nl;
+    int64_t i = b->n++;
+    b->poff[i + 1] = b->pdata_len;
+    b->source_id[i] = src; b->ordinal[i] = ord; b->size[i] = size;
+    b->mode[i] = mode; b->mtime[i] = mtime; b->uid[i] = uid; b->gid[i] = gid;
+    if (b->n >= b->cap) mb_flush(b);
 }
 
 static void *z_scan_reader(void *arg) {
@@ -1687,6 +1726,7 @@ static void *z_scan_reader(void *arg) {
         if (si >= Z.nsrc) break;
         Zsrc z;
         if (zsrc_open(&z, Z.srcs[si])) continue;
+        MetaBuilder mb; mb_init(&mb);
         uint8_t hdr[512];
         size_t scap = 1 << 16; uint8_t *scr = malloc(scap);
         char pax_path[4096], gnu[4096];
@@ -1727,13 +1767,14 @@ static void *z_scan_reader(void *arg) {
             int64_t rsize = pax_size >= 0 ? pax_size : size;
             zsrc_skip(&z, (rsize + 511) / 512 * 512);
             if (typ == '0' || typ == 0) {
-                z_emit_meta(si, ordinal, name, rsize, zoctal(hdr + 100, 8),
-                            zoctal(hdr + 136, 12) * 1000000000LL,
-                            zoctal(hdr + 108, 8), zoctal(hdr + 116, 8));
+                mb_row(&mb, name, si, ordinal, rsize, zoctal(hdr + 100, 8),
+                       zoctal(hdr + 136, 12) * 1000000000LL,
+                       zoctal(hdr + 108, 8), zoctal(hdr + 116, 8));
                 ordinal++;
             }
             has_pax = 0; has_gnu = 0; pax_size = -1;
         }
+        mb_flush(&mb); mb_free(&mb);
         free(scr); zsrc_close(&z);
     }
     return NULL;
@@ -1745,10 +1786,12 @@ static int run_zscan(const char **srcs, int nsrc, int readers) {
     pthread_mutex_init(&Z.omu, NULL);
     if (readers > 64) readers = 64;
     if (readers < 1) readers = 1;
+    emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* Arrow IPC framing */
     pthread_t rt[64];
     for (int i = 0; i < readers; i++)
         pthread_create(&rt[i], NULL, z_scan_reader, NULL);
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
+    emit_eos(1);
     fflush(stdout);
     return 0;
 }

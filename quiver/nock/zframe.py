@@ -489,49 +489,25 @@ def _footer_payloads(ftmp):
     return None, body + trailer
 
 
+_ZMETA_SCHEMA = {"path": pl.String, "source_id": pl.Int32, "ordinal": pl.Int32,
+                 "size": pl.Int64, "mode": pl.Int32, "mtime_ns": pl.Int64,
+                 "uid": pl.Int32, "gid": pl.Int32}
+
+
 def _zscan(inputs, readers):
     """scan: quiver-exec decompresses + parses each source in C (off the GIL)
-    and streams member metadata (path, stat, source_id, ordinal). No bytes
-    are compressed — this is the cheap pass that feeds the Polars planner."""
+    and streams member metadata as ZMETA Arrow-IPC batches — read here through
+    the same StreamReader the planner uses for scan. No bytes are compressed;
+    this is the cheap pass that feeds the Polars planner."""
     import subprocess
-    import numpy as np
-    from ..wire import EXE
+    from ..wire import EXE, _to_pl
+    from ..pupyarrow.writer import StreamReader
     proc = subprocess.Popen([EXE, "zscan", str(readers), *inputs],
                             stdout=subprocess.PIPE, bufsize=1 << 22)
-    tail = struct.Struct("<qqiiiii")            # size,mtime,mode,uid,gid,src,ord
-    f = proc.stdout
-    paths, sizes, mtimes = [], [], []
-    modes, uids, gids, srcs, ords = [], [], [], [], []
-    buf = b""
-    while True:
-        chunk = f.read(1 << 22)
-        if not chunk:
-            break
-        buf += chunk
-        i, n = 0, len(buf)
-        while True:
-            if i + 2 > n:
-                break
-            plen = buf[i] | (buf[i + 1] << 8)
-            if i + 2 + plen + 36 > n:
-                break
-            paths.append(buf[i + 2:i + 2 + plen].decode("utf-8", "surrogateescape"))
-            (sz, mt, mo, ui, gi, sr, od) = tail.unpack_from(buf, i + 2 + plen)
-            sizes.append(sz); mtimes.append(mt); modes.append(mo)
-            uids.append(ui); gids.append(gi); srcs.append(sr); ords.append(od)
-            i += 2 + plen + 36
-        buf = buf[i:]
+    dfs = [_to_pl(b) for b in StreamReader(proc.stdout)]
     if proc.wait() != 0:
         raise RuntimeError(f"zscan exited {proc.returncode}")
-    return pl.DataFrame({
-        "source_id": np.array(srcs, dtype=np.int32),
-        "ordinal": np.array(ords, dtype=np.int32),
-        "path": paths,
-        "size": np.array(sizes, dtype=np.int64),
-        "mode": np.array(modes, dtype=np.int32),
-        "mtime_ns": np.array(mtimes, dtype=np.int64),
-        "uid": np.array(uids, dtype=np.int32),
-        "gid": np.array(gids, dtype=np.int32)})
+    return pl.concat(dfs) if dfs else pl.DataFrame(schema=_ZMETA_SCHEMA)
 
 
 def _glob_to_re(g):

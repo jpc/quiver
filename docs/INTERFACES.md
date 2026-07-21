@@ -75,14 +75,16 @@ Plus two smaller drifts:
 
 The fold's three bespoke metadata formats can each become the universal one,
 deleting ~200 lines of hand-rolled parsing and making recompress "just another
-Polars-planned, Arrow-wired tool":
+Polars-planned, Arrow-wired tool". Staged so the proven `zpack` byte path is
+touched last:
 
-1. **`zscan` → the STAT stream.** Emit Arrow-IPC scan batches with two extra
-   columns (`source_id`, `ordinal`) instead of the 36B record. `_zscan`
-   collapses into `scan_iter`; the planner is then pure Polars over a
-   DataFrame, exactly like `du`/`rm`.
+1. **`zscan` → the STAT stream.** ✅ *Done.* `zscan` emits a `ZMETA` Arrow-IPC
+   batch (`path`, `source_id`, `ordinal`, stat) via the same template
+   machinery as scan; `_zscan` reads it through `StreamReader` into a Polars
+   DataFrame — no bespoke 36B record, no manual column building. This path
+   never touched `zpack`'s output, so it was the safe first stage.
 
-2. **plan file → the command stream.** The plan is a command DataFrame:
+2. **plan file → the command stream.** *Next.* The plan is a command DataFrame:
    `opcode = OP_COMPRESS`, one row per kept member carrying `source_id`,
    `ordinal`, `frame`, `sink`, and the per-sink `start` — reusing `cmd_df`
    with a few added columns (or overloading `dep_group`/`parent_row`).
@@ -99,9 +101,11 @@ Polars-planned, Arrow-wired tool":
    whose completion never landed — the same mechanism as `rm`/`cp`, no
    separate append format.
 
-5. **One opcode source of truth.** Generate the C `enum` from `wire.py`'s
-   opcode list (the template step in `quiver/compiler/gen_templates.py`
-   already generates C headers), so `OP_COMPRESS` can't drift again.
+5. **One opcode source of truth.** ✅ *Done.* Opcodes live in
+   `quiver/opcodes.py`; `wire.py` derives its `OP_*` from it and
+   `gen_templates.py` emits `#define OP_* n` into `ipc_gen.h`, so the C data
+   plane and Python control plane can no longer drift (`OP_COMPRESS` was
+   C-only before this).
 
 ### Why this is a win, not just tidier
 

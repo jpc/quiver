@@ -16,8 +16,11 @@ import polars as pl
 
 from .pupyarrow.writer import StreamReader, StreamWriter
 
-OP_UNLINK, OP_RMDIR, OP_MKDIR, OP_COPY, OP_CKSUM = 2, 3, 4, 5, 6
-OP_FBARRIER, OP_SETMETA, OP_EXTRACT = 7, 8, 9
+from .opcodes import OPCODES               # single source, shared with the C enum
+OP_UNLINK, OP_RMDIR, OP_MKDIR = OPCODES["UNLINK"], OPCODES["RMDIR"], OPCODES["MKDIR"]
+OP_COPY, OP_CKSUM = OPCODES["COPY"], OPCODES["CKSUM"]
+OP_FBARRIER, OP_SETMETA = OPCODES["FBARRIER"], OPCODES["SETMETA"]
+OP_EXTRACT, OP_COMPRESS = OPCODES["EXTRACT"], OPCODES["COMPRESS"]
 
 CMD_SCHEMA = [
     ("user_data", "u64"), ("opcode", "u8"), ("dep_group", "i64"),
