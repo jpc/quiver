@@ -78,132 +78,6 @@
 static pthread_mutex_t g_append_mu = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_append_off = 0;
 
-/* ── shared frame cache: OP_EXTRACT+ZSTD_D decodes each frame once ─────────
- * unpack fans a frame's members across the pool's shared LIFO queue, so a
- * per-thread cache would re-decode the same 16 MB frame many times. This is a
- * shared, single-flight, byte-bounded LRU keyed by frame_coff: the first
- * worker to touch a frame decodes and inserts, the rest wait on the condvar
- * and reuse. The planner sorts by frame_coff, so only a poolful of frames are
- * live at once. A raw (uncompressed) EXTRACT keeps its own pread path and
- * never enters here — the discriminator is pad_align (frame_clen) > 1. */
-#define FC_SLOTS 256
-typedef struct {
-    int64_t key;            /* frame_coff; -1 = empty slot */
-    uint8_t *buf; int64_t len;
-    int ready, err, refs;
-    int64_t used;           /* LRU tick */
-} FCEnt;
-static struct {
-    pthread_mutex_t mu; pthread_cond_t cv;
-    FCEnt e[FC_SLOTS];
-    int64_t tick, bytes, cap;
-} g_fc;
-static pthread_once_t g_fc_once = PTHREAD_ONCE_INIT;
-static void fc_once_init(void) {
-    pthread_mutex_init(&g_fc.mu, NULL);
-    pthread_cond_init(&g_fc.cv, NULL);
-    for (int i = 0; i < FC_SLOTS; i++) g_fc.e[i].key = -1;
-    g_fc.cap = 2LL << 30;   /* ~2 GiB of decompressed frames resident */
-}
-
-/* On success returns 0, sets *slot (ref'd; release with fc_release) and
- * *buf and *len. On failure returns -errno and holds nothing. */
-static int fc_get(int64_t key, int64_t coff, int64_t clen, int afd,
-                  int *slot, uint8_t **buf, int64_t *len) {
-    pthread_once(&g_fc_once, fc_once_init);
-    pthread_mutex_lock(&g_fc.mu);
-    for (;;) {
-        int hit = -1;
-        for (int i = 0; i < FC_SLOTS; i++)
-            if (g_fc.e[i].key == key) { hit = i; break; }
-        if (hit >= 0) {
-            FCEnt *e = &g_fc.e[hit];
-            if (!e->ready) { pthread_cond_wait(&g_fc.cv, &g_fc.mu); continue; }
-            if (e->err) { pthread_mutex_unlock(&g_fc.mu); return e->err; }
-            e->refs++; e->used = ++g_fc.tick;
-            *slot = hit; *buf = e->buf; *len = e->len;
-            pthread_mutex_unlock(&g_fc.mu);
-            return 0;
-        }
-        int victim = -1; int64_t oldest = INT64_MAX;
-        for (int i = 0; i < FC_SLOTS; i++)
-            if (g_fc.e[i].key == -1) { victim = i; break; }
-        if (victim < 0)
-            for (int i = 0; i < FC_SLOTS; i++) {
-                FCEnt *e = &g_fc.e[i];
-                if (e->ready && e->refs == 0 && e->used < oldest)
-                    { oldest = e->used; victim = i; }
-            }
-        if (victim < 0) { pthread_cond_wait(&g_fc.cv, &g_fc.mu); continue; }
-        FCEnt *e = &g_fc.e[victim];
-        if (e->buf) { g_fc.bytes -= e->len; free(e->buf); e->buf = NULL; }
-        e->key = key; e->ready = 0; e->err = 0; e->refs = 1;
-        e->len = 0; e->used = ++g_fc.tick;
-        pthread_mutex_unlock(&g_fc.mu);
-
-        /* decode outside the lock */
-        int err = 0; uint8_t *ub = NULL; int64_t ulen = 0;
-        uint8_t *cb = malloc((size_t)clen);
-        if (!cb) err = -ENOMEM;
-        else {
-            int64_t got = 0;
-            while (got < clen) {
-                ssize_t r = pread(afd, cb + got, (size_t)(clen - got),
-                                  coff + got);
-                if (r <= 0) { err = r < 0 ? -errno : -EIO; break; }
-                got += r;
-            }
-            if (!err) {
-                unsigned long long ds =
-                    ZSTD_getFrameContentSize(cb, (size_t)clen);
-                if (ds == ZSTD_CONTENTSIZE_ERROR ||
-                    ds == ZSTD_CONTENTSIZE_UNKNOWN) err = -EIO;
-                else if (!(ub = malloc((size_t)ds ? (size_t)ds : 1)))
-                    err = -ENOMEM;
-                else {
-                    size_t z = ZSTD_decompress(ub, (size_t)ds, cb,
-                                               (size_t)clen);
-                    if (ZSTD_isError(z) || z != ds)
-                        { err = -EIO; free(ub); ub = NULL; }
-                    else ulen = (int64_t)z;
-                }
-            }
-        }
-        free(cb);
-
-        pthread_mutex_lock(&g_fc.mu);
-        if (err) {
-            e->err = err; e->ready = 1; e->refs = 0;
-            pthread_cond_broadcast(&g_fc.cv);
-            pthread_mutex_unlock(&g_fc.mu);
-            return err;
-        }
-        e->buf = ub; e->len = ulen; e->ready = 1;
-        g_fc.bytes += ulen;
-        *slot = victim; *buf = ub; *len = ulen;
-        while (g_fc.bytes > g_fc.cap) {   /* trim unreferenced ready frames */
-            int vi = -1; int64_t o = INT64_MAX;
-            for (int i = 0; i < FC_SLOTS; i++) {
-                FCEnt *x = &g_fc.e[i];
-                if (x->key != -1 && x->ready && x->refs == 0 && x->used < o)
-                    { o = x->used; vi = i; }
-            }
-            if (vi < 0) break;
-            g_fc.bytes -= g_fc.e[vi].len; free(g_fc.e[vi].buf);
-            g_fc.e[vi].buf = NULL; g_fc.e[vi].key = -1; g_fc.e[vi].len = 0;
-        }
-        pthread_cond_broadcast(&g_fc.cv);
-        pthread_mutex_unlock(&g_fc.mu);
-        return 0;
-    }
-}
-
-static void fc_release(int slot) {
-    pthread_mutex_lock(&g_fc.mu);
-    if (--g_fc.e[slot].refs == 0) pthread_cond_broadcast(&g_fc.cv);
-    pthread_mutex_unlock(&g_fc.mu);
-}
-
 /* ── CRC-64/NVME: reflected, poly 0xad93d23594c93659, composable ────────
  * Table-driven reference (~1 GB/s); the production path is PCLMULQDQ
  * (ISA-L / aws-checksums, tens of GB/s) behind the same interface. */
@@ -682,34 +556,10 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
         return;
     }
     case OP_EXTRACT: {
-        /* inverse COPY. Two addressing modes on one opcode:
-         *   pad_align > 1 → ZSTD_D: the member lives inside compressed frame
-         *     archive[data_offset, frame_clen=pad_align]; decode it once via
-         *     the shared frame cache, slice [header_offset, +size], write path.
-         *   else (raw)     → IDENTITY: archive[data_offset, size] -> path. */
-        if (align > 1) {
-            int slot = 0; uint8_t *fbuf = NULL; int64_t flen = 0;
-            int rc = fc_get(c->data_offset[i], c->data_offset[i], align, afd,
-                            &slot, &fbuf, &flen);
-            if (rc < 0) { out->res = rc; return; }
-            int64_t in_off = c->header_offset[i];
-            if (in_off < 0 || in_off + size > flen)
-                { fc_release(slot); out->res = -EIO; return; }
-            int dfd = open(c->path[i], O_WRONLY | O_CREAT | O_TRUNC,
-                           c->mode[i] >= 0 ? (mode_t)c->mode[i]
-                                           : DEFAULT_FILE_MODE);
-            if (dfd < 0) { fc_release(slot); out->res = -errno; return; }
-            int64_t left = size, w = 0;
-            while (left > 0) {
-                ssize_t r = write(dfd, fbuf + in_off + w, (size_t)left);
-                if (r < 0) { out->res = -errno; break; }
-                left -= r; w += r;
-            }
-            out->read_size = w;
-            close(dfd);
-            fc_release(slot);
-            return;
-        }
+        /* raw (zero-copy) EXTRACT: archive[data_offset, size] -> create path.
+         * The compressed case (a member inside a zstd frame) is NOT here — it
+         * is a COPY(BUF→FILE) inside a decode group, scattered from the buffer
+         * an INFLATE filled (docs/ISA.md §2-§4, run_decode_epoch). */
         int dfd = open(c->path[i], O_WRONLY | O_CREAT | O_TRUNC,
                        c->mode[i] >= 0 ? (mode_t)c->mode[i]
                                        : DEFAULT_FILE_MODE);
@@ -859,6 +709,88 @@ static int pool_outstanding(OpenPool *p) {
     return n;
 }
 
+/* ── buffered decode groups (docs/ISA.md §3-§4) ────────────────────────────
+ * A decode group is one INFLATE row (archive[data_offset,size] → a worker-owned
+ * buffer) immediately followed by K = header_offset member EXTRACT rows, each
+ * scattering a buffer slice [header_offset, +size] to its file. One worker owns
+ * one grow-on-demand buffer for a whole group and decodes the frame exactly
+ * once — no cache, no refcount, no single-flight; decode-once is structural.
+ * Buffers resident = min(#groups, DECODE_POOL). */
+#define DECODE_POOL OPEN_POOL
+
+typedef struct {
+    const CmdBatch *c; RowResult *out; int afd;
+    const int64_t *groups; int ng; _Atomic int next;
+} DecodePool;
+
+static void decode_group(const CmdBatch *c, int64_t g, int afd, RowResult *out,
+                         uint8_t **cb, size_t *ccap, uint8_t **ub, size_t *ucap) {
+    int64_t coff = c->data_offset[g], clen = c->size[g], k = c->header_offset[g];
+    out[g].res = 0; out[g].read_size = 0;
+    if ((size_t)clen > *ccap) { *cb = realloc(*cb, (size_t)clen); *ccap = (size_t)clen; }
+    int64_t got = 0;
+    while (got < clen) {
+        ssize_t r = pread(afd, *cb + got, (size_t)(clen - got), coff + got);
+        if (r <= 0) { out[g].res = r < 0 ? -errno : -EIO; return; }
+        got += r;
+    }
+    unsigned long long ds = ZSTD_getFrameContentSize(*cb, (size_t)clen);
+    if (ds == ZSTD_CONTENTSIZE_ERROR || ds == ZSTD_CONTENTSIZE_UNKNOWN) {
+        out[g].res = -EIO; return;
+    }
+    if (ds > *ucap) { *ub = realloc(*ub, (size_t)ds ? (size_t)ds : 1); *ucap = (size_t)ds; }
+    size_t z = ZSTD_decompress(*ub, (size_t)ds, *cb, (size_t)clen);
+    if (ZSTD_isError(z) || z != ds) { out[g].res = -EIO; return; }
+    out[g].read_size = (int64_t)z;
+    for (int64_t m = g + 1; m <= g + k; m++) {          /* scatter members */
+        int64_t io = c->header_offset[m], sz = c->size[m];
+        out[m].res = 0; out[m].read_size = sz;
+        if (io < 0 || io + sz > (int64_t)z) { out[m].res = -EIO; continue; }
+        int dfd = open(c->path[m], O_WRONLY | O_CREAT | O_TRUNC,
+                       c->mode[m] >= 0 ? (mode_t)c->mode[m] : DEFAULT_FILE_MODE);
+        if (dfd < 0) { out[m].res = -errno; continue; }
+        int64_t left = sz, w = 0;
+        while (left > 0) {
+            ssize_t r = write(dfd, *ub + io + w, (size_t)left);
+            if (r < 0) { out[m].res = -errno; break; }
+            left -= r; w += r;
+        }
+        out[m].read_size = w;
+        close(dfd);
+    }
+}
+
+static void *decode_worker(void *arg) {
+    DecodePool *p = arg;
+    uint8_t *cb = NULL, *ub = NULL; size_t ccap = 0, ucap = 0;
+    for (;;) {
+        int i = atomic_fetch_add(&p->next, 1);
+        if (i >= p->ng) break;
+        decode_group(p->c, p->groups[i], p->afd, p->out, &cb, &ccap, &ub, &ucap);
+    }
+    free(cb); free(ub);
+    return NULL;
+}
+
+/* Run a whole decode epoch [e0,e1) — every INFLATE-headed group in parallel. */
+static void run_decode_epoch(const CmdBatch *c, int64_t e0, int64_t e1,
+                             int afd, RowResult *out) {
+    for (int64_t i = e0; i < e1; i++) { out[i].res = 0; out[i].read_size = c->size[i]; }
+    int64_t *groups = malloc(sizeof(int64_t) * (size_t)(e1 - e0));
+    int ng = 0;
+    for (int64_t i = e0; i < e1; i++)
+        if (c->opcode[i] == OP_INFLATE) groups[ng++] = i;
+    DecodePool p = { c, out, afd, groups, ng, 0 };
+    int nt = ng < DECODE_POOL ? ng : DECODE_POOL;
+    if (nt >= 1) {
+        pthread_t tid[DECODE_POOL];
+        for (int t = 0; t < nt; t++)
+            pthread_create(&tid[t], NULL, decode_worker, &p);
+        for (int t = 0; t < nt; t++) pthread_join(tid[t], NULL);
+    }
+    free(groups);
+}
+
 /* The scheduler is engine-agnostic: epochs, refcount deps, and the slot
  * bound are identical whether a row executes as a single ring SQE or on
  * the pool. ring == NULL (engine=sync, or platforms without io_uring)
@@ -888,6 +820,13 @@ static int run_batch_uring(struct io_uring *ring, const CmdBatch *c, int afd,
     while (e0 < n) {
         int64_t e1 = e0;
         while (e1 < n && c->dep_group[e1] == c->dep_group[e0]) e1++;
+        /* Buffered decode epoch: dispatch by group, not by row (§4). The
+         * planner keeps each INFLATE + its members contiguous and in one epoch,
+         * with parent_row=-1 (intra-group order is worker-sequential). */
+        if (c->opcode[e0] == OP_INFLATE) {
+            run_decode_epoch(c, e0, e1, afd, out);
+            e0 = e1; continue;
+        }
         int64_t done = 0, span = e1 - e0, n_ready = 0;
         int64_t chains_inflight = 0;               /* rows with SQEs pending */
         for (int64_t i = e1 - 1; i >= e0; i--)     /* pop ≈ batch order */

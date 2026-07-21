@@ -1136,14 +1136,18 @@ def _unpack(idx, dest, shard_of, workers):
 
 
 def _unpack_plan(idx, dest):
-    """Compile a linear-nock index into the MKDIR / EXTRACT+ZSTD_D / SETMETA
-    command stream the one executor runs (docs/UNPACK.md) — the compressed
-    mirror of footer.extract's raw plan. EXTRACT carries the frame in its
-    operand fields: data_offset=frame_coff, pad_align=frame_clen (>1 ⇒ the
-    executor decodes the frame via its shared cache), header_offset=in_off,
-    size=member size. Sorted by frame_coff so each frame decodes once."""
-    from ..wire import OP_EXTRACT, OP_MKDIR, OP_SETMETA, cmd_df
-    idx = idx.sort(["frame_coff", "in_off"])
+    """Compile a linear-nock index into the buffer-machine command stream
+    (docs/ISA.md §2-§4): MKDIR epoch, then a decode epoch of INFLATE-headed
+    groups, then a SETMETA epoch. Each group is one INFLATE row (decode the
+    frame archive[frame_coff, frame_clen] into a worker buffer; header_offset
+    carries K = member count) immediately followed by its K EXTRACT rows, each
+    scattering buffer slice [in_off, +size] to a file. Returns (cmds, group
+    start-indices for boundary-aware chunking, paths)."""
+    from ..wire import OP_INFLATE, OP_EXTRACT, OP_MKDIR, OP_SETMETA, cmd_df
+    idx = idx.sort(["frame_coff", "in_off"]).with_columns(
+        pl.col("frame_coff").rle_id().alias("_fi"))      # 0..F-1, sorted ⇒ runs
+    idx = idx.with_columns(_mp=pl.int_range(pl.len()).over("_fi"))  # pos in frame
+
     dirs = (idx.select(dir=pl.col("path").str.extract(r"^(.*)/", 1))
                .drop_nulls().unique())
     seen, alld = set(), []                    # mkdir -p every ancestor
@@ -1155,41 +1159,65 @@ def _unpack_plan(idx, dest):
                 seen.add(pd); alld.append(pd)
     alld.sort(key=lambda d: d.count("/"))
     maxd = max((d.count("/") for d in alld), default=-1)
+    dg = maxd + 1
     n = idx.height
-    cmds = pl.concat([
-        cmd_df(len(alld), opcode=[OP_MKDIR] * len(alld),
-               dep_group=pl.Series([d.count("/") for d in alld],
-                                   dtype=pl.Int64),
-               path=[os.path.join(dest, d) for d in alld]),
-        cmd_df(n, opcode=[OP_EXTRACT] * n,
-               dep_group=pl.Series([maxd + 1] * n, dtype=pl.Int64),
-               path=[os.path.join(dest, p) for p in idx["path"]],
-               data_offset=idx["frame_coff"], pad_align=idx["frame_clen"],
-               header_offset=idx["in_off"], size=idx["size"],
-               mode=(idx["mode"] & 0o7777).cast(pl.Int32)),
-        cmd_df(n, opcode=[OP_SETMETA] * n,
-               dep_group=pl.Series([maxd + 2] * n, dtype=pl.Int64),
-               path=[os.path.join(dest, p) for p in idx["path"]],
-               mtime_ns=idx["mtime_ns"]),
-    ]).with_columns(user_data=pl.int_range(len(alld) + 2 * n, dtype=pl.UInt64))
-    return cmds, idx["path"].to_list()
+
+    frames = (idx.group_by(["frame_coff", "frame_clen"], maintain_order=True)
+                 .agg(k=pl.len()))
+    nF = frames.height
+    inflate = cmd_df(nF, opcode=[OP_INFLATE] * nF,
+                     dep_group=pl.Series([dg] * nF, dtype=pl.Int64),
+                     data_offset=frames["frame_coff"], size=frames["frame_clen"],
+                     header_offset=frames["k"]).with_columns(
+        _fi=pl.int_range(nF, dtype=pl.Int64),
+        _sub=pl.lit(0, dtype=pl.Int64), _mp=pl.lit(0, dtype=pl.Int64))
+    members = cmd_df(n, opcode=[OP_EXTRACT] * n,
+                     dep_group=pl.Series([dg] * n, dtype=pl.Int64),
+                     path=[os.path.join(dest, p) for p in idx["path"]],
+                     header_offset=idx["in_off"], size=idx["size"],
+                     mode=(idx["mode"] & 0o7777).cast(pl.Int32)).with_columns(
+        _fi=idx["_fi"].cast(pl.Int64),
+        _sub=pl.lit(1, dtype=pl.Int64), _mp=idx["_mp"].cast(pl.Int64))
+    decode = (pl.concat([inflate, members])
+                .sort(["_fi", "_sub", "_mp"]).drop(["_fi", "_sub", "_mp"]))
+
+    mkdir = cmd_df(len(alld), opcode=[OP_MKDIR] * len(alld),
+                   dep_group=pl.Series([d.count("/") for d in alld],
+                                       dtype=pl.Int64),
+                   path=[os.path.join(dest, d) for d in alld])
+    setmeta = cmd_df(n, opcode=[OP_SETMETA] * n,
+                     dep_group=pl.Series([maxd + 2] * n, dtype=pl.Int64),
+                     path=[os.path.join(dest, p) for p in idx["path"]],
+                     mtime_ns=idx["mtime_ns"])
+    cmds = pl.concat([mkdir, decode, setmeta]).with_columns(
+        user_data=pl.int_range(len(alld) + nF + 2 * n, dtype=pl.UInt64))
+    # valid chunk starts: any row that isn't a decode-group member (EXTRACT).
+    boundaries = np.flatnonzero(cmds["opcode"].to_numpy() != OP_EXTRACT)
+    return cmds, boundaries, idx["path"].to_list()
 
 
-def unpack(path, dest, predicate=None, workers=None, engine="auto"):
+def unpack(path, dest, predicate=None, workers=None, engine="auto",
+           batch_rows=4096):
     """Parallel unpack of a linear nock archive → dest. engine=None keeps the
     portable Python thread-pool decoder (the oracle); otherwise members are
-    decoded through the one executor's OP_EXTRACT+ZSTD_D frame cache — the
-    de-forked path (docs/DEFORK.md step 1)."""
+    decoded through the executor's buffered decode groups (INFLATE + scatter,
+    docs/ISA.md) — one decode per frame, no cache. `batch_rows` bounds the
+    Arrow batch; group-boundary chunking keeps each frame's group whole."""
     idx = read_index(path)
     if predicate is not None:
         idx = idx.filter(predicate)
     os.makedirs(dest, exist_ok=True)
     if engine is None or not idx.height:
         return _unpack(idx, dest, lambda sid: path, workers)
-    from ..wire import run_commands
+    from ..wire import PipeExecutor
     from ..tools import _check
-    cmds, paths = _unpack_plan(idx, dest)
-    _check(run_commands(cmds, path, engine), cmds)
+    cmds, boundaries, paths = _unpack_plan(idx, dest)
+    ex = PipeExecutor(path, engine=engine)
+    try:
+        comp = ex.execute(cmds, batch_rows=batch_rows, boundaries=boundaries)
+    finally:
+        assert ex.close() == 0
+    _check(comp, cmds)
     return len(paths)
 
 

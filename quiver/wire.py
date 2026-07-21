@@ -21,6 +21,7 @@ OP_UNLINK, OP_RMDIR, OP_MKDIR = OPCODES["UNLINK"], OPCODES["RMDIR"], OPCODES["MK
 OP_COPY, OP_CKSUM = OPCODES["COPY"], OPCODES["CKSUM"]
 OP_FBARRIER, OP_SETMETA = OPCODES["FBARRIER"], OPCODES["SETMETA"]
 OP_EXTRACT, OP_COMPRESS = OPCODES["EXTRACT"], OPCODES["COMPRESS"]
+OP_INFLATE, OP_DEFLATE = OPCODES["INFLATE"], OPCODES["DEFLATE"]
 
 CMD_SCHEMA = [
     ("user_data", "u64"), ("opcode", "u8"), ("dep_group", "i64"),
@@ -113,18 +114,41 @@ class PipeExecutor:
         self.proc.stdin.flush()
         self.reader = StreamReader(self.proc.stdout)
 
+    def _chunk_bounds(self, n, batch_rows, boundaries):
+        """Yield (start, end) chunk ranges. Without `boundaries`, a plain
+        fixed stride. With them (sorted valid chunk-start indices, e.g. decode
+        group starts, as a numpy array), never end a chunk mid-group: snap each
+        end down to the largest boundary ≤ start+batch_rows, or up to the next
+        boundary when a single group exceeds batch_rows (oversized, unsplit)."""
+        if boundaries is None or not len(boundaries):
+            for s in range(0, n, batch_rows):
+                yield s, min(s + batch_rows, n)
+            return
+        import numpy as np
+        bnd = boundaries
+        if bnd[-1] != n:
+            bnd = np.append(bnd, n)
+        start = 0
+        while start < n:
+            j = int(np.searchsorted(bnd, start + batch_rows, "right")) - 1
+            end = int(bnd[j])
+            if end <= start:                      # group bigger than batch_rows
+                end = int(bnd[int(np.searchsorted(bnd, start, "right"))])
+            yield start, end
+            start = end
+
     def execute(self, cmds: pl.DataFrame,
-                batch_rows: int = 4096) -> pl.DataFrame:
+                batch_rows: int = 4096, boundaries=None) -> pl.DataFrame:
         """parent_row values are positions within `cmds`. Chunking is
         safe because every batch boundary is a barrier: a parent landing
         in a later chunk starts after all earlier chunks completed, so
         its in-chunk refcount correctly ignores already-finished
         children. We rebase to chunk-local indices here (-1 when the
-        parent lies outside the chunk)."""
+        parent lies outside the chunk). `boundaries` keeps buffered decode
+        groups (INFLATE + its member rows) within a single batch."""
         outs = []
-        for start in range(0, len(cmds), batch_rows):
-            chunk = cmds[start:start + batch_rows]
-            end = start + len(chunk)
+        for start, end in self._chunk_bounds(len(cmds), batch_rows, boundaries):
+            chunk = cmds[start:end]
             pr = pl.col("parent_row")
             chunk = chunk.with_columns(
                 pl.when((pr >= start) & (pr < end)).then(pr - start)

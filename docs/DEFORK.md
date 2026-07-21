@@ -7,6 +7,20 @@
 > *transitional* artifact: it's replaced by the buffered-group scheduler
 > (ISA.md §3–§4), which decodes each frame once by construction, no cache. The
 > rationale and the LIFO-queue finding below still stand; the mechanism changes.
+>
+> **Progress on the buffer-machine sequence (ISA.md §10):**
+> - ✅ **§10.1 buffered-group scheduler** — `run_decode_epoch`/`decode_worker`
+>   in quiver-exec.c: a decode epoch dispatches by *group* (one worker owns a
+>   grow-on-demand buffer for an `INFLATE` + its `EXTRACT` members), decoding
+>   each frame once. `OP_INFLATE` added to `opcodes.py`.
+> - ✅ **§10.2 unpack reworked onto it; frame cache deleted** — `_unpack_plan`
+>   emits `MKDIR` / `INFLATE`-headed decode groups / `SETMETA`; `PipeExecutor`
+>   gained boundary-aware chunking (`_chunk_bounds`) so a group is never split
+>   across an Arrow batch. `g_fc`/`fc_get`/`fc_release` removed; `OP_EXTRACT`
+>   reverted to raw-only. Test asserts executor == Python oracle byte+mode exact,
+>   incl. a `batch_rows=3` run that forces cross-group chunk boundaries.
+> - ⏳ §10.3 pack_fs (gather group + `DEFLATE`), §10.4 recompress (streaming),
+>   §10.5 sharded source + merge — next.
 
 **Why.** We designed one machine — `scan`/generators → Polars plan → the *one*
 executor over a command stream → link the footer (`docs/ISA.md`,

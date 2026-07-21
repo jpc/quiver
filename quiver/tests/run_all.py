@@ -700,6 +700,12 @@ def test_zframe_unpack(tmp):
     for rel in exe:
         assert exe[rel].read_bytes() == ora[rel].read_bytes()
         assert (exe[rel].stat().st_mode & 0o7777) == (ora[rel].stat().st_mode & 0o7777)
+    # group-integrity: a tiny batch forces chunk boundaries *between* decode
+    # groups (INFLATE + members) but never inside one — still byte-exact.
+    assert zframe.unpack(str(tmp/"lin.tar.zstd"), str(tmp/"utiny"),
+                         batch_rows=3) == 150
+    for rel in exe:
+        assert (tmp/"utiny"/rel).read_bytes() == ora[rel].read_bytes()
     # sharded nock: unpack resolves each member to its shard
     zframe.recompress_c([a], str(tmp/"s0.tar.zstd"), level=4, batch_bytes=16 << 10)
     zframe.recompress_c([b], str(tmp/"s1.tar.zstd"), level=4, batch_bytes=16 << 10)
