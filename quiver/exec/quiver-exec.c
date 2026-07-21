@@ -78,6 +78,132 @@
 static pthread_mutex_t g_append_mu = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_append_off = 0;
 
+/* ── shared frame cache: OP_EXTRACT+ZSTD_D decodes each frame once ─────────
+ * unpack fans a frame's members across the pool's shared LIFO queue, so a
+ * per-thread cache would re-decode the same 16 MB frame many times. This is a
+ * shared, single-flight, byte-bounded LRU keyed by frame_coff: the first
+ * worker to touch a frame decodes and inserts, the rest wait on the condvar
+ * and reuse. The planner sorts by frame_coff, so only a poolful of frames are
+ * live at once. A raw (uncompressed) EXTRACT keeps its own pread path and
+ * never enters here — the discriminator is pad_align (frame_clen) > 1. */
+#define FC_SLOTS 256
+typedef struct {
+    int64_t key;            /* frame_coff; -1 = empty slot */
+    uint8_t *buf; int64_t len;
+    int ready, err, refs;
+    int64_t used;           /* LRU tick */
+} FCEnt;
+static struct {
+    pthread_mutex_t mu; pthread_cond_t cv;
+    FCEnt e[FC_SLOTS];
+    int64_t tick, bytes, cap;
+} g_fc;
+static pthread_once_t g_fc_once = PTHREAD_ONCE_INIT;
+static void fc_once_init(void) {
+    pthread_mutex_init(&g_fc.mu, NULL);
+    pthread_cond_init(&g_fc.cv, NULL);
+    for (int i = 0; i < FC_SLOTS; i++) g_fc.e[i].key = -1;
+    g_fc.cap = 2LL << 30;   /* ~2 GiB of decompressed frames resident */
+}
+
+/* On success returns 0, sets *slot (ref'd; release with fc_release) and
+ * *buf and *len. On failure returns -errno and holds nothing. */
+static int fc_get(int64_t key, int64_t coff, int64_t clen, int afd,
+                  int *slot, uint8_t **buf, int64_t *len) {
+    pthread_once(&g_fc_once, fc_once_init);
+    pthread_mutex_lock(&g_fc.mu);
+    for (;;) {
+        int hit = -1;
+        for (int i = 0; i < FC_SLOTS; i++)
+            if (g_fc.e[i].key == key) { hit = i; break; }
+        if (hit >= 0) {
+            FCEnt *e = &g_fc.e[hit];
+            if (!e->ready) { pthread_cond_wait(&g_fc.cv, &g_fc.mu); continue; }
+            if (e->err) { pthread_mutex_unlock(&g_fc.mu); return e->err; }
+            e->refs++; e->used = ++g_fc.tick;
+            *slot = hit; *buf = e->buf; *len = e->len;
+            pthread_mutex_unlock(&g_fc.mu);
+            return 0;
+        }
+        int victim = -1; int64_t oldest = INT64_MAX;
+        for (int i = 0; i < FC_SLOTS; i++)
+            if (g_fc.e[i].key == -1) { victim = i; break; }
+        if (victim < 0)
+            for (int i = 0; i < FC_SLOTS; i++) {
+                FCEnt *e = &g_fc.e[i];
+                if (e->ready && e->refs == 0 && e->used < oldest)
+                    { oldest = e->used; victim = i; }
+            }
+        if (victim < 0) { pthread_cond_wait(&g_fc.cv, &g_fc.mu); continue; }
+        FCEnt *e = &g_fc.e[victim];
+        if (e->buf) { g_fc.bytes -= e->len; free(e->buf); e->buf = NULL; }
+        e->key = key; e->ready = 0; e->err = 0; e->refs = 1;
+        e->len = 0; e->used = ++g_fc.tick;
+        pthread_mutex_unlock(&g_fc.mu);
+
+        /* decode outside the lock */
+        int err = 0; uint8_t *ub = NULL; int64_t ulen = 0;
+        uint8_t *cb = malloc((size_t)clen);
+        if (!cb) err = -ENOMEM;
+        else {
+            int64_t got = 0;
+            while (got < clen) {
+                ssize_t r = pread(afd, cb + got, (size_t)(clen - got),
+                                  coff + got);
+                if (r <= 0) { err = r < 0 ? -errno : -EIO; break; }
+                got += r;
+            }
+            if (!err) {
+                unsigned long long ds =
+                    ZSTD_getFrameContentSize(cb, (size_t)clen);
+                if (ds == ZSTD_CONTENTSIZE_ERROR ||
+                    ds == ZSTD_CONTENTSIZE_UNKNOWN) err = -EIO;
+                else if (!(ub = malloc((size_t)ds ? (size_t)ds : 1)))
+                    err = -ENOMEM;
+                else {
+                    size_t z = ZSTD_decompress(ub, (size_t)ds, cb,
+                                               (size_t)clen);
+                    if (ZSTD_isError(z) || z != ds)
+                        { err = -EIO; free(ub); ub = NULL; }
+                    else ulen = (int64_t)z;
+                }
+            }
+        }
+        free(cb);
+
+        pthread_mutex_lock(&g_fc.mu);
+        if (err) {
+            e->err = err; e->ready = 1; e->refs = 0;
+            pthread_cond_broadcast(&g_fc.cv);
+            pthread_mutex_unlock(&g_fc.mu);
+            return err;
+        }
+        e->buf = ub; e->len = ulen; e->ready = 1;
+        g_fc.bytes += ulen;
+        *slot = victim; *buf = ub; *len = ulen;
+        while (g_fc.bytes > g_fc.cap) {   /* trim unreferenced ready frames */
+            int vi = -1; int64_t o = INT64_MAX;
+            for (int i = 0; i < FC_SLOTS; i++) {
+                FCEnt *x = &g_fc.e[i];
+                if (x->key != -1 && x->ready && x->refs == 0 && x->used < o)
+                    { o = x->used; vi = i; }
+            }
+            if (vi < 0) break;
+            g_fc.bytes -= g_fc.e[vi].len; free(g_fc.e[vi].buf);
+            g_fc.e[vi].buf = NULL; g_fc.e[vi].key = -1; g_fc.e[vi].len = 0;
+        }
+        pthread_cond_broadcast(&g_fc.cv);
+        pthread_mutex_unlock(&g_fc.mu);
+        return 0;
+    }
+}
+
+static void fc_release(int slot) {
+    pthread_mutex_lock(&g_fc.mu);
+    if (--g_fc.e[slot].refs == 0) pthread_cond_broadcast(&g_fc.cv);
+    pthread_mutex_unlock(&g_fc.mu);
+}
+
 /* ── CRC-64/NVME: reflected, poly 0xad93d23594c93659, composable ────────
  * Table-driven reference (~1 GB/s); the production path is PCLMULQDQ
  * (ISA-L / aws-checksums, tens of GB/s) behind the same interface. */
@@ -556,7 +682,34 @@ static void row_sync(const CmdBatch *c, int64_t i, int afd, RowResult *out) {
         return;
     }
     case OP_EXTRACT: {
-        /* inverse COPY: archive[data_offset, size] -> create path */
+        /* inverse COPY. Two addressing modes on one opcode:
+         *   pad_align > 1 → ZSTD_D: the member lives inside compressed frame
+         *     archive[data_offset, frame_clen=pad_align]; decode it once via
+         *     the shared frame cache, slice [header_offset, +size], write path.
+         *   else (raw)     → IDENTITY: archive[data_offset, size] -> path. */
+        if (align > 1) {
+            int slot = 0; uint8_t *fbuf = NULL; int64_t flen = 0;
+            int rc = fc_get(c->data_offset[i], c->data_offset[i], align, afd,
+                            &slot, &fbuf, &flen);
+            if (rc < 0) { out->res = rc; return; }
+            int64_t in_off = c->header_offset[i];
+            if (in_off < 0 || in_off + size > flen)
+                { fc_release(slot); out->res = -EIO; return; }
+            int dfd = open(c->path[i], O_WRONLY | O_CREAT | O_TRUNC,
+                           c->mode[i] >= 0 ? (mode_t)c->mode[i]
+                                           : DEFAULT_FILE_MODE);
+            if (dfd < 0) { fc_release(slot); out->res = -errno; return; }
+            int64_t left = size, w = 0;
+            while (left > 0) {
+                ssize_t r = write(dfd, fbuf + in_off + w, (size_t)left);
+                if (r < 0) { out->res = -errno; break; }
+                left -= r; w += r;
+            }
+            out->read_size = w;
+            close(dfd);
+            fc_release(slot);
+            return;
+        }
         int dfd = open(c->path[i], O_WRONLY | O_CREAT | O_TRUNC,
                        c->mode[i] >= 0 ? (mode_t)c->mode[i]
                                        : DEFAULT_FILE_MODE);

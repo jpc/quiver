@@ -683,7 +683,7 @@ def test_zframe_unpack(tmp):
 
     a, b = str(tmp/"a.tar.zstd"), str(tmp/"b.tar.zstd")
     mk(a, "a", 150); mk(b, "b", 150)
-    # linear nock: parallel unpack == extract() oracle, byte-exact
+    # linear nock: executor OP_EXTRACT+ZSTD_D unpack == extract() oracle, byte-exact
     zframe.recompress_c([a], str(tmp/"lin.tar.zstd"), level=4, batch_bytes=16 << 10)
     assert zframe.unpack(str(tmp/"lin.tar.zstd"), str(tmp/"ul"), workers=4) == 150
     zframe.extract(str(tmp/"lin.tar.zstd"), str(tmp/"uo"))
@@ -691,6 +691,15 @@ def test_zframe_unpack(tmp):
         w = (f"a{i}-".encode()) * (6 + i)
         assert (tmp/"ul"/"a"/f"f{i:04d}.dat").read_bytes() == w
         assert (tmp/"uo"/"a"/f"f{i:04d}.dat").read_bytes() == w
+    # de-fork invariant (docs/DEFORK.md step 1): the C executor path must equal
+    # the pure-Python thread-pool oracle byte-for-byte AND mode-for-mode.
+    zframe.unpack(str(tmp/"lin.tar.zstd"), str(tmp/"uor"), engine=None)  # oracle
+    exe = {p.relative_to(tmp/"ul"): p for p in (tmp/"ul").rglob("*") if p.is_file()}
+    ora = {p.relative_to(tmp/"uor"): p for p in (tmp/"uor").rglob("*") if p.is_file()}
+    assert exe.keys() == ora.keys() and len(exe) == 150
+    for rel in exe:
+        assert exe[rel].read_bytes() == ora[rel].read_bytes()
+        assert (exe[rel].stat().st_mode & 0o7777) == (ora[rel].stat().st_mode & 0o7777)
     # sharded nock: unpack resolves each member to its shard
     zframe.recompress_c([a], str(tmp/"s0.tar.zstd"), level=4, batch_bytes=16 << 10)
     zframe.recompress_c([b], str(tmp/"s1.tar.zstd"), level=4, batch_bytes=16 << 10)

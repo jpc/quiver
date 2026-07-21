@@ -24,18 +24,26 @@ executor → footer. The zframe (compressed) path is the fork; make it look like
 
 ## Plan (safe-first; each step keeps the suite green, old driver → oracle)
 
-1. **`unpack` (linear) → `OP_EXTRACT` + `ZSTD_D` on the one executor.** Pure
-   addition (no `zpack` to touch). The command carries `frame_coff` (=
-   `data_offset`), `frame_clen`, `in_off`, `size`, `path`, `mode`, `mtime`; the
-   executor decompresses the frame and slices `[in_off, size]`.
+1. **`unpack` (linear) → `OP_EXTRACT` + `ZSTD_D` on the one executor.** ✅ DONE.
+   Pure addition (no `zpack` to touch). The command carries `frame_coff` (=
+   `data_offset`), `frame_clen` (= `pad_align`, >1 ⇒ decode), `in_off` (=
+   `header_offset`), `size`, `path`, `mode`, `mtime`; the executor decompresses
+   the frame and slices `[in_off, in_off+size]`. `zframe._unpack_plan` emits the
+   MKDIR / EXTRACT / SETMETA stream (the compressed mirror of `footer.extract`),
+   `unpack(engine=…)` runs it; `engine=None` keeps the Python `_unpack` oracle.
    - **KEY FINDING (verified in code):** the pool is a **shared LIFO work
      queue** — `open_worker` pulls `p->q[--p->qn]`, so rows are dispatched
      dynamically, **not** as contiguous per-worker ranges. A *thread-local*
      one-frame cache therefore gets poor hits (a frame's members scatter across
-     workers, each re-decoding the 16 MB frame). So use a **shared bounded frame
-     cache** (small LRU, mutex-protected: first worker to hit a frame decodes +
-     inserts, others reuse) — or add frame-affinity scheduling. Sort the plan by
-     `frame_coff`. Oracle: the current Python `unpack`/`extract`.
+     workers, each re-decoding the 16 MB frame). **Built:** a **shared,
+     single-flight, byte-bounded LRU** (`g_fc`/`fc_get`/`fc_release` in
+     quiver-exec.c) keyed by `frame_coff` — first worker to touch a frame
+     decodes + inserts, the rest wait on a condvar and reuse; refs pin an entry
+     while its member is written, LRU trims to a 2 GiB budget. Plan sorted by
+     `(frame_coff, in_off)` so only a poolful of frames are live at once.
+   - **Test:** `test_zframe_unpack` now asserts the executor path == the
+     Python `_unpack` oracle **byte-for-byte and mode-for-mode** over the whole
+     tree, not just spot files. Oracle retained: `unpack(engine=None)`.
 2. **`pack_fs` → `OP_COMPRESS(src=FILE)`.** The executor gains a FILE-source
    **fetch/gather**: read a frame's files by path, tar-format, gather into the
    frame buffer, `ZSTD_C`, append (offset from completion). This is `zexec`'s

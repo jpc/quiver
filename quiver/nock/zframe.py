@@ -1135,13 +1135,62 @@ def _unpack(idx, dest, shard_of, workers):
         return sum(f.result() for f in futs)
 
 
-def unpack(path, dest, predicate=None, workers=None):
-    """Parallel unpack of a linear nock archive → dest."""
+def _unpack_plan(idx, dest):
+    """Compile a linear-nock index into the MKDIR / EXTRACT+ZSTD_D / SETMETA
+    command stream the one executor runs (docs/UNPACK.md) — the compressed
+    mirror of footer.extract's raw plan. EXTRACT carries the frame in its
+    operand fields: data_offset=frame_coff, pad_align=frame_clen (>1 ⇒ the
+    executor decodes the frame via its shared cache), header_offset=in_off,
+    size=member size. Sorted by frame_coff so each frame decodes once."""
+    from ..wire import OP_EXTRACT, OP_MKDIR, OP_SETMETA, cmd_df
+    idx = idx.sort(["frame_coff", "in_off"])
+    dirs = (idx.select(dir=pl.col("path").str.extract(r"^(.*)/", 1))
+               .drop_nulls().unique())
+    seen, alld = set(), []                    # mkdir -p every ancestor
+    for d in dirs["dir"]:
+        parts = d.split("/")
+        for k in range(1, len(parts) + 1):
+            pd = "/".join(parts[:k])
+            if pd not in seen:
+                seen.add(pd); alld.append(pd)
+    alld.sort(key=lambda d: d.count("/"))
+    maxd = max((d.count("/") for d in alld), default=-1)
+    n = idx.height
+    cmds = pl.concat([
+        cmd_df(len(alld), opcode=[OP_MKDIR] * len(alld),
+               dep_group=pl.Series([d.count("/") for d in alld],
+                                   dtype=pl.Int64),
+               path=[os.path.join(dest, d) for d in alld]),
+        cmd_df(n, opcode=[OP_EXTRACT] * n,
+               dep_group=pl.Series([maxd + 1] * n, dtype=pl.Int64),
+               path=[os.path.join(dest, p) for p in idx["path"]],
+               data_offset=idx["frame_coff"], pad_align=idx["frame_clen"],
+               header_offset=idx["in_off"], size=idx["size"],
+               mode=(idx["mode"] & 0o7777).cast(pl.Int32)),
+        cmd_df(n, opcode=[OP_SETMETA] * n,
+               dep_group=pl.Series([maxd + 2] * n, dtype=pl.Int64),
+               path=[os.path.join(dest, p) for p in idx["path"]],
+               mtime_ns=idx["mtime_ns"]),
+    ]).with_columns(user_data=pl.int_range(len(alld) + 2 * n, dtype=pl.UInt64))
+    return cmds, idx["path"].to_list()
+
+
+def unpack(path, dest, predicate=None, workers=None, engine="auto"):
+    """Parallel unpack of a linear nock archive → dest. engine=None keeps the
+    portable Python thread-pool decoder (the oracle); otherwise members are
+    decoded through the one executor's OP_EXTRACT+ZSTD_D frame cache — the
+    de-forked path (docs/DEFORK.md step 1)."""
     idx = read_index(path)
     if predicate is not None:
         idx = idx.filter(predicate)
     os.makedirs(dest, exist_ok=True)
-    return _unpack(idx, dest, lambda sid: path, workers)
+    if engine is None or not idx.height:
+        return _unpack(idx, dest, lambda sid: path, workers)
+    from ..wire import run_commands
+    from ..tools import _check
+    cmds, paths = _unpack_plan(idx, dest)
+    _check(run_commands(cmds, path, engine), cmds)
+    return len(paths)
 
 
 def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
