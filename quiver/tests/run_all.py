@@ -635,6 +635,76 @@ def test_zframe_s3(tmp):
     run()
     ok("zframe S3: reshard streamed to S3 multipart (moto), nock + byte-exact")
 
+
+def test_zframe_wal(tmp):
+    """WAL resume: after a crash, re-scan/re-plan (deterministic), skip the
+    frames already committed to the WAL, and append the rest — verified by
+    simulating a crash mid-run and resuming to a complete, byte-exact archive."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, os, struct, subprocess as sp, tarfile
+    from quiver.nock import zframe
+    from quiver.wire import EXE
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
+        for i in range(400):
+            b = (f"m{i}-").encode() * (20 + i)
+            ti = tarfile.TarInfo(f"c/f{i:04d}.dat"); ti.size = len(b)
+            ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+    src = str(tmp/"a.tar.zstd")
+    with open(src, "wb") as fo:
+        fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    # deterministic run (1 reader/compressor), capture records + raw frames
+    df = zframe._zscan([src], 1)
+    plan = zframe.plan_frames(df, batch_bytes=16 << 10)
+    M = plan.height
+    pp = str(tmp/"p.plan"); zframe._write_plan(plan, 1, pp, nsink=1)
+    full = str(tmp/"full.frames")
+    proc = sp.Popen([EXE, "zexec", pp, full, "4", "1", "1", src],
+                    stdout=sp.PIPE)
+    data = proc.stdout.read(); proc.wait()
+    rec = struct.Struct("<qqiiiiqqqi")
+    recs, i, n = [], 0, len(data)
+    while i + 2 <= n:
+        plen = data[i] | (data[i + 1] << 8)
+        if i + 2 + plen + 60 > n:
+            break
+        recs.append((data[i:i + 2 + plen + 60],
+                     rec.unpack_from(data, i + 2 + plen)))
+        i += 2 + plen + 60
+    nframes = max(t[5] for _, t in recs) + 1
+    assert nframes > 3, nframes
+
+    # simulate a crash after ~1/3 of the frames
+    K = nframes // 3
+    committed = [rw for rw, t in recs if t[5] < K]
+    hw = max(t[6] + t[7] for _, t in recs if t[5] < K)
+    out = str(tmp/"resumed.tar.zstd"); wal = str(tmp/"job.wal")
+    with open(out, "wb") as fo:
+        fo.write(open(full, "rb").read()[:hw])
+    with open(wal, "wb") as fo:
+        fo.write(b"".join(committed))
+
+    res = zframe.recompress_c([src], out, level=4, readers=1, compressors=1,
+                              batch_bytes=16 << 10, wal=wal)
+    assert res.members == M, (res.members, M)          # complete
+    assert not os.path.exists(wal)                     # WAL retired on success
+    idx = zframe.read_index(out)
+    assert idx.height == M
+    m = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
+               capture_output=True, text=True).stdout.strip()
+    assert int(m) == M
+    # byte-exact for a member from a committed frame and a resumed frame
+    zframe.extract(out, str(tmp/"rx"), pl.col("path").is_in(
+        ["c/f0001.dat", "c/f0399.dat"]))
+    assert (tmp/"rx"/"c"/"f0001.dat").read_bytes() == (b"m1-") * 21
+    assert (tmp/"rx"/"c"/"f0399.dat").read_bytes() == (b"m399-") * (20 + 399)
+    ok("zframe WAL: crash mid-run → resume skips committed frames, complete")
+
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars
     # subtree partition, the fan-out/barrier, and the root-op handling
@@ -696,6 +766,7 @@ def main():
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
               test_zframe_plan, test_zframe_reshard, test_zframe_s3,
+              test_zframe_wal,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)

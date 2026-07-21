@@ -618,14 +618,16 @@ def plan_frames(df, include=None, exclude=None, min_size=0,
     ).sort(["source_id", "ordinal"])
 
 
-def _write_plan(plan_df, nsrc, path):
-    """Plan file for zexec: [i32 nsrc][i32 nsink][i32 counts[nsrc]][ents],
-    ents being per-source (i32 ordinal, i32 frame, i32 sink) sorted by ordinal
-    in source order — C merge-joins it against the re-parsed stream. Returns
-    the sink count."""
+def _write_plan(plan_df, nsrc, path, nsink=None, start=None):
+    """Plan file for zexec: [i32 nsrc][i32 nsink][i64 start[nsink]]
+    [i32 counts[nsrc]][ents], ents being per-source (i32 ordinal, i32 frame,
+    i32 sink) sorted by ordinal in source order — C merge-joins it against the
+    re-parsed stream. `start` gives each sink's resume append offset (0 fresh).
+    Returns the sink count."""
     import numpy as np
     d = plan_df.sort(["source_id", "ordinal"])
-    nsink = int(d["sink"].max()) + 1 if d.height else 1
+    if nsink is None:
+        nsink = int(d["sink"].max()) + 1 if d.height else 1
     counts = [0] * nsrc
     for sid, c in d.group_by("source_id").agg(pl.len().alias("c")).iter_rows():
         counts[sid] = c
@@ -636,8 +638,13 @@ def _write_plan(plan_df, nsrc, path):
     ent[0::3] = ords
     ent[1::3] = frames
     ent[2::3] = sinks
+    starts = np.zeros(nsink, dtype=np.int64)
+    if start:
+        for s, off in start.items():
+            starts[s] = off
     with open(path, "wb") as f:
         f.write(struct.pack("<ii", nsrc, nsink))
+        f.write(starts.tobytes())
         f.write(np.array(counts, dtype=np.int32).tobytes())
         f.write(ent.tobytes())
     return nsink
@@ -808,12 +815,132 @@ def _recompress_s3(inputs, s3_url, level, batch_bytes, readers, compressors,
     return Result(members=members, frames=frames)
 
 
+_WAL_REC = struct.Struct("<qqiiiiqqqi")             # matches the 60B footer tail
+
+
+def _wal_iter(path):
+    """Stream committed footer records from the WAL (raw 60B-tail records, the
+    exact bytes zexec emits). Yields (path, size, mtime, mode, uid, gid, frame,
+    coff, clen, in_off, sink). A torn trailing record is ignored."""
+    buf = b""
+    with open(path, "rb") as f:
+        while (chunk := f.read(1 << 20)):
+            buf += chunk
+            i, n = 0, len(buf)
+            while i + 2 <= n:
+                plen = buf[i] | (buf[i + 1] << 8)
+                if i + 2 + plen + 60 > n:
+                    break
+                p = buf[i + 2:i + 2 + plen].decode("utf-8", "surrogateescape")
+                yield (p,) + _WAL_REC.unpack_from(buf, i + 2 + plen)
+                i += 2 + plen + 60
+            buf = buf[i:]
+
+
+def _ingest_wal(f, walf, progress, progress_every, cin_total):
+    """Persist each newly committed record to the WAL (fsync'd on the progress
+    tick — a frame's bytes are already in the sink before its record, so the
+    WAL is the source of truth for what's durable). Returns new (members)."""
+    import time
+    buf = b""
+    members = 0
+    t0 = last = time.time()
+    while (chunk := f.read(1 << 20)):
+        buf += chunk
+        i, n = 0, len(buf)
+        while i + 2 <= n:
+            plen = buf[i] | (buf[i + 1] << 8)
+            if i + 2 + plen + 60 > n:
+                break
+            walf.write(buf[i:i + 2 + plen + 60])
+            members += 1
+            i += 2 + plen + 60
+        buf = buf[i:]
+        now = time.time()
+        if now - last >= progress_every:
+            last = now
+            walf.flush(); os.fsync(walf.fileno())
+            if progress:
+                progress({"members": members, "frames": 0, "cout": 0,
+                          "cin_total": cin_total, "elapsed": now - t0})
+    return members
+
+
+def _wal_finalize(wal_path, sink_path, force_sidecar):
+    """Build each sink's footer from the full WAL (committed + newly appended)
+    and write it. Returns (members, frames, sinks)."""
+    foot = {}
+    members, maxframe = 0, -1
+    for (p, size, mtime, mode, uid, gid, frame, coff, clen, in_off, sink) \
+            in _wal_iter(wal_path):
+        if sink not in foot:
+            ft = tempfile.TemporaryFile()
+            foot[sink] = (ft, _FooterStream(ft))
+        foot[sink][1].add(p, size, mode, mtime, uid, gid,
+                          frame, coff, clen, in_off)
+        members += 1
+        if frame > maxframe:
+            maxframe = frame
+    for sink, (ft, fw) in foot.items():
+        fw.close()
+        _write_footer(sink_path(sink), ft, force_sidecar)
+        ft.close()
+    return members, maxframe + 1, sorted(foot)
+
+
+def _recompress_wal(inputs, out_path, level, batch_bytes, readers, compressors,
+                    progress, progress_every, force_sidecar, include, exclude,
+                    min_size, shard_by, shards, wal_path, cin_total):
+    """WAL-resumable recompress (local). The plan is deterministic, so on
+    resume we re-scan/re-plan, drop every already-committed frame, and tell
+    zexec to append after each sink's high-water — re-decompressing to fast-
+    forward (cheap) while skipping the compression that's already done."""
+    import subprocess
+    from ..wire import EXE
+    plan = plan_frames(_zscan(inputs, readers), include, exclude, min_size,
+                       batch_bytes, shard_by, shards)
+    nsink = int(plan["sink"].max()) + 1 if plan.height else 1
+    pattern = _shard_pattern(out_path) if nsink > 1 else out_path
+    sink_path = (lambda s: pattern % s) if nsink > 1 else (lambda s: out_path)
+
+    done_frames, hw = set(), {}
+    if os.path.exists(wal_path):                    # resume
+        for r in _wal_iter(wal_path):
+            done_frames.add(r[6])
+            end = r[7] + r[8]                       # coff + clen
+            if end > hw.get(r[10], 0):
+                hw[r[10]] = end
+        if done_frames:
+            plan = plan.filter(~pl.col("frame").is_in(list(done_frames)))
+    with tempfile.NamedTemporaryFile(suffix=".plan", delete=False) as pf:
+        plan_path = pf.name
+    _write_plan(plan, len(inputs), plan_path, nsink=nsink, start=hw)
+
+    walf = open(wal_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            [EXE, "zexec", plan_path, pattern, str(level),
+             str(readers), str(compressors), *inputs],
+            stdout=subprocess.PIPE, bufsize=1 << 22)
+        _ingest_wal(proc.stdout, walf, progress, progress_every, cin_total)
+        rc = proc.wait()
+        walf.flush(); os.fsync(walf.fileno())
+    finally:
+        walf.close()
+        os.unlink(plan_path)
+    if rc != 0:
+        raise RuntimeError(f"zexec exited {rc} (WAL kept at {wal_path})")
+    members, frames, _ = _wal_finalize(wal_path, sink_path, force_sidecar)
+    os.unlink(wal_path)                             # retire WAL on success
+    return Result(members=members, frames=frames)
+
+
 def recompress_c(inputs, out_path: str, level: int = 6,
                  batch_bytes: int = 16 << 20, readers: int = 8,
                  compressors: int | None = None, progress=None,
                  progress_every: float = 2.0, _force_sidecar: bool = False,
                  include=None, exclude=None, min_size: int = 0,
-                 shard_by=None, shards=None) -> Result:
+                 shard_by=None, shards=None, wal=None) -> Result:
     """The fold. With no filter or shard, the fused `zpack` fast path
     decompresses, parses, batches, compresses and appends all in C (option A).
     With any glob/size filter or a shard, it splits into scan → Polars plan →
@@ -826,6 +953,14 @@ def recompress_c(inputs, out_path: str, level: int = 6,
     from ..wire import EXE
     compressors = compressors or (os.cpu_count() or 8)
     cin_total = sum(os.path.getsize(p) for p in inputs)
+
+    if wal is not None:                                     # WAL-resumable (local)
+        if out_path.startswith("s3://"):
+            raise NotImplementedError("WAL resume is local-only for now")
+        return _recompress_wal(inputs, out_path, level, batch_bytes, readers,
+                               compressors, progress, progress_every,
+                               _force_sidecar, include, exclude, min_size,
+                               shard_by, shards, wal, cin_total)
 
     if out_path.startswith("s3://"):                        # stream into S3
         return _recompress_s3(inputs, out_path, level, batch_bytes, readers,

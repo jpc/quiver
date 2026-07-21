@@ -42,6 +42,9 @@ def main(argv=None):
     sp.add_argument("--shards", type=int, default=None, metavar="N",
                     help="fan out into N shards by path hash, one pass; "
                          "out is templated ('{shard}'/'%%d', else .shardN)")
+    sp.add_argument("--wal", default=None, metavar="PATH",
+                    help="write-ahead log for crash-resumable recompress "
+                         "(local out); rerun with the same --wal to resume")
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling; --py only)")
     sp = sub.add_parser("serve", help="browse a zframe archive over HTTP")
@@ -98,7 +101,7 @@ def main(argv=None):
                                       include=a.glob, exclude=a.exclude,
                                       min_size=a.min_size,
                                       shard_by="hash" if a.shards else None,
-                                      shards=a.shards)
+                                      shards=a.shards, wal=a.wal)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
     elif a.cmd == "serve":

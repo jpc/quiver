@@ -1393,8 +1393,11 @@ static struct {
  * i32 sink) sorted by ordinal. sink routes a member's frame to one of nsink
  * outputs — attribute-based resharding decided entirely in Polars. */
 typedef struct { int32_t ordinal, frame, sink; } PlanEnt;
-static struct { int nsrc, nsink; int32_t *counts; PlanEnt **ents;
-                uint8_t *raw; } P;
+/* start[]: per-sink resume offset — 0 for a fresh run, else the committed
+ * high-water from the WAL, so zexec appends new frames after already-done
+ * ones (the planner drops committed members, so only new frames arrive). */
+static struct { int nsrc, nsink; int64_t *start; int32_t *counts;
+                PlanEnt **ents; uint8_t *raw; } P;
 
 static int plan_load(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -1406,6 +1409,7 @@ static int plan_load(const char *path) {
     uint8_t *p = P.raw;
     P.nsrc = *(int32_t *)p; p += 4;
     P.nsink = *(int32_t *)p; p += 4;
+    P.start = (int64_t *)p; p += 8 * (size_t)P.nsink;
     P.counts = (int32_t *)p; p += 4 * (size_t)P.nsrc;
     P.ents = malloc(sizeof(PlanEnt *) * P.nsrc);
     for (int s = 0; s < P.nsrc; s++) {
@@ -1587,8 +1591,13 @@ static void *z_compressor(void *arg) {
         if (Z.fd[sink] < 0) {                  /* lazy-open this sink's output */
             char path[4096];
             snprintf(path, sizeof path, Z.pattern, sink);
-            Z.fd[sink] = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            Z.fd[sink] = open(path, O_WRONLY | O_CREAT, 0644);
             if (Z.fd[sink] < 0) perror("sink");
+            /* keep [0, aoff) (committed prefix on resume; empty on fresh run),
+             * drop any torn tail; no-ops on a FIFO. aoff is still the start
+             * offset here — nothing has been appended yet. */
+            else if (ftruncate(Z.fd[sink], Z.aoff[sink]) == 0)
+                lseek(Z.fd[sink], Z.aoff[sink], SEEK_SET);
         }
         int64_t coff = Z.aoff[sink];
         Z.aoff[sink] += (int64_t)clen;
@@ -1895,6 +1904,7 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
     Z.slock = malloc(sizeof(pthread_mutex_t) * Z.nsink);
     for (int i = 0; i < Z.nsink; i++) {
         Z.fd[i] = -1; pthread_mutex_init(&Z.slock[i], NULL);
+        Z.aoff[i] = P.start ? P.start[i] : 0;  /* resume high-water, else 0 */
     }
     pthread_t rt[64], ct[128];
     if (readers > 64) readers = 64;
