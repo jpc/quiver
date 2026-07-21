@@ -1144,6 +1144,67 @@ def unpack(path, dest, predicate=None, workers=None):
     return _unpack(idx, dest, lambda sid: path, workers)
 
 
+def pack_fs(root, out_path, batch_bytes=16 << 20, level=6, workers=None,
+            predicate=None, engine="auto", threads=8):
+    """Parallel pack a filesystem tree into a per-batch-frame zstd nock — the
+    FILE-source variant of recompress (docs/ISA.md §2: COMPRESS with src=FILE
+    instead of STREAM, a simpler fetch — read files and tar-format them rather
+    than decompress+parse a tar.zstd). scan the tree, batch files into frames by
+    size, then tar-format + zstd each frame in a thread pool (file reads and
+    zstd both release the GIL). Output is a standard tar.zstd, unpackable by
+    unpack()."""
+    import tarfile
+    from .. import wire
+    workers = workers or (os.cpu_count() or 8)
+    df = wire.scan(root, engine=engine, threads=threads)
+    files = df.filter(~pl.col("is_dir"))
+    if predicate is not None:
+        files = files.filter(predicate)
+    # frame = greedy fill by raw tar footprint (512 header + padded body)
+    files = files.sort("path").with_columns(
+        (512 + ((pl.col("size") + 511) // 512) * 512).alias("raw"))
+    files = files.with_columns(
+        ((pl.col("raw").cum_sum() - pl.col("raw")) // batch_bytes).alias("frame"))
+    lock = threading.Lock()
+    st = {"off": 0}
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+
+    def work(grp):
+        buf, members = bytearray(), []
+        for r in grp.iter_rows(named=True):
+            with open(os.path.join(root, r["path"]), "rb") as f:
+                data = f.read()                        # file read: GIL released
+            ti = tarfile.TarInfo(r["path"])
+            ti.size = len(data); ti.mode = r["mode"] & 0o7777
+            ti.mtime = r["mtime_ns"] // 1_000_000_000
+            ti.uid = r["uid"]; ti.gid = r["gid"]
+            hdr = ti.tobuf(format=tarfile.PAX_FORMAT)
+            in_off = len(buf) + len(hdr)
+            buf += hdr; buf += data; buf += b"\x00" * ((-len(data)) % 512)
+            members.append((r["path"], len(data), r["mode"], r["mtime_ns"],
+                            r["uid"], r["gid"], in_off))
+        comp = zstd.ZstdCompressor(level=level).compress(bytes(buf))  # GIL released
+        with lock:                                     # assign the append offset
+            coff = st["off"]; st["off"] += len(comp)
+        os.pwrite(fd, comp, coff)                      # positioned, concurrent-safe
+        return coff, len(comp), members
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        results = [f.result() for f in
+                   [ex.submit(work, g)
+                    for _, g in files.group_by("frame", maintain_order=True)]]
+    os.close(fd)
+    ftmp = tempfile.TemporaryFile()
+    fw = _FooterStream(ftmp)
+    for fid, (coff, clen, members) in enumerate(results):   # coff locates frames
+        for (path, size, mode, mtime, uid, gid, in_off) in members:
+            fw.add(path, size, mode, mtime, uid, gid, fid, coff, clen, in_off)
+    fw.close()
+    _write_footer(out_path, ftmp, False)
+    ftmp.close()
+    return Result(members=fw.members, frames=len(results))
+
+
 def unpack_merged(manifest, dest, predicate=None, workers=None):
     """Parallel unpack of a sharded nock: each member resolved to its shard
     file — the only difference from the linear case (docs/UNPACK.md)."""

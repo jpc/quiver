@@ -47,6 +47,14 @@ def main(argv=None):
                          "(local out); rerun with the same --wal to resume")
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling; --py only)")
+    sp = sub.add_parser("packfs",
+                        help="parallel pack a filesystem tree → per-batch-frame "
+                             "tar.zstd nock (FILE-source COMPRESS)")
+    sp.add_argument("root"); sp.add_argument("out")
+    sp.add_argument("--batch-mb", type=float, default=16.0)
+    sp.add_argument("--level", type=int, default=6)
+    sp.add_argument("--workers", type=int, default=None)
+    sp.add_argument("--glob", action="append", default=None, metavar="PAT")
     sp = sub.add_parser("unpack",
                         help="parallel unpack a nock archive (linear or "
                              ".nockset manifest) → dest")
@@ -110,6 +118,14 @@ def main(argv=None):
                                       shards=a.shards, wal=a.wal)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
+    elif a.cmd == "packfs":
+        from .nock import zframe
+        pred = (pl.col("path").str.contains(zframe._globs_re(a.glob))
+                if a.glob else None)
+        res = zframe.pack_fs(a.root, a.out,
+                             batch_bytes=int(a.batch_mb * (1 << 20)),
+                             level=a.level, workers=a.workers, predicate=pred)
+        print(f"{res.members} files, {res.frames} frames -> {a.out}")
     elif a.cmd == "unpack":
         from .nock import zframe
         pred = (pl.col("path").str.contains(zframe._globs_re(a.glob))

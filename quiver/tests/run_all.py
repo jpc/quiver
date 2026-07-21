@@ -636,6 +636,30 @@ def test_zframe_s3(tmp):
     ok("zframe S3: reshard streamed to S3 multipart (moto), nock + byte-exact")
 
 
+def test_zframe_packfs(tmp):
+    """FILE-source pack: scan a filesystem tree, batch files into frames, zstd
+    each frame in parallel → a standard tar.zstd nock that round-trips."""
+    from quiver.nock import zframe
+    root = tmp/"tree"
+    want = {}
+    random.seed(3)
+    for i in range(300):
+        d = root/f"d{i % 5}"/f"s{i % 2}"; d.mkdir(parents=True, exist_ok=True)
+        data = os.urandom(random.randrange(5, 4000))
+        (d/f"f{i:04d}.bin").write_bytes(data)
+        want[f"d{i % 5}/s{i % 2}/f{i:04d}.bin"] = data
+    res = zframe.pack_fs(str(root), str(tmp/"fs.tar.zstd"),
+                         batch_bytes=64 << 10, level=4, workers=4)
+    assert res.members == 300 and res.frames > 1
+    n = subprocess.run(f"zstd -dc {tmp}/fs.tar.zstd | tar t | wc -l", shell=True,
+                       capture_output=True, text=True).stdout.strip()
+    assert int(n) == 300                               # a clean tar.zstd
+    zframe.unpack(str(tmp/"fs.tar.zstd"), str(tmp/"fx"), workers=4)
+    for rel, data in want.items():                     # pack→unpack byte-exact
+        assert (tmp/"fx"/rel).read_bytes() == data
+    ok("zframe pack_fs: filesystem scan → compressed frame nock, round-trips")
+
+
 def test_zframe_unpack(tmp):
     """Parallel unpack (decode each frame once in a thread pool) must equal the
     single-threaded extract oracle, byte-exact, for linear and sharded nock,
@@ -859,7 +883,7 @@ def main():
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
               test_zframe_plan, test_zframe_reshard, test_zframe_s3,
-              test_zframe_merge, test_zframe_unpack,
+              test_zframe_merge, test_zframe_unpack, test_zframe_packfs,
               test_zframe_wal,
               test_cksum_parallel,
               test_p1_barrier):
