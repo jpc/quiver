@@ -1383,34 +1383,74 @@ static struct {
     pthread_mutex_t omu;
 } Z;
 
-/* plan (zexec): per-source ordinal→(frame,sink) keep-list, loaded from a file
- * the Polars planner writes. Layout: [i32 nsrc][i32 nsink][i32 counts[nsrc]]
- * [ents...] where ents is per-source arrays of (i32 ordinal, i32 frame,
- * i32 sink) sorted by ordinal. sink routes a member's frame to one of nsink
- * outputs — attribute-based resharding decided entirely in Polars. */
+/* plan (zexec): the member→(frame,sink) keep-list is an OP_COMPRESS *command
+ * stream* (Arrow IPC, CMD schema) the planner writes — read here with the same
+ * parse_cmd_batch the exec loop uses, no bespoke format. The four plan operands
+ * ride existing command columns: source_id→data_offset, ordinal→size,
+ * frame→dep_group, sink→parent_row (level→pad_align). nsink and per-sink resume
+ * `start` offsets are execution params, passed on argv. */
 typedef struct { int32_t ordinal, frame, sink; } PlanEnt;
-/* start[]: per-sink resume offset — 0 for a fresh run, else the committed
- * high-water from the WAL, so zexec appends new frames after already-done
- * ones (the planner drops committed members, so only new frames arrive). */
 static struct { int nsrc, nsink; int64_t *start; int32_t *counts;
-                PlanEnt **ents; uint8_t *raw; } P;
+                PlanEnt **ents; } P;
 
-static int plan_load(const char *path) {
+static int plan_load(const char *path, int nsink, const char *starts) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("plan"); return -1; }
-    struct stat st; fstat(fd, &st);
-    P.raw = malloc(st.st_size);
-    if (read(fd, P.raw, st.st_size) != st.st_size) { close(fd); return -1; }
-    close(fd);
-    uint8_t *p = P.raw;
-    P.nsrc = *(int32_t *)p; p += 4;
-    P.nsink = *(int32_t *)p; p += 4;
-    P.start = (int64_t *)p; p += 8 * (size_t)P.nsink;
-    P.counts = (int32_t *)p; p += 4 * (size_t)P.nsrc;
-    P.ents = malloc(sizeof(PlanEnt *) * P.nsrc);
-    for (int s = 0; s < P.nsrc; s++) {
-        P.ents[s] = (PlanEnt *)p;
-        p += sizeof(PlanEnt) * (size_t)P.counts[s];
+    uint8_t *meta = NULL, *body = NULL; size_t mcap = 0, bcap = 0;
+    PlanEnt *ents = NULL; int32_t *srcs = NULL; int64_t ne = 0, cap = 0;
+    int maxsrc = -1;
+    for (;;) {                                  /* mirror the exec read loop */
+        uint32_t hdr[2];
+        int r = read_full(fd, hdr, 8);
+        if (r == 1 || (r == 0 && hdr[1] == 0)) break;
+        if (r < 0 || hdr[0] != 0xFFFFFFFFu) { close(fd); return -1; }
+        if (hdr[1] > mcap) meta = realloc(meta, mcap = hdr[1]);
+        if (read_full(fd, meta, hdr[1])) { close(fd); return -1; }
+        int64_t rt = fb_root(meta);
+        int64_t blp = fb_field(meta, rt, 3);
+        int64_t blen = blp >= 0 ? fb_i64(meta, blp) : 0;
+        if (blen > 0) {
+            if ((size_t)blen > bcap) body = realloc(body, bcap = (size_t)blen);
+            if (read_full(fd, body, (size_t)blen)) { close(fd); return -1; }
+        }
+        int64_t htp = fb_field(meta, rt, 1);
+        if (htp >= 0 && meta[htp] == 1) continue;          /* Schema msg */
+        CmdBatch cb;
+        if (parse_cmd_batch(meta, body, &cb)) { close(fd); return -1; }
+        int64_t n = cb.n_rows;
+        if (ne + n > cap) {
+            cap = (ne + n) * 2;
+            ents = realloc(ents, sizeof(PlanEnt) * (size_t)cap);
+            srcs = realloc(srcs, 4 * (size_t)cap);
+        }
+        for (int64_t i = 0; i < n; i++) {
+            int32_t s = (int32_t)cb.data_offset[i];        /* source_id */
+            srcs[ne] = s;
+            ents[ne].ordinal = (int32_t)cb.size[i];        /* ordinal */
+            ents[ne].frame   = (int32_t)cb.dep_group[i];   /* frame */
+            ents[ne].sink    = (int32_t)cb.parent_row[i];  /* sink */
+            if (s > maxsrc) maxsrc = s;
+            ne++;
+        }
+        free(cb.arena); free(cb.path); free(cb.dst);
+    }
+    free(meta); free(body); close(fd);
+    /* rows arrive sorted by (source_id, ordinal), so each source is contiguous */
+    P.nsrc = maxsrc + 1; P.nsink = nsink;
+    int ns = P.nsrc > 0 ? P.nsrc : 1;
+    P.counts = calloc((size_t)ns, sizeof(int32_t));
+    for (int64_t i = 0; i < ne; i++) P.counts[srcs[i]]++;
+    P.ents = malloc(sizeof(PlanEnt *) * (size_t)ns);
+    int64_t off = 0;
+    for (int s = 0; s < P.nsrc; s++) { P.ents[s] = ents + off; off += P.counts[s]; }
+    free(srcs);
+    P.start = calloc((size_t)(nsink > 0 ? nsink : 1), sizeof(int64_t));
+    if (starts && strcmp(starts, "-")) {                   /* resume offsets */
+        const char *q = starts; int si = 0;
+        while (*q && si < nsink) {
+            P.start[si++] = strtoll(q, (char **)&q, 10);
+            if (*q == ',') q++;
+        }
     }
     return 0;
 }
@@ -1933,11 +1973,11 @@ static void *z_exec_reader(void *arg) {
 
 static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
                      const char *pattern, int level, int readers,
-                     int compressors) {
+                     int compressors, int nsink, const char *starts) {
     memset(&Z, 0, sizeof Z);
     Z.srcs = srcs; Z.nsrc = nsrc; Z.level = level; Z.batch = 16 << 20;
     Z.nreaders_left = readers;
-    if (plan_load(plan_path)) return 2;
+    if (plan_load(plan_path, nsink, starts)) return 2;
     pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
     pthread_mutex_init(&Z.omu, NULL);
     Z.nsink = P.nsink < 1 ? 1 : P.nsink;
@@ -2012,10 +2052,12 @@ int main(int argc, char **argv) {
     }
 
     if (!strcmp(argv[1], "zexec")) {
-        /* zexec <plan> <out> <level> <readers> <compressors> <src...> */
-        if (argc < 8) { fprintf(stderr, "zexec: too few args\n"); return 2; }
-        return run_zexec(argv[2], (const char **)&argv[7], argc - 7, argv[3],
-                         atoi(argv[4]), atoi(argv[5]), atoi(argv[6]));
+        /* zexec <plan> <pattern> <level> <readers> <compressors>
+         *       <nsink> <starts> <src...> */
+        if (argc < 10) { fprintf(stderr, "zexec: too few args\n"); return 2; }
+        return run_zexec(argv[2], (const char **)&argv[9], argc - 9, argv[3],
+                         atoi(argv[4]), atoi(argv[5]), atoi(argv[6]),
+                         atoi(argv[7]), argv[8]);
     }
 
     struct io_uring ring;

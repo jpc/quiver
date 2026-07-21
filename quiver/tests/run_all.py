@@ -664,8 +664,8 @@ def test_zframe_wal(tmp):
     M = plan.height
     pp = str(tmp/"p.plan"); zframe._write_plan(plan, 1, pp, nsink=1)
     full = str(tmp/"full.frames")
-    proc = sp.Popen([EXE, "zexec", pp, full, "4", "1", "1", src],
-                    stdout=sp.PIPE)
+    proc = sp.Popen([EXE, "zexec", pp, full, "4", "1", "1", "1", "-", src],
+                    stdout=sp.PIPE)                     # nsink=1, starts="-"
     data = proc.stdout.read(); proc.wait()
     rec = struct.Struct("<qqiiiiqqqi")
     recs, i, n = [], 0, len(data)

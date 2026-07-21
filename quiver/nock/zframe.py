@@ -594,35 +594,31 @@ def plan_frames(df, include=None, exclude=None, min_size=0,
     ).sort(["source_id", "ordinal"])
 
 
-def _write_plan(plan_df, nsrc, path, nsink=None, start=None):
-    """Plan file for zexec: [i32 nsrc][i32 nsink][i64 start[nsink]]
-    [i32 counts[nsrc]][ents], ents being per-source (i32 ordinal, i32 frame,
-    i32 sink) sorted by ordinal in source order — C merge-joins it against the
-    re-parsed stream. `start` gives each sink's resume append offset (0 fresh).
-    Returns the sink count."""
-    import numpy as np
+def _write_plan(plan_df, nsrc, path, nsink=None):
+    """Write the plan as an OP_COMPRESS command stream (Arrow IPC, CMD schema),
+    sorted by (source_id, ordinal). The four plan operands ride existing command
+    columns — source_id→data_offset, ordinal→size, frame→dep_group,
+    sink→parent_row — and zexec reads it with the normal command reader. Returns
+    the sink count (nsink and resume offsets are execution params, passed on
+    argv, not in the stream)."""
+    from ..wire import cmd_df, _df_cols, CMD_SCHEMA, OP_COMPRESS
+    from ..pupyarrow.writer import StreamWriter
     d = plan_df.sort(["source_id", "ordinal"])
     if nsink is None:
         nsink = int(d["sink"].max()) + 1 if d.height else 1
-    counts = [0] * nsrc
-    for sid, c in d.group_by("source_id").agg(pl.len().alias("c")).iter_rows():
-        counts[sid] = c
-    ords = d["ordinal"].to_numpy().astype(np.int32)
-    frames = d["frame"].to_numpy().astype(np.int32)
-    sinks = d["sink"].to_numpy().astype(np.int32)
-    ent = np.empty(len(ords) * 3, dtype=np.int32)
-    ent[0::3] = ords
-    ent[1::3] = frames
-    ent[2::3] = sinks
-    starts = np.zeros(nsink, dtype=np.int64)
-    if start:
-        for s, off in start.items():
-            starts[s] = off
+    n = d.height
     with open(path, "wb") as f:
-        f.write(struct.pack("<ii", nsrc, nsink))
-        f.write(starts.tobytes())
-        f.write(np.array(counts, dtype=np.int32).tobytes())
-        f.write(ent.tobytes())
+        w = StreamWriter(f, CMD_SCHEMA)
+        if n:
+            cmds = cmd_df(n).with_columns(
+                pl.lit(OP_COMPRESS, dtype=pl.UInt8).alias("opcode"),
+                d["source_id"].cast(pl.Int64).alias("data_offset"),
+                d["ordinal"].cast(pl.Int64).alias("size"),
+                d["frame"].cast(pl.Int64).alias("dep_group"),
+                d["sink"].cast(pl.Int64).alias("parent_row"))
+            for s in range(0, n, 1 << 20):
+                w.write_batch(_df_cols(cmds[s:s + (1 << 20)]))
+        w.close()
     return nsink
 
 
@@ -768,7 +764,7 @@ def _recompress_s3(inputs, s3_url, level, batch_bytes, readers, compressors,
     try:
         if planned:
             cmd = [EXE, "zexec", tmpplan, fifopat, str(level),
-                   str(readers), str(compressors), *inputs]
+                   str(readers), str(compressors), str(nsink), "-", *inputs]
         else:
             cmd = [EXE, "zpack", fifopat % 0, str(level), str(batch_bytes),
                    str(readers), str(compressors), *inputs]
@@ -890,13 +886,14 @@ def _recompress_wal(inputs, out_path, level, batch_bytes, readers, compressors,
             plan = plan.filter(~pl.col("frame").is_in(list(done_frames)))
     with tempfile.NamedTemporaryFile(suffix=".plan", delete=False) as pf:
         plan_path = pf.name
-    _write_plan(plan, len(inputs), plan_path, nsink=nsink, start=hw)
+    _write_plan(plan, len(inputs), plan_path, nsink=nsink)
+    starts = ",".join(str(hw.get(s, 0)) for s in range(nsink))  # resume offsets
 
     walf = open(wal_path, "ab")
     try:
         proc = subprocess.Popen(
             [EXE, "zexec", plan_path, pattern, str(level),
-             str(readers), str(compressors), *inputs],
+             str(readers), str(compressors), str(nsink), starts, *inputs],
             stdout=subprocess.PIPE, bufsize=1 << 22)
         _ingest_wal(proc.stdout, walf, progress, progress_every, cin_total)
         rc = proc.wait()
@@ -965,7 +962,7 @@ def recompress_c(inputs, out_path: str, level: int = 6,
         try:
             proc = subprocess.Popen(
                 [EXE, "zexec", plan_path, pattern, str(level),
-                 str(readers), str(compressors), *inputs],
+                 str(readers), str(compressors), str(nsink), "-", *inputs],
                 stdout=subprocess.PIPE, bufsize=1 << 22)
             members, frames, _ = _ingest_footer(
                 proc.stdout, fin, progress, progress_every, cin_total, cout)
