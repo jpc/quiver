@@ -4,18 +4,46 @@ Every existing and planned feature recast as operations of one machine, so that
 implementation adds *instructions and addressing modes*, not *modes*. Read
 `docs/MACHINE.md` first for the framing; this is the instruction-set detail.
 
+## 0. Instructions vs programs vs services
+
+Three levels get confused, so pin them down:
+
+- **Instructions** — what the machine executes. Only these are the ISA. There
+  are four classes (§1).
+- **Programs** — compiler front-ends that lower to an instruction stream, living
+  entirely in Polars: `du`, `rm`, `cp`, `sync`/`rsync`, `pack`, `extract`,
+  `recompress`, `reshard`. The machine never sees them; they emit instructions.
+  (`du` emits *none* — it's a pure query over a generator's output.)
+- **Services** — runtime/µarch machinery that isn't an instruction: the linker
+  (footer writer), the WAL journal, the S3 uploader (a sink's implementation),
+  the dependency scheduler. They operate *on* the streams, not *in* them.
+
+So `rm` and `rsync` are **programs**, not instructions. `scan` is an
+**instruction** — but a generator (§1), not a transformer.
+
 ## 1. Instruction classes
 
-Two functional units, one fence — the whole ISA sorts into three classes:
+Two ports and four classes:
 
-- **Control-path** (namespace + metadata; latency-bound → io_uring ring):
-  `MKDIR`, `UNLINK`, `RMDIR`, `SETMETA` (and the natural future `LINK`,
-  `SYMLINK`, `RENAME`). These touch names and inode attributes, never bulk
-  bytes.
-- **Data-path** (bytes; throughput-bound → 64-worker pool): `COPY`, `CKSUM`,
-  `EXTRACT`, `COMPRESS`. These are *one instruction family* — see §2.
+- **Generators** (read an address space → a row stream; *1 request → N rows*,
+  no command input). `SCAN` reads a namespace subtree via getdents+statx and
+  streams `STAT` rows; `ZSCAN` reads a `tar.zstd` via decompress+parse and
+  streams `ZMETA` rows. These are the machine's **read-state** side — the
+  operand supply the compiler plans over. They correspond to reading the `FILE`
+  and `STREAM` source address spaces (§2) *as a table*. They run on the **scan
+  port** (root in → rows out); everything below runs on the **execute port**
+  (command stream in → completion stream out).
+- **Control-path** transformers (namespace + metadata; latency-bound → io_uring
+  ring): `MKDIR`, `UNLINK`, `RMDIR`, `SETMETA` (and the natural future `LINK`,
+  `SYMLINK`, `RENAME`). Names and inode attributes, never bulk bytes.
+- **Data-path** transformers (bytes; throughput-bound → 64-worker pool): `COPY`,
+  `CKSUM`, `EXTRACT`, `COMPRESS` — *one instruction family*, see §2.
 - **Ordering**: `FBARRIER` — a fence + durability point, issuable to either
-  unit.
+  transformer unit.
+
+Transformers are *1 command → 1 completion*; generators are *1 → N*; that
+cardinality difference is why `scan`/`zscan` have their own invocation (the
+scan port) rather than riding the command stream.
 
 ## 2. The data-path is one instruction, parameterized
 
