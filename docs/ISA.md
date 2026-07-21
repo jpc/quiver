@@ -176,6 +176,39 @@ Acceptance test for all of it: after the refactor there is **one** instruction
 schema in, **one** completion schema out, **one** WAL, and recompress differs
 from pack only by field values (`STREAM`/`ZSTD_C`) — no second machine.
 
+## 10. Instruction encoding: narrow the word, don't pad it
+
+The command word is **wide** (`CMD_SCHEMA`, 15 columns) but any one opcode uses
+few — `OP_COMPRESS` uses 5 (`source_id`, `ordinal`, `frame`, `sink`, `level`).
+The other 10 are dead weight: ~100 B/row vs the ~24 B the operands need, and the
+empty `path`/`dst_path`/`header` columns still carry `n×8` offset buffers. On a
+33 M-member plan that's a multi-GB stream — and it now *travels to nodes*
+(`docs/DISTRIBUTED.md`), so compactness matters. Three ways to shrink it:
+
+1. **Nullable columns.** Mark the unused columns null: an all-null column
+   collapses to a validity bitmap (or omits its buffers entirely), and the
+   empty-string offset buffers disappear. Arrow IPC also allows per-buffer
+   LZ4/ZSTD. *Caveat:* pupyarrow and `parse_cmd_batch` assume every column's
+   buffers are fully materialized at fixed indices, so nulls/compression need
+   the reader to handle validity and absent buffers — real work, and it keeps
+   the wide word.
+2. **Narrow per-opcode schema** *(recommended).* Give each opcode class its own
+   compact batch schema — `OP_COMPRESS` = `{source_id, ordinal, frame, sink,
+   level}` — and make the command stream a sequence of *typed, opcode-homogeneous
+   batches* (the planner already groups by opcode/epoch). This is how real ISAs
+   use several instruction formats rather than one padded word. It needs a small
+   per-schema reader (the `ZPLAN` reader deferred in stage 2) but no validity
+   machinery, and it's the truest encoding.
+3. **Just compress on the wire.** zstd the plan stream for transfer — the
+   constant/zero columns vanish under general compression. Cheap and immediate,
+   but the *parse* cost (materializing full buffers in C) is unchanged.
+
+So: **yes, nulls work**, but narrowing the word per opcode is simpler, faster to
+parse, and the honest ISA answer; nulls are the fallback if we ever want to keep
+one universal word. Stage 2 deliberately took the wide word (reusing
+`parse_cmd_batch`) to land the lowering with zero new C; the narrow `ZPLAN`
+schema is the follow-up that makes it compact.
+
 ## 9. Instruction granularity: fuse the architecture, pipeline the µarch
 
 Should the data-path instruction split into separate `LOAD` (fetch/decompress
