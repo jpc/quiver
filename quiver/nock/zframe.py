@@ -601,14 +601,19 @@ def _write_plan(plan_df, nsrc, path, nsink=None):
     sink→parent_row — and zexec reads it with the normal command reader. Returns
     the sink count (nsink and resume offsets are execution params, passed on
     argv, not in the stream)."""
+    import zstandard as zstd
     from ..wire import cmd_df, _df_cols, CMD_SCHEMA, OP_COMPRESS
     from ..pupyarrow.writer import StreamWriter
     d = plan_df.sort(["source_id", "ordinal"])
     if nsink is None:
         nsink = int(d["sink"].max()) + 1 if d.height else 1
     n = d.height
-    with open(path, "wb") as f:
-        w = StreamWriter(f, CMD_SCHEMA)
+    # whole-stream zstd: the command word is wide but sparse (an OP_COMPRESS row
+    # uses 5 of 15 columns), so the constant/zero buffers collapse across the
+    # stream — far better than per-buffer compression. zexec streams-decompresses.
+    with open(path, "wb") as f, \
+            zstd.ZstdCompressor(level=3).stream_writer(f, closefd=False) as zf:
+        w = StreamWriter(zf, CMD_SCHEMA)
         if n:
             cmds = cmd_df(n).with_columns(
                 pl.lit(OP_COMPRESS, dtype=pl.UInt8).alias("opcode"),

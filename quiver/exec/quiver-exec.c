@@ -1394,29 +1394,35 @@ static struct { int nsrc, nsink; int64_t *start; int32_t *counts;
                 PlanEnt **ents; } P;
 
 static int plan_load(const char *path, int nsink, const char *starts) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("plan"); return -1; }
+    /* The plan is a zstd-compressed OP_COMPRESS command stream — whole-stream
+     * compression, so the sparse constant columns collapse together. Decompress
+     * on the fly with the same streaming reader zpack uses; parse the IPC
+     * messages out of it exactly as the exec loop does. */
+    Zsrc z;
+    if (zsrc_open(&z, path)) { perror("plan"); return -1; }
     uint8_t *meta = NULL, *body = NULL; size_t mcap = 0, bcap = 0;
     PlanEnt *ents = NULL; int32_t *srcs = NULL; int64_t ne = 0, cap = 0;
     int maxsrc = -1;
-    for (;;) {                                  /* mirror the exec read loop */
+    for (;;) {
         uint32_t hdr[2];
-        int r = read_full(fd, hdr, 8);
-        if (r == 1 || (r == 0 && hdr[1] == 0)) break;
-        if (r < 0 || hdr[0] != 0xFFFFFFFFu) { close(fd); return -1; }
+        if (zsrc_read(&z, (uint8_t *)hdr, 8) < 8) break;   /* EOF */
+        if (hdr[0] != 0xFFFFFFFFu) { zsrc_close(&z); return -1; }
+        if (hdr[1] == 0) break;                            /* EOS */
         if (hdr[1] > mcap) meta = realloc(meta, mcap = hdr[1]);
-        if (read_full(fd, meta, hdr[1])) { close(fd); return -1; }
+        if (zsrc_read(&z, meta, hdr[1]) < hdr[1]) { zsrc_close(&z); return -1; }
         int64_t rt = fb_root(meta);
         int64_t blp = fb_field(meta, rt, 3);
         int64_t blen = blp >= 0 ? fb_i64(meta, blp) : 0;
         if (blen > 0) {
             if ((size_t)blen > bcap) body = realloc(body, bcap = (size_t)blen);
-            if (read_full(fd, body, (size_t)blen)) { close(fd); return -1; }
+            if (zsrc_read(&z, body, (size_t)blen) < (size_t)blen) {
+                zsrc_close(&z); return -1;
+            }
         }
         int64_t htp = fb_field(meta, rt, 1);
         if (htp >= 0 && meta[htp] == 1) continue;          /* Schema msg */
         CmdBatch cb;
-        if (parse_cmd_batch(meta, body, &cb)) { close(fd); return -1; }
+        if (parse_cmd_batch(meta, body, &cb)) { zsrc_close(&z); return -1; }
         int64_t n = cb.n_rows;
         if (ne + n > cap) {
             cap = (ne + n) * 2;
@@ -1434,7 +1440,7 @@ static int plan_load(const char *path, int nsink, const char *starts) {
         }
         free(cb.arena); free(cb.path); free(cb.dst);
     }
-    free(meta); free(body); close(fd);
+    free(meta); free(body); zsrc_close(&z);
     /* rows arrive sorted by (source_id, ordinal), so each source is contiguous */
     P.nsrc = maxsrc + 1; P.nsink = nsink;
     int ns = P.nsrc > 0 ? P.nsrc : 1;
