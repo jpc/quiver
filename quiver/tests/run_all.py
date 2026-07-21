@@ -522,6 +522,61 @@ def test_zframe_plan(tmp):
     assert (idx2["size"] >= 400).all() and r2.members == idx2.height
     ok("zframe plan seam: scan → Polars glob/size filter → exec (kept only)")
 
+
+def test_zframe_reshard(tmp):
+    """Single-pass fan-out: the plan tags each member with a sink; zexec
+    writes N self-contained tar.zstd shards from one decompress pass."""
+    try:
+        import zstandard as zstd  # noqa
+    except ImportError:
+        return
+    import io, tarfile, glob, subprocess as sp
+    import polars as pl
+    from quiver.nock import zframe
+
+    def mk_zst(path, pfx, n):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tf:
+            for i in range(n):
+                b = (f"{pfx}-{i}-").encode() * (3 + i)
+                ti = tarfile.TarInfo(f"{pfx}/f{i:04d}.dat"); ti.size = len(b)
+                ti.mode = 0o644; tf.addfile(ti, io.BytesIO(b))
+        with open(path, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
+
+    mk_zst(str(tmp/"a.tar.zstd"), "a", 120)
+    mk_zst(str(tmp/"b.tar.zstd"), "b", 80)
+    srcs = [str(tmp/"a.tar.zstd"), str(tmp/"b.tar.zstd")]
+
+    # 3-way hash split in one pass
+    N = 3
+    res = zframe.recompress_c(srcs, str(tmp/"h.tar.zstd"), level=4,
+                              batch_bytes=16 << 10, shard_by="hash", shards=N)
+    assert res.members == 200
+    shards = sorted(glob.glob(str(tmp/"h.shard*.tar.zstd")))
+    assert len(shards) == N, shards
+    seen, total = set(), 0
+    for k, sh in enumerate(shards):
+        idx = zframe.read_index(sh)
+        n = sp.run(f"zstd -dc {sh} | tar t | wc -l", shell=True,
+                   capture_output=True, text=True).stdout.strip()
+        assert int(n) == idx.height          # each shard a clean tar.zstd
+        hk = pl.DataFrame({"p": idx["path"].to_list()}).with_columns(
+            (pl.col("p").hash() % N).alias("h"))
+        assert (hk["h"] == k).all()           # every member routed to its shard
+        seen |= set(idx["path"].to_list()); total += idx.height
+    assert len(seen) == total == 200          # disjoint and complete
+
+    # attribute split (by source) via a Polars expression sink
+    res2 = zframe.recompress_c(srcs, str(tmp/"s.tar.zstd"), level=4,
+                               batch_bytes=16 << 10,
+                               shard_by=pl.col("source_id"))
+    a = zframe.read_index(str(tmp/"s.shard0.tar.zstd"))
+    b = zframe.read_index(str(tmp/"s.shard1.tar.zstd"))
+    assert a["path"].str.starts_with("a/").all()
+    assert b["path"].str.starts_with("b/").all()
+    ok("zframe reshard: one pass → N byte-exact shards (hash + attribute)")
+
 def test_multi(tmp):
     # distributed cp/rm across two LOCAL executors: exercises the Polars
     # subtree partition, the fan-out/barrier, and the root-op handling
@@ -582,7 +637,7 @@ def main():
               test_cksum, test_s3, test_wal_resume, test_wal_retry,
               test_refcount_rm, test_pushdown, test_wal_failures_view,
               test_streaming, test_ssh, test_multi, test_zframe, test_zframe_c,
-              test_zframe_plan,
+              test_zframe_plan, test_zframe_reshard,
               test_cksum_parallel,
               test_p1_barrier):
         t(tmp)

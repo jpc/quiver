@@ -39,6 +39,9 @@ def main(argv=None):
                     help="drop members matching PAT (repeatable)")
     sp.add_argument("--min-size", type=int, default=0,
                     help="drop members smaller than N bytes")
+    sp.add_argument("--shards", type=int, default=None, metavar="N",
+                    help="fan out into N shards by path hash, one pass; "
+                         "out is templated ('{shard}'/'%%d', else .shardN)")
     sp.add_argument("--limit", type=int, default=None,
                     help="max members per input (sampling; --py only)")
     sp = sub.add_parser("serve", help="browse a zframe archive over HTTP")
@@ -93,7 +96,9 @@ def main(argv=None):
                                       level=a.level, readers=a.readers,
                                       compressors=a.workers, progress=_prog,
                                       include=a.glob, exclude=a.exclude,
-                                      min_size=a.min_size)
+                                      min_size=a.min_size,
+                                      shard_by="hash" if a.shards else None,
+                                      shards=a.shards)
         sys.stderr.write("\n")
         print(f"{res.members} members, {res.frames} frames -> {a.out}")
     elif a.cmd == "serve":

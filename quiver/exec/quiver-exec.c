@@ -1370,22 +1370,27 @@ typedef struct { char *path; int64_t size, mtime, in_off; int32_t mode, uid, gid
  * append (zpack fused mode). zexec sets it from the plan so a frame keeps its
  * planned id regardless of which compressor finishes first. */
 typedef struct ZJob { struct ZJob *next; uint8_t *buf; int64_t len;
-                      ZRec *recs; int nrecs; int64_t lframe; } ZJob;
+                      ZRec *recs; int nrecs; int64_t lframe; int sink; } ZJob;
 
 static struct {
     const char **srcs; int nsrc; _Atomic int src_i;
     ZJob *qh, *qt; int qn, readers_done, nreaders_left;
     pthread_mutex_t qmu; pthread_cond_t qcv;
-    int afd; int level; int64_t batch;
-    pthread_mutex_t amu; int64_t append_off, frame_idx;
+    int level; int64_t batch;
+    pthread_mutex_t amu; int64_t frame_idx;
+    int nsink; int *fd; int64_t *aoff;    /* per-sink output fd + append cursor */
+    const char *pattern;                  /* out path template with %d for sink */
     pthread_mutex_t omu;
 } Z;
 
-/* plan (zexec): per-source ordinal→frame keep-list, loaded from a file the
- * Polars planner writes. Layout: [i32 nsrc][i32 counts[nsrc]][ents...] where
- * ents is per-source arrays of (i32 ordinal, i32 frame) sorted by ordinal. */
-typedef struct { int32_t ordinal, frame; } PlanEnt;
-static struct { int nsrc; int32_t *counts; PlanEnt **ents; uint8_t *raw; } P;
+/* plan (zexec): per-source ordinal→(frame,sink) keep-list, loaded from a file
+ * the Polars planner writes. Layout: [i32 nsrc][i32 nsink][i32 counts[nsrc]]
+ * [ents...] where ents is per-source arrays of (i32 ordinal, i32 frame,
+ * i32 sink) sorted by ordinal. sink routes a member's frame to one of nsink
+ * outputs — attribute-based resharding decided entirely in Polars. */
+typedef struct { int32_t ordinal, frame, sink; } PlanEnt;
+static struct { int nsrc, nsink; int32_t *counts; PlanEnt **ents;
+                uint8_t *raw; } P;
 
 static int plan_load(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -1396,6 +1401,7 @@ static int plan_load(const char *path) {
     close(fd);
     uint8_t *p = P.raw;
     P.nsrc = *(int32_t *)p; p += 4;
+    P.nsink = *(int32_t *)p; p += 4;
     P.counts = (int32_t *)p; p += 4 * (size_t)P.nsrc;
     P.ents = malloc(sizeof(PlanEnt *) * P.nsrc);
     for (int s = 0; s < P.nsrc; s++) {
@@ -1405,16 +1411,17 @@ static int plan_load(const char *path) {
     return 0;
 }
 
-static void z_emit(ZRec *r, int32_t frame, int64_t coff, int64_t clen) {
+static void z_emit(ZRec *r, int32_t frame, int64_t coff, int64_t clen,
+                   int32_t sink) {
     uint16_t plen = (uint16_t)strlen(r->path);
-    /* one record: [u16 plen][path][i64 size][i64 mtime][i32 mode]
-     *             [i32 uid][i32 gid][i32 frame][i64 coff][i64 clen][i64 in_off] */
+    /* one record: [u16 plen][path][i64 size][i64 mtime][i32 mode][i32 uid]
+     *   [i32 gid][i32 frame][i64 coff][i64 clen][i64 in_off][i32 sink] */
     fwrite(&plen, 2, 1, stdout); fwrite(r->path, plen, 1, stdout);
     fwrite(&r->size, 8, 1, stdout); fwrite(&r->mtime, 8, 1, stdout);
     fwrite(&r->mode, 4, 1, stdout); fwrite(&r->uid, 4, 1, stdout);
     fwrite(&r->gid, 4, 1, stdout); fwrite(&frame, 4, 1, stdout);
     fwrite(&coff, 8, 1, stdout); fwrite(&clen, 8, 1, stdout);
-    fwrite(&r->in_off, 8, 1, stdout);
+    fwrite(&r->in_off, 8, 1, stdout); fwrite(&sink, 4, 1, stdout);
 }
 
 static void z_push(ZJob *j) {
@@ -1533,7 +1540,7 @@ static void *z_reader(void *arg) {
             if (blen >= Z.batch) {
                 ZJob *j = malloc(sizeof *j);
                 j->buf = buf; j->len = blen; j->recs = recs; j->nrecs = nrec;
-                j->lframe = -1;
+                j->lframe = -1; j->sink = 0;
                 z_push(j);
                 bcap = (size_t)Z.batch + (4 << 20);
                 buf = malloc(bcap); blen = 0;
@@ -1543,7 +1550,7 @@ static void *z_reader(void *arg) {
         if (blen) {                                    /* source's final frame */
             ZJob *j = malloc(sizeof *j);
             j->buf = buf; j->len = blen; j->recs = recs; j->nrecs = nrec;
-            j->lframe = -1;
+            j->lframe = -1; j->sink = 0;
             z_push(j);
         } else { free(buf); free(recs); }
         zsrc_close(&z);
@@ -1566,17 +1573,23 @@ static void *z_compressor(void *arg) {
         uint8_t *comp = malloc(bound);
         size_t clen = ZSTD_compressCCtx(cc, comp, bound, j->buf,
                                         (size_t)j->len, Z.level);
+        int sink = j->sink;
         pthread_mutex_lock(&Z.amu);
-        int64_t coff = Z.append_off;
+        if (Z.fd[sink] < 0) {                  /* lazy-open this sink's output */
+            char path[4096];
+            snprintf(path, sizeof path, Z.pattern, sink);
+            Z.fd[sink] = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (Z.fd[sink] < 0) perror("sink");
+        }
+        int64_t coff = Z.aoff[sink];
         int64_t fidx = (j->lframe >= 0) ? j->lframe : Z.frame_idx;
-        if (j->lframe < 0) Z.frame_idx++;
-        else Z.frame_idx++;                    /* count physical frames either way */
-        if (pwrite(Z.afd, comp, clen, coff) < 0) perror("pwrite");
-        Z.append_off += (int64_t)clen;
+        Z.frame_idx++;                         /* count physical frames written */
+        if (pwrite(Z.fd[sink], comp, clen, coff) < 0) perror("pwrite");
+        Z.aoff[sink] += (int64_t)clen;
         pthread_mutex_unlock(&Z.amu);
         pthread_mutex_lock(&Z.omu);
         for (int r = 0; r < j->nrecs; r++)
-            z_emit(&j->recs[r], (int32_t)fidx, coff, (int64_t)clen);
+            z_emit(&j->recs[r], (int32_t)fidx, coff, (int64_t)clen, sink);
         pthread_mutex_unlock(&Z.omu);
         for (int r = 0; r < j->nrecs; r++) free(j->recs[r].path);
         free(comp); free(j->buf); free(j->recs); free(j);
@@ -1592,8 +1605,10 @@ static int run_zpack(const char **srcs, int nsrc, const char *out,
     Z.nreaders_left = readers;
     pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
     pthread_mutex_init(&Z.amu, NULL); pthread_mutex_init(&Z.omu, NULL);
-    Z.afd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (Z.afd < 0) { perror("output"); return 2; }
+    Z.nsink = 1;                               /* single output, preopened */
+    Z.fd = malloc(sizeof(int)); Z.aoff = calloc(1, sizeof(int64_t));
+    Z.fd[0] = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (Z.fd[0] < 0) { perror("output"); return 2; }
     pthread_t rt[64], ct[128];
     if (readers > 64) readers = 64;
     if (compressors > 128) compressors = 128;
@@ -1604,9 +1619,9 @@ static int run_zpack(const char **srcs, int nsrc, const char *out,
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
     for (int i = 0; i < compressors; i++) pthread_join(ct[i], NULL);
     fflush(stdout);
-    close(Z.afd);
+    close(Z.fd[0]);
     fprintf(stderr, "zpack: %ld frames, %ld bytes\n",
-            (long)Z.frame_idx, (long)Z.append_off);
+            (long)Z.frame_idx, (long)Z.aoff[0]);
     return 0;
 }
 
@@ -1725,9 +1740,19 @@ static void *z_exec_reader(void *arg) {
         if (zsrc_open(&z, Z.srcs[si])) continue;
         PlanEnt *pp = (si < P.nsrc) ? P.ents[si] : NULL;
         PlanEnt *pe = pp ? pp + P.counts[si] : NULL;
-        size_t bcap = (size_t)Z.batch + (4 << 20);
-        uint8_t *buf = malloc(bcap); int64_t blen = 0, cur_lframe = -1;
-        int rcap = 8192, nrec = 0; ZRec *recs = malloc(sizeof(ZRec) * rcap);
+        /* one open frame buffer per sink — a source's members interleave
+         * sinks in stream order, so each sink accumulates independently and
+         * flushes at its own planned-frame boundary. Lazily allocated so a
+         * source that touches few sinks costs little. */
+        int NS = Z.nsink;
+        uint8_t **buf = calloc(NS, sizeof *buf);
+        int64_t *blen = calloc(NS, sizeof *blen);
+        size_t  *bcap = calloc(NS, sizeof *bcap);
+        int64_t *curf = malloc(NS * sizeof *curf);
+        ZRec   **recs = calloc(NS, sizeof *recs);
+        int     *nrec = calloc(NS, sizeof *nrec);
+        int     *rcap = calloc(NS, sizeof *rcap);
+        for (int k = 0; k < NS; k++) curf[k] = -1;
         size_t mcap = 1 << 20; uint8_t *mbuf = malloc(mcap); int64_t mlen = 0;
         char pax_path[4096], gnu[4096];
         int has_pax = 0, has_gnu = 0; int64_t pax_size = -1;
@@ -1779,45 +1804,59 @@ static void *z_exec_reader(void *arg) {
             zsrc_read(&z, mbuf + mlen + 512, rbl);
             mlen += 512 + rbl;
             int isfile = (typ == '0' || typ == 0);
-            int keep = 0; int64_t lframe = -1;
+            int keep = 0; int64_t lframe = -1; int sk = 0;
             if (isfile) {
                 if (pp && pp < pe && pp->ordinal == ordinal) {
-                    keep = 1; lframe = pp->frame; pp++;
+                    keep = 1; lframe = pp->frame; sk = pp->sink; pp++;
                 }
                 ordinal++;
             }
             if (keep) {
-                if (blen > 0 && lframe != cur_lframe) {      /* frame boundary */
+                if (!buf[sk]) {                    /* lazy-alloc sink frame buf */
+                    bcap[sk] = (size_t)Z.batch + (4 << 20);
+                    buf[sk] = malloc(bcap[sk]);
+                    rcap[sk] = 8192; recs[sk] = malloc(sizeof(ZRec) * rcap[sk]);
+                }
+                if (blen[sk] > 0 && lframe != curf[sk]) {    /* frame boundary */
                     ZJob *j = malloc(sizeof *j);
-                    j->buf = buf; j->len = blen; j->recs = recs;
-                    j->nrecs = nrec; j->lframe = cur_lframe;
+                    j->buf = buf[sk]; j->len = blen[sk]; j->recs = recs[sk];
+                    j->nrecs = nrec[sk]; j->lframe = curf[sk]; j->sink = sk;
                     z_push(j);
-                    bcap = (size_t)Z.batch + (4 << 20);
-                    buf = malloc(bcap); blen = 0;
-                    rcap = 8192; nrec = 0; recs = malloc(sizeof(ZRec) * rcap);
+                    bcap[sk] = (size_t)Z.batch + (4 << 20);
+                    buf[sk] = malloc(bcap[sk]); blen[sk] = 0;
+                    rcap[sk] = 8192; nrec[sk] = 0;
+                    recs[sk] = malloc(sizeof(ZRec) * rcap[sk]);
                 }
-                cur_lframe = lframe;
-                if (blen + mlen > (int64_t)bcap) {
-                    bcap = (blen + mlen) * 2; buf = realloc(buf, bcap);
+                curf[sk] = lframe;
+                if (blen[sk] + mlen > (int64_t)bcap[sk]) {
+                    bcap[sk] = (blen[sk] + mlen) * 2;
+                    buf[sk] = realloc(buf[sk], bcap[sk]);
                 }
-                int64_t body_off = blen + hoff + 512;
-                memcpy(buf + blen, mbuf, mlen); blen += mlen;
-                if (nrec >= rcap) { rcap *= 2; recs = realloc(recs, sizeof(ZRec)*rcap); }
-                recs[nrec].path = strdup(name); recs[nrec].size = rsize;
-                recs[nrec].mode = zoctal(hdr + 100, 8);
-                recs[nrec].mtime = zoctal(hdr + 136, 12) * 1000000000LL;
-                recs[nrec].uid = zoctal(hdr + 108, 8);
-                recs[nrec].gid = zoctal(hdr + 116, 8);
-                recs[nrec].in_off = body_off; nrec++;
+                int64_t body_off = blen[sk] + hoff + 512;
+                memcpy(buf[sk] + blen[sk], mbuf, mlen); blen[sk] += mlen;
+                if (nrec[sk] >= rcap[sk]) {
+                    rcap[sk] *= 2;
+                    recs[sk] = realloc(recs[sk], sizeof(ZRec) * rcap[sk]);
+                }
+                ZRec *rr = &recs[sk][nrec[sk]];
+                rr->path = strdup(name); rr->size = rsize;
+                rr->mode = zoctal(hdr + 100, 8);
+                rr->mtime = zoctal(hdr + 136, 12) * 1000000000LL;
+                rr->uid = zoctal(hdr + 108, 8); rr->gid = zoctal(hdr + 116, 8);
+                rr->in_off = body_off; nrec[sk]++;
             }
             mlen = 0; has_pax = 0; has_gnu = 0; pax_size = -1;
         }
-        if (blen) {
-            ZJob *j = malloc(sizeof *j);
-            j->buf = buf; j->len = blen; j->recs = recs;
-            j->nrecs = nrec; j->lframe = cur_lframe;
-            z_push(j);
-        } else { free(buf); free(recs); }
+        for (int k = 0; k < NS; k++) {             /* flush each sink's tail */
+            if (buf[k] && blen[k] > 0) {
+                ZJob *j = malloc(sizeof *j);
+                j->buf = buf[k]; j->len = blen[k]; j->recs = recs[k];
+                j->nrecs = nrec[k]; j->lframe = curf[k]; j->sink = k;
+                z_push(j);
+            } else { free(buf[k]); free(recs[k]); }
+        }
+        free(buf); free(blen); free(bcap); free(curf);
+        free(recs); free(nrec); free(rcap);
         free(mbuf); zsrc_close(&z);
     }
     pthread_mutex_lock(&Z.qmu);
@@ -1828,15 +1867,19 @@ static void *z_exec_reader(void *arg) {
 }
 
 static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
-                     const char *out, int level, int readers, int compressors) {
+                     const char *pattern, int level, int readers,
+                     int compressors) {
     memset(&Z, 0, sizeof Z);
     Z.srcs = srcs; Z.nsrc = nsrc; Z.level = level; Z.batch = 16 << 20;
     Z.nreaders_left = readers;
     if (plan_load(plan_path)) return 2;
     pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
     pthread_mutex_init(&Z.amu, NULL); pthread_mutex_init(&Z.omu, NULL);
-    Z.afd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (Z.afd < 0) { perror("output"); return 2; }
+    Z.nsink = P.nsink < 1 ? 1 : P.nsink;
+    Z.pattern = pattern;                       /* %d → sink; each opened lazily */
+    Z.fd = malloc(sizeof(int) * Z.nsink);
+    Z.aoff = calloc(Z.nsink, sizeof(int64_t));
+    for (int i = 0; i < Z.nsink; i++) Z.fd[i] = -1;
     pthread_t rt[64], ct[128];
     if (readers > 64) readers = 64;
     if (compressors > 128) compressors = 128;
@@ -1847,9 +1890,12 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
     for (int i = 0; i < compressors; i++) pthread_join(ct[i], NULL);
     fflush(stdout);
-    close(Z.afd);
-    fprintf(stderr, "zexec: %ld frames, %ld bytes\n",
-            (long)Z.frame_idx, (long)Z.append_off);
+    int64_t total = 0;
+    for (int i = 0; i < Z.nsink; i++) {
+        if (Z.fd[i] >= 0) { total += Z.aoff[i]; close(Z.fd[i]); }
+    }
+    fprintf(stderr, "zexec: %ld frames, %d sinks, %ld bytes\n",
+            (long)Z.frame_idx, Z.nsink, (long)total);
     return 0;
 }
 

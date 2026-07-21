@@ -420,14 +420,21 @@ def _write_footer(out_path: str, ftmp, force_sidecar: bool) -> None:
             side.write(trailer)
 
 
-def _ingest_footer(f, out_path, force_sidecar, progress, progress_every,
+def _ingest_footer(f, sink_path, force_sidecar, progress, progress_every,
                    cin_total):
     """Read the per-member footer records streamed by zpack/zexec (identical
-    format) and write the footer. Returns (members, frames)."""
+    60B-tail format, sink-tagged) and write one footer per sink. Returns
+    (members, frames, sinks)."""
     import time
-    rec = struct.Struct("<qqiiiiqqq")           # 56B fixed tail per member
-    ftmp = tempfile.TemporaryFile()
-    fw = _FooterStream(ftmp)
+    rec = struct.Struct("<qqiiiiqqqi")          # 60B tail: adds i32 sink
+    footers = {}                                # sink -> (ftmp, _FooterStream)
+
+    def fw_for(sink):
+        if sink not in footers:
+            ft = tempfile.TemporaryFile()
+            footers[sink] = (ft, _FooterStream(ft))
+        return footers[sink][1]
+
     buf = b""
     frames = members = 0
     t0 = last = time.time()
@@ -441,27 +448,30 @@ def _ingest_footer(f, out_path, force_sidecar, progress, progress_every,
             if i + 2 > n:
                 break
             plen = buf[i] | (buf[i + 1] << 8)
-            if i + 2 + plen + 56 > n:
+            if i + 2 + plen + 60 > n:
                 break
             path = buf[i + 2:i + 2 + plen].decode("utf-8", "surrogateescape")
-            (size, mtime, mode, uid, gid, frame, coff, clen, in_off) = \
+            (size, mtime, mode, uid, gid, frame, coff, clen, in_off, sink) = \
                 rec.unpack_from(buf, i + 2 + plen)
-            fw.add(path, size, mode, mtime, uid, gid, frame, coff, clen, in_off)
+            fw_for(sink).add(path, size, mode, mtime, uid, gid,
+                             frame, coff, clen, in_off)
             members += 1
             if frame + 1 > frames:
                 frames = frame + 1
-            i += 2 + plen + 56
+            i += 2 + plen + 60
         buf = buf[i:]
         now = time.time()
         if progress and now - last >= progress_every:
             last = now
-            cout = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+            cout = sum(os.path.getsize(sink_path(s)) for s in footers
+                       if os.path.exists(sink_path(s)))
             progress({"members": members, "frames": frames, "cout": cout,
                       "cin_total": cin_total, "elapsed": now - t0})
-    fw.close()
-    _write_footer(out_path, ftmp, force_sidecar)
-    ftmp.close()
-    return members, frames
+    for sink, (ft, fw) in footers.items():
+        fw.close()
+        _write_footer(sink_path(sink), ft, force_sidecar)
+        ft.close()
+    return members, frames, sorted(footers)
 
 
 def _zscan(inputs, readers):
@@ -545,11 +555,15 @@ def _globs_re(globs):
 
 
 def plan_frames(df, include=None, exclude=None, min_size=0,
-                batch_bytes=16 << 20):
-    """The plan seam: given scanned member metadata, apply globs/size filters
-    and assign surviving members to frames (greedy fill by raw tar size,
-    within-source stream order). Returns the plan with a global `frame` id.
-    This is where arbitrary Polars policy — filters, grouping — now lives."""
+                batch_bytes=16 << 20, shard_by=None, shards=None):
+    """The plan seam: given scanned member metadata, apply globs/size filters,
+    optionally assign each member to a `sink` (attribute-based resharding),
+    and pack surviving members into frames (greedy fill by raw tar size,
+    within-source stream order, never spanning a source or sink). Returns the
+    plan with global `frame` and `sink`. Arbitrary Polars policy lives here.
+
+    shard_by: a pl.Expr over the member columns yielding a sink id, or the
+    string "hash" (with `shards=N`) for an even N-way split by path."""
     d = df.sort(["source_id", "ordinal"])
     if min_size:
         d = d.filter(pl.col("size") >= min_size)
@@ -557,71 +571,109 @@ def plan_frames(df, include=None, exclude=None, min_size=0,
         d = d.filter(pl.col("path").str.contains(_globs_re(include)))
     if exclude:
         d = d.filter(~pl.col("path").str.contains(_globs_re(exclude)))
+    # sink assignment (default: everything to sink 0)
+    if shard_by is None:
+        d = d.with_columns(pl.lit(0, dtype=pl.Int32).alias("sink"))
+    else:
+        if isinstance(shard_by, str) and shard_by == "hash":
+            if not shards:
+                raise ValueError("shards=N required for hash sharding")
+            expr = pl.col("path").hash() % shards
+        elif isinstance(shard_by, pl.Expr):
+            expr = shard_by
+        else:
+            raise TypeError("shard_by must be a pl.Expr or 'hash'")
+        d = d.with_columns(expr.cast(pl.Int32).alias("sink"))
     # raw tar footprint of each member: 512 header + padded body
     d = d.with_columns(
         (512 + ((pl.col("size") + 511) // 512) * 512).alias("raw"))
-    # greedy per-source frame fill: a member starts frame (cum_start // batch)
+    # greedy fill within each (source, sink) block, in ordinal order
     d = d.with_columns(
-        ((pl.col("raw").cum_sum().over("source_id") - pl.col("raw"))
+        ((pl.col("raw").cum_sum().over(["source_id", "sink"]) - pl.col("raw"))
          // batch_bytes).alias("lframe"))
-    # make frame ids globally unique by offsetting each source's block
-    per = (d.group_by("source_id").agg((pl.col("lframe").max() + 1).alias("nf"))
-           .sort("source_id"))
+    # globally unique frame ids by offsetting each (source, sink) block
+    per = (d.group_by(["source_id", "sink"])
+           .agg((pl.col("lframe").max() + 1).alias("nf"))
+           .sort(["source_id", "sink"]))
     per = per.with_columns((pl.col("nf").cum_sum() - pl.col("nf")).alias("base"))
-    d = d.join(per.select(["source_id", "base"]), on="source_id", how="left")
+    d = d.join(per.select(["source_id", "sink", "base"]),
+               on=["source_id", "sink"], how="left")
     return d.with_columns(
         (pl.col("lframe") + pl.col("base")).cast(pl.Int32).alias("frame")
     ).sort(["source_id", "ordinal"])
 
 
 def _write_plan(plan_df, nsrc, path):
-    """Plan file for zexec: [i32 nsrc][i32 counts[nsrc]][ents], ents being
-    per-source (i32 ordinal, i32 frame) arrays sorted by ordinal in source
-    order — C merge-joins it against the re-parsed stream."""
+    """Plan file for zexec: [i32 nsrc][i32 nsink][i32 counts[nsrc]][ents],
+    ents being per-source (i32 ordinal, i32 frame, i32 sink) sorted by ordinal
+    in source order — C merge-joins it against the re-parsed stream. Returns
+    the sink count."""
     import numpy as np
     d = plan_df.sort(["source_id", "ordinal"])
+    nsink = int(d["sink"].max()) + 1 if d.height else 1
     counts = [0] * nsrc
     for sid, c in d.group_by("source_id").agg(pl.len().alias("c")).iter_rows():
         counts[sid] = c
     ords = d["ordinal"].to_numpy().astype(np.int32)
     frames = d["frame"].to_numpy().astype(np.int32)
-    ent = np.empty(len(ords) * 2, dtype=np.int32)
-    ent[0::2] = ords
-    ent[1::2] = frames
+    sinks = d["sink"].to_numpy().astype(np.int32)
+    ent = np.empty(len(ords) * 3, dtype=np.int32)
+    ent[0::3] = ords
+    ent[1::3] = frames
+    ent[2::3] = sinks
     with open(path, "wb") as f:
-        f.write(struct.pack("<i", nsrc))
+        f.write(struct.pack("<ii", nsrc, nsink))
         f.write(np.array(counts, dtype=np.int32).tobytes())
         f.write(ent.tobytes())
+    return nsink
+
+
+def _shard_pattern(out_path):
+    """Turn an output path into a printf pattern with %d for the sink."""
+    if "%d" in out_path:
+        return out_path
+    if out_path.endswith(".tar.zstd"):
+        return out_path[:-len(".tar.zstd")] + ".shard%d.tar.zstd"
+    return out_path + ".shard%d"
 
 
 def recompress_c(inputs, out_path: str, level: int = 6,
                  batch_bytes: int = 16 << 20, readers: int = 8,
                  compressors: int | None = None, progress=None,
                  progress_every: float = 2.0, _force_sidecar: bool = False,
-                 include=None, exclude=None, min_size: int = 0) -> Result:
-    """The fold. With no filter, the fused `zpack` fast path decompresses,
-    parses, batches, compresses and appends all in C (option A). With any
-    glob/size filter, it splits into scan → Polars plan → exec (option B):
-    the plan seam where filters and frame policy live, at the cost of one
-    extra decompress-only pass (~3% of level-10 compress)."""
+                 include=None, exclude=None, min_size: int = 0,
+                 shard_by=None, shards=None) -> Result:
+    """The fold. With no filter or shard, the fused `zpack` fast path
+    decompresses, parses, batches, compresses and appends all in C (option A).
+    With any glob/size filter or a shard, it splits into scan → Polars plan →
+    exec (option B): the plan seam where filters, frame policy and sink
+    routing live, at the cost of one extra decompress-only pass (~3% of
+    level-10 compress). Sharding fans out to `out_path` templated with the
+    sink id ('{shard}'/'%d', else `.shardN` inserted) in a single pass —
+    each shard a self-contained tar.zstd (+ .nock)."""
     import subprocess
     from ..wire import EXE
     compressors = compressors or (os.cpu_count() or 8)
     cin_total = sum(os.path.getsize(p) for p in inputs)
+    planned = include or exclude or min_size or shard_by is not None
 
-    if include or exclude or min_size:                       # B: scan → plan → exec
+    if planned:                                             # B: scan → plan → exec
         df = _zscan(inputs, readers)
-        plan = plan_frames(df, include, exclude, min_size, batch_bytes)
+        plan = plan_frames(df, include, exclude, min_size, batch_bytes,
+                           shard_by, shards)
         with tempfile.NamedTemporaryFile(suffix=".plan", delete=False) as pf:
             plan_path = pf.name
-        _write_plan(plan, len(inputs), plan_path)
+        nsink = _write_plan(plan, len(inputs), plan_path)
+        pattern = _shard_pattern(out_path) if nsink > 1 else out_path
+        sink_path = ((lambda s: pattern % s) if nsink > 1
+                     else (lambda s: out_path))
         try:
             proc = subprocess.Popen(
-                [EXE, "zexec", plan_path, out_path, str(level),
+                [EXE, "zexec", plan_path, pattern, str(level),
                  str(readers), str(compressors), *inputs],
                 stdout=subprocess.PIPE, bufsize=1 << 22)
-            members, frames = _ingest_footer(
-                proc.stdout, out_path, _force_sidecar, progress,
+            members, frames, sinks = _ingest_footer(
+                proc.stdout, sink_path, _force_sidecar, progress,
                 progress_every, cin_total)
             if proc.wait() != 0:
                 raise RuntimeError(f"zexec exited {proc.returncode}")
@@ -633,8 +685,9 @@ def recompress_c(inputs, out_path: str, level: int = 6,
         [EXE, "zpack", out_path, str(level), str(batch_bytes),
          str(readers), str(compressors), *inputs],
         stdout=subprocess.PIPE, bufsize=1 << 22)
-    members, frames = _ingest_footer(proc.stdout, out_path, _force_sidecar,
-                                     progress, progress_every, cin_total)
+    members, frames, _ = _ingest_footer(
+        proc.stdout, lambda s: out_path, _force_sidecar,
+        progress, progress_every, cin_total)
     if proc.wait() != 0:
         raise RuntimeError(f"zpack exited {proc.returncode}")
     return Result(members=members, frames=frames)
