@@ -658,43 +658,80 @@ def _parse_s3(url):
     return bucket, key
 
 
+def _retry(fn, attempts=5, base=0.5):
+    """Retry a transient S3 op with exponential backoff."""
+    import time
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if i == attempts - 1:
+                raise
+            time.sleep(base * (2 ** i))
+
+
+def _make_submit(executor, sem):
+    """Submit an upload task bounded by `sem` in-flight slots — this is the
+    backpressure: when the cap is reached, submit() blocks, the sink stops
+    draining its FIFO, and C blocks writing that sink (per-sink lock, so the
+    others keep going). Memory is bounded to sem_size × part_size globally."""
+    def submit(fn):
+        sem.acquire()
+
+        def wrapped():
+            try:
+                return fn()
+            finally:
+                sem.release()
+        return executor.submit(wrapped)
+    return submit
+
+
 def _s3_upload_sink(client, bucket, key, fifo_path, footer_box, done_evt,
-                    part_size=8 << 20):
+                    submit, part_size=8 << 20, retries=5):
     """Stream one sink's frames from its FIFO straight into an S3 multipart
     upload; when the frames end, append the footer (an embedded skippable
-    frame, or a separate <key>.nock object for >4 GB) and complete. Runs off
-    C's own output — no local staging of the 2 TB body."""
-    mpu = client.create_multipart_upload(Bucket=bucket, Key=key)
+    frame, or a separate <key>.nock object for >4 GB) and complete. Parts are
+    uploaded through a bounded, retrying pool so reads and uploads overlap
+    without unbounded memory. No local staging of the body."""
+    mpu = _retry(lambda: client.create_multipart_upload(Bucket=bucket, Key=key),
+                 retries)
     uid = mpu["UploadId"]
-    parts, pnum, buf = [], 1, bytearray()
+    futures, pnum, buf = [], 1, bytearray()
 
-    def put_part(data):
-        nonlocal pnum
-        r = client.upload_part(Bucket=bucket, Key=key, UploadId=uid,
-                               PartNumber=pnum, Body=bytes(data))
-        parts.append({"ETag": r["ETag"], "PartNumber": pnum})
-        pnum += 1
+    def send(data, n):                                 # S3 assembles by number,
+        futures.append((n, submit(lambda: _retry(     # so out-of-order is fine
+            lambda: client.upload_part(
+                Bucket=bucket, Key=key, UploadId=uid,
+                PartNumber=n, Body=data), retries)["ETag"])))
     try:
         with open(fifo_path, "rb") as fr:              # blocks until C opens it
             while (chunk := fr.read(1 << 20)):
                 buf += chunk
                 while len(buf) >= part_size:           # non-last parts ≥ 5 MB
-                    put_part(buf[:part_size]); del buf[:part_size]
+                    send(bytes(buf[:part_size]), pnum); pnum += 1
+                    del buf[:part_size]
         done_evt.wait()                                # footer now available
         embed, sidecar = footer_box[0]
         if embed:
             buf += embed
         while len(buf) >= part_size:
-            put_part(buf[:part_size]); del buf[:part_size]
-        if buf or not parts:
-            put_part(buf)                              # final (any size) part
-        client.complete_multipart_upload(
+            send(bytes(buf[:part_size]), pnum); pnum += 1; del buf[:part_size]
+        if buf or not futures:
+            send(bytes(buf), pnum); pnum += 1          # final (any size) part
+        parts = [{"ETag": fut.result(), "PartNumber": n}
+                 for n, fut in sorted(futures)]
+        _retry(lambda: client.complete_multipart_upload(
             Bucket=bucket, Key=key, UploadId=uid,
-            MultipartUpload={"Parts": parts})
+            MultipartUpload={"Parts": parts}), retries)
         if sidecar is not None:
-            client.put_object(Bucket=bucket, Key=key + ".nock", Body=sidecar)
+            _retry(lambda: client.put_object(
+                Bucket=bucket, Key=key + ".nock", Body=sidecar), retries)
     except Exception:
-        client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=uid)
+        try:
+            client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=uid)
+        except Exception:
+            pass
         raise
 
 
@@ -707,9 +744,13 @@ def _recompress_s3(inputs, s3_url, level, batch_bytes, readers, compressors,
     import subprocess
     import threading
     import shutil
+    from concurrent.futures import ThreadPoolExecutor
     import boto3
     from ..wire import EXE
     bucket, key = _parse_s3(s3_url)
+    inflight = max(4, (compressors or 8) // 4)     # bounded parts in flight
+    executor = ThreadPoolExecutor(max_workers=inflight)
+    submit = _make_submit(executor, threading.Semaphore(inflight))
     planned = include or exclude or min_size or shard_by is not None
     tmpplan = None
     if planned:
@@ -735,7 +776,7 @@ def _recompress_s3(inputs, s3_url, level, batch_bytes, readers, compressors,
         os.mkfifo(fifopat % s)
         t = threading.Thread(target=_s3_upload_sink, daemon=True,
                              args=(client, bucket, sink_key(s), fifopat % s,
-                                   boxes[s], evts[s]))
+                                   boxes[s], evts[s], submit))
         t.start(); threads[s] = t
 
     def finalize(sink, ftmp):
@@ -760,6 +801,7 @@ def _recompress_s3(inputs, s3_url, level, batch_bytes, readers, compressors,
         if rc != 0:
             raise RuntimeError(f"exec exited {rc}")
     finally:
+        executor.shutdown(wait=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
         if tmpplan:
             os.unlink(tmpplan)
