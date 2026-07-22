@@ -1289,7 +1289,8 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
 
 def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                       frame_bytes=16 << 20, compressors=None, readers=None,
-                      force_sidecar=False, predicate=None):
+                      force_sidecar=False, predicate=None,
+                      shard_by=None, shards=None):
     """One-pass planned recompress via the `zstream` port (docs/ISA.md §5) — the
     last de-fork. C decompresses each source ONCE into a live buffer (a large
     `window`) and yields member metadata (ZMETA); this driver plans the window
@@ -1307,13 +1308,28 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     compressors = compressors or (os.cpu_count() or 8)
     readers = readers or min(24, len(inputs))          # one decode stream/source
 
-    # The PLAN only needs the per-member frame id — so it rides a NARROW,
-    # single-column ZPLAN schema (dep_group:i64), not the wide 15-column CMD
-    # word. Serializing the wide word cost ~16 ms/window at EVI size (the three
-    # empty var-length columns dominate); the 1-column form is ~85× cheaper
-    # (~0.2 ms). C's read_zplan copies the i64 values buffer straight out.
-    ZPLAN = [("dep_group", "i64")]
-    nsink = 1                                          # reshard fan-out (later)
+    # ONE instruction set for every mode. Each zstream mode — plain, filter,
+    # reshard, S3, WAL — reduces to two integers per member: (frame_id, sink).
+    # plain → sink 0, frame by span; filter → frame -1 drops; reshard → sink
+    # varies. So the PLAN is a NARROW 2-column ZPLAN reusing the CMD word's own
+    # field names (dep_group=frame, parent_row=sink) — a strict subset of the
+    # 15-column word. The full word serializes fine through Polars (~0.8 ms) but
+    # costs ~4 ms/window to CONSTRUCT (13 empty Series zstream never reads); the
+    # 2-column form is ~0.2 ms and never needs widening (level is per-run). C's
+    # read_zplan copies buffer[1]=frame and buffer[3]=sink straight out.
+    resharding = shard_by is not None
+    if resharding:
+        if not shards:
+            raise ValueError("shards=N (the sink count) is required to reshard")
+        out_path = _shard_pattern(out_path)
+        if isinstance(shard_by, str) and shard_by == "hash":
+            shard_by = pl.col("path").hash() % shards
+        elif not isinstance(shard_by, pl.Expr):
+            raise TypeError("shard_by must be a pl.Expr or 'hash'")
+    nsink = shards if resharding else 1
+    # injective packing stride for (sink, lframe) → key: any lframe in a window
+    # is < window_bytes/frame_bytes, so this bound never collides across sinks.
+    _sink_stride = window_bytes // max(1, frame_bytes) + 2
     r_comp, w_comp = os.pipe()
     argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(window_bytes),
             str(compressors), str(readers), str(nsink),
@@ -1374,15 +1390,39 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                 m = m.with_columns(_keep=predicate)
             else:
                 m = m.with_columns(_keep=pl.lit(True))
+            # sink assignment: reshard routes each member to a sink; otherwise
+            # everything lands in sink 0. A dropped member's sink is irrelevant.
+            if resharding:
+                m = m.with_columns(_sink=shard_by.cast(pl.Int64))
+            else:
+                m = m.with_columns(_sink=pl.lit(0, dtype=pl.Int64))
             kept_span = pl.when(pl.col("_keep")).then(pl.col("_sp")).otherwise(0)
             m = m.with_columns(_ks=kept_span)
-            m = m.with_columns(_eo=(pl.col("_ks").cum_sum() - pl.col("_ks")))
-            lframe = (pl.col("_eo") // frame_bytes).cast(pl.Int64)
+            # frames pack by cumulative KEPT span WITHIN each sink (a frame never
+            # spans sinks); _eo is that per-sink running byte offset. in_off is
+            # the member's offset within its frame's (per-sink) byte stream.
             m = m.with_columns(
-                _gf=pl.when(pl.col("_keep")).then(lframe + base).otherwise(-1))
+                _eo=(pl.col("_ks").cum_sum().over("_sink") - pl.col("_ks")))
+            lframe = (pl.col("_eo") // frame_bytes).cast(pl.Int64)
+            m = m.with_columns(_lf=lframe)
+            if resharding:
+                # dense per-window global frame id over distinct (sink, lframe):
+                # rank the packed key so ids stay contiguous fmin..fmax (the C
+                # reader allocates a per-window frame array of that span).
+                key = pl.when(pl.col("_keep")).then(
+                    pl.col("_sink") * _sink_stride + pl.col("_lf")).otherwise(None)
+                m = m.with_columns(
+                    _gf=pl.when(pl.col("_keep"))
+                          .then(key.rank("dense").cast(pl.Int64) - 1 + base)
+                          .otherwise(-1))
+            else:
+                m = m.with_columns(
+                    _gf=pl.when(pl.col("_keep")).then(pl.col("_lf") + base)
+                          .otherwise(-1))
             m = m.with_columns(_fs=pl.col("_eo").min().over("_gf"))  # frame start
             m = m.with_columns(
                 frame=pl.col("_gf").cast(pl.Int32),
+                sink=pl.col("_sink").cast(pl.Int32),
                 in_off=(pl.col("_eo") - pl.col("_fs") + pl.col("_sp")
                         - pl.col("_pb")))
             nframes = int(m.filter(pl.col("_gf") >= 0)["_gf"].n_unique())
@@ -1390,8 +1430,9 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             # exchange lock waiting on it); only THEN do bookkeeping. Store the
             # whole window frame by reference (O(1)) — the column select + concat
             # + join happen once at the end, off the serialized critical path.
-            # The PLAN is the narrow ZPLAN (dep_group only), written via Polars.
-            ipc.write_batch(proc.stdin, m.select(dep_group=pl.col("_gf")))
+            # The PLAN is the unified 2-column ZPLAN (frame, sink), via Polars.
+            ipc.write_batch(proc.stdin, m.select(
+                dep_group=pl.col("_gf"), parent_row=pl.col("_sink")))
             proc.stdin.flush()
             M.append(m)
             state["base"] = base + nframes
@@ -1439,20 +1480,30 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     # one vectorized pass, all off the critical path: select the footer member
     # columns from the accumulated windows, concat, and JOIN the completion
     # frames on frame id — links (coff,clen) to every member.
-    mcols = ["path", "size", "mode", "mtime_ns", "uid", "gid", "frame", "in_off"]
+    mcols = ["path", "size", "mode", "mtime_ns", "uid", "gid",
+             "frame", "sink", "in_off"]
     _mschema = dict(zip(mcols, (pl.String, pl.Int64, pl.Int32, pl.Int64,
-                                pl.Int32, pl.Int32, pl.Int32, pl.Int64)))
+                                pl.Int32, pl.Int32, pl.Int32, pl.Int32, pl.Int64)))
     members = (pl.concat([w.select(mcols) for w in M]) if M
                else pl.DataFrame(schema=_mschema))
     members = members.filter(pl.col("frame") >= 0)   # drop filtered-out members
     frames = (pl.concat(C) if C else pl.DataFrame(
         schema={"frame": pl.Int32, "frame_coff": pl.Int64,
                 "frame_clen": pl.Int64}))
-    footer = (members.join(frames, on="frame", how="left")
-                     .select([c for c, _ in _FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)                     # whole footer stream (Polars)
-    _write_footer(out_path, ftmp, force_sidecar); ftmp.close()
+    joined = members.join(frames, on="frame", how="left")
+    # One footer per output object. Reshard fans out to N sink files (each a
+    # self-contained nock archive, its frame_coff offsets relative to its own
+    # file); the plain/filter case is the single-sink special case of this.
+    total_members = 0
+    for s in (range(nsink) if resharding else [0]):
+        part = joined.filter(pl.col("sink") == s) if resharding else joined
+        footer = part.select([c for c, _ in _FOOTER_IPC])
+        ftmp = tempfile.TemporaryFile()
+        ipc.write_all(ftmp, footer)                 # whole footer stream (Polars)
+        _write_footer(out_path % s if resharding else out_path,
+                      ftmp, force_sidecar)
+        ftmp.close()
+        total_members += footer.height
 
     if instr_windows is not None:
         import json as _json
@@ -1464,7 +1515,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                                  for g in w["comp"].pop("gframes") if g in cr]
         _json.dump({"windows": instr_windows, "captured": len(instr_windows),
                     "total_windows": len(instr_windows)}, open(instr_path, "w"))
-    return Result(members=footer.height, frames=state["base"])
+    return Result(members=total_members, frames=state["base"])
 
 
 def unpack_distributed(path, dest, transports, predicate=None, engine="auto",

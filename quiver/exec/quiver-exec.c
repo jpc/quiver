@@ -2151,12 +2151,16 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
  * compress); the union/async pipeline (keep the sinks fed) is the follow-up.
  * Frames are contiguous member runs, so a frame is a byte slice of the buffer
  * (no gather; filter/reshard gather is the next increment). */
-/* Read one ZPLAN batch — a NARROW plan: a single i64 `dep_group` column (the
- * per-member frame id). The wide CMD word costs ~16 ms/window to serialize at
- * EVI size (the three empty var-length columns dominate); the plan only needs
- * dep_group, so this 1-column form is ~85× cheaper. An i64 array has 2 buffers
- * (validity[0], values[1]); copy the values into *dg. Returns 1 at EOS. */
+/* Read one ZPLAN batch — a NARROW plan: an i64 `dep_group` column (the
+ * per-member frame id) and, for reshard, an optional second i64 `sink` column
+ * (the per-member output sink). The wide CMD word costs ~16 ms/window to
+ * serialize at EVI size (the three empty var-length columns dominate); the plan
+ * only needs these, so this form is ~85× cheaper. Each i64 array has 2 buffers
+ * (validity, values): a 1-column batch has 2 buffers, a 2-column batch 4. Copy
+ * dep_group values (buffer 1); if the batch carries 4 buffers, also copy sink
+ * values (buffer 3) and set *has_sink. Returns 1 at EOS. */
 static int read_zplan(int64_t **dg, int64_t *dgcap, int64_t *n_out,
+                      int64_t **sk, int64_t *skcap, int *has_sink,
                       uint8_t **meta, size_t *mcap, uint8_t **body, size_t *bcap) {
     for (;;) {
         uint32_t hdr[2];
@@ -2177,12 +2181,22 @@ static int read_zplan(int64_t **dg, int64_t *dgcap, int64_t *n_out,
         int64_t rb = fb_offset_field(*meta, rt, 2);
         int64_t nrows = fb_i64(*meta, fb_field(*meta, rb, 0));
         int64_t bufs = fb_offset_field(*meta, rb, 2);
-        if (fb_u32(*meta, bufs) < 2) return -1;
+        uint32_t nbufs = fb_u32(*meta, bufs);
+        if (nbufs < 2) return -1;
         int64_t voff = fb_i64(*meta, bufs + 4 + 16 * 1);      /* values buffer */
         if (nrows > *dgcap) {
             *dg = realloc(*dg, sizeof(int64_t) * (size_t)nrows); *dgcap = nrows;
         }
         memcpy(*dg, *body + voff, sizeof(int64_t) * (size_t)nrows);
+        *has_sink = 0;
+        if (nbufs >= 4) {                                     /* reshard: sink col */
+            int64_t soff = fb_i64(*meta, bufs + 4 + 16 * 3);  /* col1 values buf */
+            if (nrows > *skcap) {
+                *sk = realloc(*sk, sizeof(int64_t) * (size_t)nrows); *skcap = nrows;
+            }
+            memcpy(*sk, *body + soff, sizeof(int64_t) * (size_t)nrows);
+            *has_sink = 1;
+        }
         *n_out = nrows;
         return 0;
     }
@@ -2466,6 +2480,7 @@ static void *zstream_reader(void *arg) {
     int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
     uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
     int64_t *dg = NULL, dgcap = 0;               /* ZPLAN dep_group buffer */
+    int64_t *sk = NULL, skcap = 0;               /* ZPLAN sink buffer (reshard) */
     int64_t batch = ZS.batch; int level = ZS.level;
     double win_t0 = tr_now();                    /* start of the current window */
 
@@ -2562,8 +2577,9 @@ static void *zstream_reader(void *arg) {
                 int64_t wid = ZS.win_id++;           /* window id (exch order) */
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
                 double w2 = tr_now();
-                int64_t cn;                          /* ZPLAN: dep_group[member] */
-                if (read_zplan(&dg, &dgcap, &cn, &pmeta, &pmc, &pbody, &pbc)) {
+                int64_t cn; int has_sink = 0;        /* ZPLAN: dep_group[member] */
+                if (read_zplan(&dg, &dgcap, &cn, &sk, &skcap, &has_sink,
+                               &pmeta, &pmc, &pbody, &pbc)) {
                     ZS.rc = 1; pthread_mutex_unlock(&ZS.exch); break;
                 }
                 double w3 = tr_now();
@@ -2586,6 +2602,7 @@ static void *zstream_reader(void *arg) {
                     Run **fr = calloc((size_t)nf, sizeof(Run *));
                     int *frn = calloc((size_t)nf, sizeof(int));
                     int *frc = calloc((size_t)nf, sizeof(int));
+                    int *fsink = calloc((size_t)nf, sizeof(int));  /* frame→sink */
                     int64_t r = 0;
                     while (r < cn) {
                         int64_t g = dg[r], a = r;
@@ -2599,19 +2616,20 @@ static void *zstream_reader(void *arg) {
                             fr[fi] = realloc(fr[fi], sizeof(Run) * (size_t)frc[fi]);
                         }
                         fr[fi][frn[fi]++] = (Run){off, end - off};
+                        if (has_sink) fsink[fi] = (int)sk[a];  /* all runs same sink */
                     }
                     for (int64_t fi = 0; fi < nf; fi++) {
                         if (!frn[fi]) continue;
                         ZSJob *jb = malloc(sizeof *jb);
                         jb->zb = zb; jb->frame_id = fmin + fi; jb->level = level;
-                        jb->sink = 0; jb->runs = fr[fi]; jb->nruns = frn[fi];
+                        jb->sink = fsink[fi]; jb->runs = fr[fi]; jb->nruns = frn[fi];
                         /* one buffer ref per frame; the reader holds its own ref
                          * (=1) until after the loop, so refs can't hit 0 early. */
                         atomic_fetch_add(&zb->refs, 1);
                         jq_push(jb);
                         wf++;
                     }
-                    free(fr); free(frn); free(frc);
+                    free(fr); free(frn); free(frc); free(fsink);
                 }
                 pthread_mutex_unlock(&ZS.exch);
                 tr_span(lane, TR_EXCH, w1, tr_now(), wf, wid);  /* b = window id */
@@ -2628,7 +2646,7 @@ static void *zstream_reader(void *arg) {
         zbp_unref(zb);                               /* the unused trailing buf */
         if (ZS.rc) break;
     }
-    free(mem); free(pmeta); free(pbody); free(dg);
+    free(mem); free(pmeta); free(pbody); free(dg); free(sk);
     return NULL;
 }
 
