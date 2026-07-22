@@ -204,3 +204,45 @@ don't matter. `cp/sync(preserve_times=False)` (`--no-preserve-times`)
 drops it: cp 2.3 s → 1.9 s (~17%; setattr is ~1/3 of the mutation
 traffic, the copy's own create+write being the rest). Content-addressed
 sync never reads mtime, so this is free there.
+
+## Recompress: compression level vs single-node WEKA (2026-07-22)
+
+Multi-source recompress (`recompress_c`, 8 EVI `tar.zstd` sources, 208 cores,
+36.2 GB decompressed / 12.4 GB compressed in). Single-node WEKA ceilings
+measured on the same node: **read ~896 MB/s, write ~1246 MB/s** (so combined
+read+write bandwidth ≈ 1.6–1.7 GB/s).
+
+| level | wall | ratio | decompressed MB/s | out MB/s | in(compressed) MB/s |
+|------:|-----:|------:|------------------:|---------:|--------------------:|
+| 1 | 14.9 s | 0.339 | 2435 | 825 | 832 |
+| 2 | 14.4 s | 0.334 | 2523 | 844 | 862 |
+| 3 | 14.8 s | 0.344 | 2442 | 839 | 834 |
+| 6 | 16.8 s | 0.321 | 2155 | 692 | 736 |
+| 9 | 29.8 s | 0.308 | 1217 | 374 | 416 |
+
+**When single-node WEKA becomes the bottleneck:** at **levels 1–3** wall time is
+flat (~14.5 s) — the pipeline is **WEKA-I/O bound**, not compute bound. Combined
+traffic is read ~835 + write ~830 ≈ **1.66 GB/s**, saturating the node's WEKA
+bandwidth; the 208 cores have spare capacity at these levels, so dropping below
+level 3 buys **no** speedup. The crossover is ~level 6 (out 839→692 MB/s, wall
++14 %); by level 9 it is firmly compute-bound (374 MB/s, 2× slower).
+
+**Ratio the WEKA-bound regime entails:** the I/O-saturated plateau (L1–3) sits at
+compression ratio **~0.34** (≈2.95× reduction). Level 6 — the knee — gives
+**0.321** (3.1×) at near-WEKA throughput for ~14 % more time. So there is no
+throughput reason to go below level 3, and **level 6 is the practical sweet
+spot** (best ratio still close to the I/O ceiling) — which is what the 2.4 TB
+production EVI run used ([[evi-recompress-run]]).
+
+Caveat: a *single* source is zstd-**decode**-bound at ~700 MB/s (one
+decompressor per source), well under WEKA; parallel decode across ≥8 sources is
+what lets output approach the WEKA write ceiling. This is the throughput case the
+`zstream` union pipeline (docs/ISA.md §5) is designed to keep fed.
+
+## zstream one-pass recompress — scale validation (2026-07-22)
+
+`recompress_stream` (the ZMETA→PLAN→COMP one-pass port, docs/ISA.md §5) validated
+against a real EVI source (15,589 members): member count == the `tar t` oracle,
+output is a clean tar (15,589 members), 200/200 sampled members round-trip
+byte-exact. Confirms the `buf_span` in_off computation on real ustar data (with a
+leading directory entry).
