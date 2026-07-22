@@ -57,7 +57,7 @@ import polars as pl
 import zstandard as zstd
 
 from . import footer as _footer
-from ..pupyarrow.writer import StreamReader, StreamWriter
+from .. import ipc
 
 SKIP_MAGIC = 0x184D2A50           # zstd skippable-frame magic (base .0-.F)
 
@@ -168,14 +168,18 @@ _FNUM_DT = [np.int64, np.int32, np.int64, np.int32, np.int32,
 Result = collections.namedtuple("Result", "members frames")
 
 
+_FOOTER_PL = dict(_ZF_SCHEMA)                        # polars footer schema
+
+
 class _FooterStream:
-    """Streams footer rows to an Arrow IPC stream (pupyarrow StreamWriter),
-    flushing a record batch every `flush_rows` — so only one batch of
-    footer rows lives in memory, not the whole (potentially 100M-row)
-    index. Columns are accumulated as Python lists and converted to numpy
-    at flush (strings stay lists)."""
+    """Streams footer rows to an Arrow IPC stream (Polars, quiver.ipc), flushing
+    a record batch every `flush_rows` — so only one batch of footer rows lives
+    in memory, not the whole (potentially 100M-row) index. Columns accumulate as
+    Python lists and become a Polars DataFrame at flush. Each flush is written
+    as its own schema+batch (ipc.write_batch); ipc.Reader skips the repeated
+    schema messages on read."""
     def __init__(self, fileobj, flush_rows: int = 1_000_000):
-        self.sw = StreamWriter(fileobj, _FOOTER_IPC)
+        self.sink = fileobj
         self.flush_rows = flush_rows
         self.paths: list[str] = []
         self.nums: list[list] = [[] for _ in range(9)]
@@ -213,16 +217,20 @@ class _FooterStream:
     def flush(self):
         if not self.n:
             return
-        cols = [self.paths] + [np.asarray(self.nums[i], dtype=_FNUM_DT[i])
-                               for i in range(9)]
-        self.sw.write_batch(cols)
+        names = [c for c, _ in _FOOTER_IPC]
+        df = pl.DataFrame(
+            {names[0]: self.paths,
+             **{names[i + 1]: np.asarray(self.nums[i], dtype=_FNUM_DT[i])
+                for i in range(9)}},
+            schema=_FOOTER_PL)
+        ipc.write_batch(self.sink, df)
         self.paths = []
         self.nums = [[] for _ in range(9)]
         self.n = 0
 
     def close(self):
         self.flush()
-        self.sw.close()
+        ipc.write_eos(self.sink)
 
 
 def recompress(inputs, out_path: str, batch_bytes: int = 16 << 20,
@@ -514,15 +522,14 @@ _ZMETA_SCHEMA = {"path": pl.String, "source_id": pl.Int32, "ordinal": pl.Int32,
 
 def _zscan(inputs, readers):
     """scan: quiver-exec decompresses + parses each source in C (off the GIL)
-    and streams member metadata as ZMETA Arrow-IPC batches — read here through
-    the same StreamReader the planner uses for scan. No bytes are compressed;
-    this is the cheap pass that feeds the Polars planner."""
+    and streams member metadata as ZMETA Arrow-IPC batches — read here natively
+    through Polars (quiver.ipc). No bytes are compressed; this is the cheap pass
+    that feeds the Polars planner."""
     import subprocess
-    from ..wire import EXE, _to_pl
-    from ..pupyarrow.writer import StreamReader
+    from ..wire import EXE
     proc = subprocess.Popen([EXE, "zscan", str(readers), *inputs],
                             stdout=subprocess.PIPE, bufsize=1 << 22)
-    dfs = [_to_pl(b) for b in StreamReader(proc.stdout)]
+    dfs = list(ipc.Reader(proc.stdout))
     if proc.wait() != 0:
         raise RuntimeError(f"zscan exited {proc.returncode}")
     return pl.concat(dfs) if dfs else pl.DataFrame(schema=_ZMETA_SCHEMA)
@@ -620,18 +627,17 @@ def _write_plan(plan_df, nsrc, path, nsink=None):
     the sink count (nsink and resume offsets are execution params, passed on
     argv, not in the stream)."""
     import zstandard as zstd
-    from ..wire import cmd_df, _df_cols, CMD_SCHEMA, OP_COMPRESS
-    from ..pupyarrow.writer import StreamWriter
+    from ..wire import cmd_df, OP_COMPRESS
     d = plan_df.sort(["source_id", "ordinal"])
     if nsink is None:
         nsink = int(d["sink"].max()) + 1 if d.height else 1
     n = d.height
     # whole-stream zstd: the command word is wide but sparse (an OP_COMPRESS row
     # uses 5 of 15 columns), so the constant/zero buffers collapse across the
-    # stream — far better than per-buffer compression. zexec streams-decompresses.
+    # stream — far better than per-buffer compression. zexec streams-decompresses
+    # and skips the (repeated) schema messages, so we write batch by batch.
     with open(path, "wb") as f, \
             zstd.ZstdCompressor(level=3).stream_writer(f, closefd=False) as zf:
-        w = StreamWriter(zf, CMD_SCHEMA)
         if n:
             cmds = cmd_df(n).with_columns(
                 pl.lit(OP_COMPRESS, dtype=pl.UInt8).alias("opcode"),
@@ -640,8 +646,8 @@ def _write_plan(plan_df, nsrc, path, nsink=None):
                 d["frame"].cast(pl.Int64).alias("dep_group"),
                 d["sink"].cast(pl.Int64).alias("parent_row"))
             for s in range(0, n, 1 << 20):
-                w.write_batch(_df_cols(cmds[s:s + (1 << 20)]))
-        w.close()
+                ipc.write_batch(zf, cmds[s:s + (1 << 20)])
+        ipc.write_eos(zf)
     return nsink
 
 
@@ -1011,21 +1017,14 @@ def recompress_c(inputs, out_path: str, level: int = 6,
 
 
 def read_index(path: str) -> pl.DataFrame:
-    """Footer frame (member → frame + in-frame offset), read from the
-    streamed IPC footer via pupyarrow (concatenating its batches)."""
+    """Footer frame (member → frame + in-frame offset), read from the streamed
+    IPC footer via Polars (concatenating its batches)."""
     data = _footer_bytes(path)
-    dfs = [pl.DataFrame(b) for b in StreamReader(io.BytesIO(data))]
+    dfs = list(ipc.Reader(io.BytesIO(data)))
     return (pl.concat(dfs) if dfs else pl.DataFrame(schema=_ZF_SCHEMA))
 
 
 _MERGED_IPC = _FOOTER_IPC + [("shard_id", "i32")]
-
-
-def _schema_cols(df, schema):
-    """Columns of `df` in `schema` order, in the form StreamWriter wants
-    (lists for strings/binary, numpy for fixed-width)."""
-    return [df[name].to_list() if t in ("large_string", "large_binary")
-            else df[name].to_numpy() for name, t in schema]
 
 
 def merge(shards, out_path: str) -> int:
@@ -1047,10 +1046,7 @@ def merge(shards, out_path: str) -> int:
     with open(out_path, "wb") as f:                 # [u32 hlen][paths][footer ipc]
         f.write(struct.pack("<I", len(header)))
         f.write(header)
-        w = StreamWriter(f, _MERGED_IPC)
-        for s in range(0, merged.height, 1 << 20):
-            w.write_batch(_schema_cols(merged[s:s + (1 << 20)], _MERGED_IPC))
-        w.close()
+        ipc.write_all(f, merged)                     # whole merged footer stream
     return merged.height
 
 
@@ -1059,7 +1055,7 @@ def read_merged(out_path: str):
     with open(out_path, "rb") as f:
         (hlen,) = struct.unpack("<I", f.read(4))
         shards = [ln for ln in f.read(hlen).decode().split("\n") if ln]
-        dfs = [pl.DataFrame(b) for b in StreamReader(f)]
+        dfs = list(ipc.Reader(f))
     idx = (pl.concat(dfs) if dfs
            else pl.DataFrame(schema={**_ZF_SCHEMA, "shard_id": pl.Int32}))
     return shards, idx
@@ -1273,7 +1269,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     Multi-reader parallel decode + an async compressor pool (compression is
     decoupled from the serialized plan exchange), 2-thread driver."""
     import subprocess
-    from ..wire import EXE, _to_pl
+    from ..wire import EXE
     compressors = compressors or (os.cpu_count() or 8)
     readers = readers or min(24, len(inputs))          # one decode stream/source
 
@@ -1289,36 +1285,11 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             pass_fds=(w_comp,))
     os.close(w_comp)
-    # ZMETA is read on the critical path with POLARS' native (Rust) IPC reader,
-    # not pupyarrow's per-row Python parse (which built a decoded string list
-    # per member — 3.3× slower on the batch, and the front-thread bottleneck).
-    # We frame the raw messages ourselves and hand each batch to pl.read_ipc_
-    # stream as schema+batch+EOS. COMP stays on pupyarrow (tiny 1-row batches,
-    # off the critical path).
-    from ..pupyarrow import fb
-    _EOS = struct.pack("<II", 0xFFFFFFFF, 0)
-    _stdout = proc.stdout
-
-    def _raw_msg():                                 # one framed IPC message, raw
-        hdr = _stdout.read(8)
-        while hdr and len(hdr) < 8:
-            hdr += _stdout.read(8 - len(hdr))
-        if not hdr or len(hdr) < 8:
-            return None
-        cont, mlen = struct.unpack("<II", hdr)
-        if mlen == 0:
-            return None                             # EOS
-        meta = _stdout.read(mlen)
-        blen = fb.Tbl.root(meta).i64(fb.MSG.BODY_LENGTH)
-        body = b""
-        while blen and len(body) < blen:
-            body += _stdout.read(blen - len(body))
-        return hdr + meta + body
-
-    zmeta_schema = _raw_msg()                        # ZMETA schema (once)
+    # All three streams go through Polars' native IPC (quiver.ipc): ZMETA in
+    # (front thread, the critical-path parse), COMP in (back thread), PLAN out.
+    zmeta = ipc.Reader(proc.stdout)                  # ZMETA ← native Polars
     comp_f = os.fdopen(r_comp, "rb")
-    comp = StreamReader(comp_f)
-    plan_w = StreamWriter(proc.stdin, ZPLAN)
+    comp = ipc.Reader(comp_f)                        # COMP  ← native Polars
     proc.stdin.flush()
 
     instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # per-window capture
@@ -1338,10 +1309,9 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
         the PLAN with GLOBAL frame ids, and accumulate the member sub-frame."""
         win_id = -1
         while True:
-            raw = _raw_msg()
-            if raw is None:
+            m = zmeta.read()                            # native Polars parse
+            if m is None:
                 break
-            m = pl.read_ipc_stream(zmeta_schema + raw + _EOS)  # native parse
             n = m.height
             if not n:
                 continue
@@ -1358,13 +1328,14 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                 frame=pl.col("_gf").cast(pl.Int32),
                 in_off=(pl.col("_eo") - pl.col("_fs") + pl.col("_sp")
                         - pl.col("_pb")))
-            gf_np = m["_gf"].to_numpy()
             nframes = int(m["_gf"].n_unique())
             # Send the PLAN FIRST to unblock the C reader (it's holding the
             # exchange lock waiting on it); only THEN do bookkeeping. Store the
             # whole window frame by reference (O(1)) — the column select + concat
             # + join happen once at the end, off the serialized critical path.
-            plan_w.write_batch([gf_np]); proc.stdin.flush()
+            # The PLAN is the narrow ZPLAN (dep_group only), written via Polars.
+            ipc.write_batch(proc.stdin, m.select(dep_group=pl.col("_gf")))
+            proc.stdin.flush()
             M.append(m)
             state["base"] = base + nframes
             if instr_windows is not None and win_id < INSTR_MAX_WIN:
@@ -1393,10 +1364,9 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
         """Drain COMP frames (any order) and accumulate them — no per-frame
         linking here; the join at the end does it in one vectorized pass."""
         while True:
-            b = comp.read_batch()
-            if b is None:
+            c = comp.read()
+            if c is None:
                 break
-            c = _to_pl(b)
             C.append(c.select(
                 pl.col("user_data").cast(pl.Int32).alias("frame"),
                 pl.col("read_size").cast(pl.Int64).alias("frame_coff"),
@@ -1423,10 +1393,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     footer = (members.join(frames, on="frame", how="left")
                      .select([c for c, _ in _FOOTER_IPC]))
     ftmp = tempfile.TemporaryFile()
-    sw = StreamWriter(ftmp, _FOOTER_IPC)
-    for s in range(0, footer.height, 1 << 20):      # chunk the write
-        sw.write_batch(_schema_cols(footer[s:s + (1 << 20)], _FOOTER_IPC))
-    sw.close()
+    ipc.write_all(ftmp, footer)                     # whole footer stream (Polars)
     _write_footer(out_path, ftmp, False); ftmp.close()
 
     if instr_windows is not None:

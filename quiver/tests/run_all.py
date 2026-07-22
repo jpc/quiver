@@ -274,8 +274,8 @@ def test_pushdown(tmp):
     def run(prefix="", glob=""):
         p = sp.Popen([wire.EXE, "scan", str(src), "uring", "4",
                       prefix, glob], stdout=sp.PIPE, stderr=sp.PIPE)
-        from quiver.pupyarrow.writer import StreamReader
-        dfs = [pl.DataFrame(b) for b in StreamReader(p.stdout)]
+        from quiver import ipc
+        dfs = list(ipc.Reader(p.stdout))
         err = p.stderr.read().decode(); p.wait()
         st = tuple(map(int, re.search(
             r"dirs=(\d+) statx=(\d+) emitted=(\d+)", err).groups()))

@@ -1,9 +1,9 @@
 """
-quiver.wire — the pipe protocol to quiver-exec, pyarrow-free.
+quiver.wire — the pipe protocol to quiver-exec.
 
-CMD frames go out through pupyarrow's StreamWriter; COMP and STAT frames
-come back through its StreamReader. polars only ever sees plain
-numpy/list columns.
+CMD frames go out and COMP / STAT frames come back as Arrow IPC, serialized
+and parsed by Polars natively (see quiver.ipc). The hand-rolled pupyarrow
+reader/writer is now confined to the build-time compiler and debug tooling.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import subprocess
 import numpy as np
 import polars as pl
 
-from .pupyarrow.writer import StreamReader, StreamWriter
+from . import ipc
 
 from .opcodes import OPCODES               # single source, shared with the C enum
 OP_UNLINK, OP_RMDIR, OP_MKDIR = OPCODES["UNLINK"], OPCODES["RMDIR"], OPCODES["MKDIR"]
@@ -112,9 +112,8 @@ class PipeExecutor:
         argv = (transport or []) + [exe, "exec", archive_path,
                                     _engine(engine)] + list(sources or [])
         self.proc = (spawn or _popen_spawn)(argv)
-        self.writer = StreamWriter(self.proc.stdin, CMD_SCHEMA)
         self.proc.stdin.flush()
-        self.reader = StreamReader(self.proc.stdout)
+        self.reader = ipc.Reader(self.proc.stdout)   # COMP ← native Polars
 
     def _chunk_bounds(self, n, batch_rows, boundaries):
         """Yield (start, end) chunk ranges. Without `boundaries`, a plain
@@ -155,18 +154,18 @@ class PipeExecutor:
             chunk = chunk.with_columns(
                 pl.when((pr >= start) & (pr < end)).then(pr - start)
                   .otherwise(-1).alias("parent_row"))
-            self.writer.write_batch(_df_cols(chunk))
+            ipc.write_batch(self.proc.stdin, chunk)  # CMD → native Polars
             self.proc.stdin.flush()
-            outs.append(_to_pl(self.reader.read_batch()))
+            outs.append(self.reader.read())
         return pl.concat(outs) if outs else pl.DataFrame(
             schema={"user_data": pl.UInt64, "res": pl.Int32,
                     "read_size": pl.Int64, "cksum": pl.UInt64,
                     "etag": pl.Binary, "parts": pl.Int32})
 
     def close(self) -> int:
-        self.writer.close()
+        ipc.write_eos(self.proc.stdin)
         self.proc.stdin.close()
-        self.reader.read_batch()
+        self.reader.read()
         return self.proc.wait()
 
 
@@ -201,9 +200,8 @@ def scan_iter(root: str, engine: str = "auto", threads: int = 8,
                             "1" if closes else "0"],
                             stdout=subprocess.PIPE)
     try:
-        for b in StreamReader(proc.stdout):
-            yield _to_pl(b).with_columns(
-                pl.col("is_dir").cast(pl.Boolean))
+        for b in ipc.Reader(proc.stdout):
+            yield b.with_columns(pl.col("is_dir").cast(pl.Boolean))
     finally:
         assert proc.wait() == 0, "scanner failed"
 
@@ -221,7 +219,7 @@ def scan(root: str, engine: str = "auto", threads: int = 8,
                             _engine(engine), str(threads), prefix, glob,
                             "1" if closes else "0"],
                             stdout=subprocess.PIPE)
-    dfs = [_to_pl(b) for b in StreamReader(proc.stdout)]
+    dfs = list(ipc.Reader(proc.stdout))
     assert proc.wait() == 0, "scanner failed"
     if not dfs:
         return pl.DataFrame(schema=SCAN_PL)

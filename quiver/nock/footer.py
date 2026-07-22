@@ -2,8 +2,17 @@
 quiver.nock.footer — the index: write, locate, read, retrofit.
 
 Placement (the slack rule): raw → EOF; tar → after the end-of-archive
-marker; Arrow IPC host → spliced before the Arrow Footer. All IO through
-pupyarrow; polars never touches pyarrow here.
+marker; Arrow IPC host → spliced before the Arrow Footer.
+
+This module *implements the on-disk nock retrofit format* — an Arrow File
+(feather) carrying schema-level KV metadata (`nock_version`, `nock_host`) and
+spliced zero-copy into an existing archive without touching its bytes. Polars'
+IPC writer supports neither custom schema metadata nor that splicing, so this is
+one of the two sanctioned homes for the hand-rolled `pupyarrow` writer (the
+other is the build-time `compiler`). It is a *format layer*, like the C
+executor's hand-rolled Arrow emit — not a live streaming path. All the
+streaming IPC (executor, scan, zstream, WAL, zframe footer) goes through Polars
+via `quiver.ipc`.
 """
 
 from __future__ import annotations

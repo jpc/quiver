@@ -24,11 +24,11 @@ import os
 
 import polars as pl
 
+from . import ipc
 from .nock.footer import _df_from_feather, _feather_bytes
-from .pupyarrow.writer import StreamReader, StreamWriter
 from .wire import (CMD_PL, OP_RMDIR, OP_UNLINK, PipeExecutor, cmd_df)
 
-_COMP_SCHEMA = [("user_data", "u64"), ("res", "i32")]
+_COMP_PL = {"user_data": pl.UInt64, "res": pl.Int32}
 
 # errno values that mean "the intended state already holds" per opcode
 _IDEMPOTENT_OK = {OP_UNLINK: {-errno.ENOENT}, OP_RMDIR: {-errno.ENOENT}}
@@ -58,8 +58,7 @@ def _load_log(path: str) -> pl.DataFrame:
     frames = []
     with open(done_path, "rb") as f:
         try:
-            for b in StreamReader(f):
-                frames.append(pl.DataFrame(b))
+            frames = list(ipc.Reader(f))    # torn tail → Reader stops cleanly
         except (AssertionError, ValueError):
             pass          # torn tail from a crash mid-append: ignore it
     if not frames:
@@ -127,9 +126,8 @@ def execute(path: str, archive_path: str = "-", engine: str = "auto",
         return pl.DataFrame({"executed": [0], "failed": [0]})
 
     done_path = path + ".done"
-    fresh = not os.path.exists(done_path)
-    dl = open(done_path, "ab")
-    dw = StreamWriter(dl, _COMP_SCHEMA, write_schema=fresh)
+    dl = open(done_path, "ab")               # schema re-emitted per append;
+    #                                          ipc.Reader skips repeated schemas
 
     ex = PipeExecutor(archive_path, engine=engine)
     executed = failed = 0
@@ -145,8 +143,9 @@ def execute(path: str, archive_path: str = "-", engine: str = "auto",
             executed += sum(okmask)
             failed += len(j) - sum(okmask)
             # record everything; _done_set filters, failures() surfaces
-            dw.write_batch([j["user_data"].to_numpy(),
-                            j["res"].to_numpy()])
+            ipc.write_batch(dl, j.select(
+                pl.col("user_data").cast(pl.UInt64),
+                pl.col("res").cast(pl.Int32)))
             dl.flush()
             os.fsync(dl.fileno())
     finally:
