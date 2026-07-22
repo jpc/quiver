@@ -192,6 +192,24 @@ class _FooterStream:
         if self.n >= self.flush_rows:
             self.flush()
 
+    def add_many(self, paths, size, mode, mtime_ns, uid, gid, in_off,
+                 frame, coff, clen):
+        """Vectorized add of a whole frame's members: `frame`/`coff`/`clen` are
+        scalars broadcast over the slice; the rest are arrays. One call per
+        frame instead of one per member — far less GIL-held Python work in the
+        footer-writing (back) thread, so the serialized planner isn't starved."""
+        k = len(paths)
+        self.paths.extend(paths)
+        self.nums[0].extend(size);   self.nums[1].extend(mode)
+        self.nums[2].extend(mtime_ns); self.nums[3].extend(uid)
+        self.nums[4].extend(gid)
+        self.nums[5].extend((frame,) * k); self.nums[6].extend((coff,) * k)
+        self.nums[7].extend((clen,) * k);  self.nums[8].extend(in_off)
+        self.n += k
+        self.members += k
+        if self.n >= self.flush_rows:
+            self.flush()
+
     def flush(self):
         if not self.n:
             return
@@ -1252,12 +1270,36 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     directions on standard schemas. in_off is computed exactly from buf_span
     (C's per-member buffer span, which absorbs interleaved dir/PAX/GNU blocks).
 
-    Single reader + synchronous per-window (parallel compress within a window);
-    multi-reader parallel decode + async double-buffering are follow-ups."""
+    Multi-reader parallel decode + an async compressor pool (compression is
+    decoupled from the serialized plan exchange), 2-thread driver."""
     import subprocess
-    from ..wire import EXE, CMD_SCHEMA, cmd_df, _df_cols, OP_COMPRESS, _to_pl
+    from ..wire import EXE, CMD_SCHEMA, OP_COMPRESS, _to_pl
     compressors = compressors or (os.cpu_count() or 8)
     readers = readers or min(24, len(inputs))          # one decode stream/source
+
+    # The PLAN is intrinsically one opcode (COMPRESS) — only dep_group varies.
+    # Build the CMD-schema column list directly (bypassing cmd_df's 15-column
+    # DataFrame construction + cast + _df_cols), the per-window planning cost
+    # the profile flagged: ~4.2 ms → ~0.05 ms/window (85×). Constant columns
+    # are memoized by row count so a run of same-size windows reuses them.
+    _pc_cache = {}
+    def _plan_cols(n, gframe_np):
+        c = _pc_cache.get(n)
+        if c is None:
+            es = [""] * n; eb = [b""] * n; z = np.zeros(n, np.int64)
+            c = (np.full(n, OP_COMPRESS, np.uint8), es, eb, z,
+                 np.ones(n, np.int64), np.full(n, -1, np.int32),
+                 np.full(n, -1, np.int64), np.full(n, -1, np.int32),
+                 np.full(n, -1, np.int32), np.full(n, -1, np.int64),
+                 np.arange(n, dtype=np.uint64))
+            if len(_pc_cache) < 512:
+                _pc_cache[n] = c
+        opcode, es, eb, z, ones, m1_32, m1_64, u1_32, g1_32, pr1, ud = c
+        # CMD_SCHEMA order: user_data, opcode, dep_group, path, dst_path, header,
+        # header_offset, data_offset, size, pad_align, mode, mtime_ns, uid, gid,
+        # parent_row.
+        return [ud, opcode, gframe_np, es, es, eb, z, z, z, ones,
+                m1_32, m1_64, u1_32, g1_32, pr1]
     r_comp, w_comp = os.pipe()
     argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(window_bytes),
             str(compressors), str(readers), *[str(i) for i in inputs]]
@@ -1275,9 +1317,11 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # per-window capture
     instr_windows = {} if instr_path else None
     INSTR_MAX_WIN, INSTR_ROWS = 64, 10              # bound the capture
-    # pending[gframe] = list of (path,size,mode,mtime,uid,gid,in_off) member
-    # rows the FRONT thread has planned but whose (coff,clen) the BACK thread
-    # hasn't linked yet. Guarded by `plock`; back pops, front pushes.
+    # pending[gframe] = the frame's members as COLUMN SLICES (path list + numpy
+    # arrays) the FRONT thread planned but whose (coff,clen) the BACK thread
+    # hasn't linked yet. Guarded by `plock`; back pops, front pushes. Slices
+    # (not per-member tuples) keep both hot loops vectorized so the back thread
+    # doesn't starve the serialized planner on the GIL.
     pending, plock = {}, threading.Lock()
     state = {"base": 0, "frames": 0, "err": None}
     comp_results = {} if instr_windows is not None else None  # gframe→(coff,clen)
@@ -1300,19 +1344,23 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             padbody = ((m["size"] + 511) // 512) * 512
             m = m.with_columns(_gf=gframe, _eo=entry_off, _pb=padbody, _sp=span)
             m = m.with_columns(_fs=pl.col("_eo").min().over("_gf"))  # frame start
-            in_off = (m["_eo"] - m["_fs"] + m["_sp"] - m["_pb"]).to_list()
-            gf = m["_gf"].to_list()
-            paths = m["path"].to_list(); szs = m["size"].to_list()
-            modes = m["mode"].to_list(); mts = m["mtime_ns"].to_list()
-            uids = m["uid"].to_list(); gids = m["gid"].to_list()
-            nframes = int(m["_gf"].n_unique())
-            # register member rows keyed by their global frame id BEFORE sending
-            # the PLAN — so the back thread always finds them when COMP arrives.
+            in_off = (m["_eo"] - m["_fs"] + m["_sp"] - m["_pb"]).to_numpy()
+            gf_np = m["_gf"].to_numpy()
+            paths = m["path"].to_list()
+            szs = m["size"].to_numpy(); modes = m["mode"].to_numpy()
+            mts = m["mtime_ns"].to_numpy(); uids = m["uid"].to_numpy()
+            gids = m["gid"].to_numpy()
+            # frames are contiguous runs of members (gf non-decreasing); slice at
+            # the run boundaries — O(frames) vectorized slices, not O(members).
+            bnd = np.flatnonzero(np.diff(gf_np)) + 1
+            starts = np.concatenate(([0], bnd)); ends = np.concatenate((bnd, [n]))
+            nframes = len(starts)
             with plock:
-                for i in range(n):
-                    pending.setdefault(gf[i], []).append(
-                        (paths[i], szs[i], modes[i], mts[i], uids[i], gids[i],
-                         in_off[i]))
+                for a, b in zip(starts.tolist(), ends.tolist()):
+                    pending[int(gf_np[a])] = (
+                        paths[a:b], szs[a:b], modes[a:b], mts[a:b], uids[a:b],
+                        gids[a:b], in_off[a:b])
+            gf = gf_np                              # for the instr preview
             if instr_windows is not None and win_id < INSTR_MAX_WIN:
                 K = INSTR_ROWS; spanl = span.to_list()
                 instr_windows[win_id] = {
@@ -1321,14 +1369,14 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                               "rows": [[paths[i], szs[i], modes[i], int(spanl[i])]
                                        for i in range(min(K, n))], "total": n},
                     "plan": {"cols": ["op", "member", "→frame", "in_off"],
-                             "rows": [["COMPRESS", i, gf[i], in_off[i]]
+                             "rows": [["COMPRESS", i, int(gf[i]), int(in_off[i])]
                                       for i in range(min(K, n))], "total": n},
                     "comp": {"cols": ["frame", "coff", "clen"], "rows": [],
                              "total": nframes,
                              "gframes": list(range(base, base + min(K, nframes)))},
                 }
-            cmds = cmd_df(n, opcode=[OP_COMPRESS] * n, dep_group=m["_gf"])
-            plan_w.write_batch(_df_cols(cmds)); proc.stdin.flush()
+            plan_w.write_batch(_plan_cols(n, m["_gf"].to_numpy()))
+            proc.stdin.flush()
             state["base"] = base + nframes
         try:
             proc.stdin.close()
@@ -1345,14 +1393,12 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             c = _to_pl(b)
             for f, o, x in zip(c["user_data"].to_list(),
                                c["read_size"].to_list(), c["cksum"].to_list()):
-                f = int(f)
+                f = int(f); o = int(o); x = int(x)
                 if comp_results is not None:
-                    comp_results[f] = (int(o), int(x))
+                    comp_results[f] = (o, x)
                 with plock:
-                    members = pending.pop(f)
-                for (path, size, mode, mtime, uid, gid, in_off) in members:
-                    fw.add(path, size, mode, mtime, uid, gid, f, int(o),
-                           int(x), in_off)
+                    paths, szs, modes, mts, uids, gids, ioff = pending.pop(f)
+                fw.add_many(paths, szs, modes, mts, uids, gids, ioff, f, o, x)
 
     ft = threading.Thread(target=front)
     bt = threading.Thread(target=back)
