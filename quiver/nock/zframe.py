@@ -1272,80 +1272,105 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
 
     ftmp = tempfile.TemporaryFile()
     fw = _FooterStream(ftmp)
-    base = 0                                        # global frame id offset
     instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # per-window capture
     instr_windows = {} if instr_path else None
-    win_id = -1
     INSTR_MAX_WIN, INSTR_ROWS = 64, 10              # bound the capture
-    for zb in zmeta:                                # one batch per window
-        m = pl.DataFrame(zb)
-        n = m.height
-        if not n:
-            continue
-        win_id += 1                                 # matches C's EXCH span b
-        # Assign members to frames within the window: greedy fill by buffer
-        # span, cutting every frame_bytes. Frame id (dep_group) must be locally
-        # 0..F-1 (C groups the PLAN by it) but globally unique in the footer.
-        span = m["buf_span"]
-        entry_off = span.cum_sum() - span                  # offset within window
-        lframe = (entry_off // frame_bytes).cast(pl.Int64) # 0..F-1
-        padbody = ((m["size"] + 511) // 512) * 512
-        m = m.with_columns(_lf=lframe, _eo=entry_off, _pb=padbody, _sp=span)
-        m = m.with_columns(_fs=pl.col("_eo").min().over("_lf"))  # frame start
-        # in_off is relative to the member's FRAME: (entry within frame) + hdrlen,
-        # where hdrlen = span - padded_body (body sits at the end of the region).
-        in_off = (m["_eo"] - m["_fs"] + m["_sp"] - m["_pb"]).to_list()
-        lf = m["_lf"].to_list()
-        cmds = cmd_df(n, opcode=[OP_COMPRESS] * n, dep_group=m["_lf"])
-        plan_w.write_batch(_df_cols(cmds)); proc.stdin.flush()
-        c = _to_pl(comp.read_batch())                      # COMP: per-frame
-        # COMP rows: user_data = local frame id, read_size = coff, cksum = clen
-        ud = c["user_data"].to_list(); co = c["read_size"].to_list()
-        cl = c["cksum"].to_list()
-        coff = {int(u): int(o) for u, o in zip(ud, co)}
-        clen = {int(u): int(x) for u, x in zip(ud, cl)}
-        paths = m["path"].to_list(); szs = m["size"].to_list()
-        modes = m["mode"].to_list(); mts = m["mtime_ns"].to_list()
-        uids = m["uid"].to_list(); gids = m["gid"].to_list()
-        # instruction-stream preview: capture each window's three streams
-        # (truncated) — the ZMETA in, PLAN out, COMP back — keyed by window id
-        # so the visualizer can show the instructions for any exchange block.
-        if instr_windows is not None and win_id < INSTR_MAX_WIN:
-            K = INSTR_ROWS
-            frames_out = sorted(coff)
-            spanl = span.to_list()
-            instr_windows[win_id] = {
-                "members": n, "frames": len(coff), "frame_bytes": frame_bytes,
-                "zmeta": {"cols": ["path", "size", "mode", "buf_span"],
-                          "rows": [[paths[i], szs[i], modes[i], int(spanl[i])]
-                                   for i in range(min(K, n))], "total": n},
-                "plan": {"cols": ["op", "member", "→frame", "in_off"],
-                         "rows": [["COMPRESS", i, base + lf[i], in_off[i]]
-                                  for i in range(min(K, n))], "total": n},
-                "comp": {"cols": ["frame", "coff", "clen"],
-                         "rows": [[base + f, coff[f], clen[f]]
-                                  for f in frames_out[:K]],
-                         "total": len(coff)},
-            }
-        for i in range(n):
-            f = lf[i]
-            fw.add(paths[i], szs[i], modes[i], mts[i], uids[i], gids[i],
-                   base + f, coff[f], clen[f], in_off[i])
-        base += len(coff)
-    try:
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
+    # pending[gframe] = list of (path,size,mode,mtime,uid,gid,in_off) member
+    # rows the FRONT thread has planned but whose (coff,clen) the BACK thread
+    # hasn't linked yet. Guarded by `plock`; back pops, front pushes.
+    pending, plock = {}, threading.Lock()
+    state = {"base": 0, "frames": 0, "err": None}
+    comp_results = {} if instr_windows is not None else None  # gframe→(coff,clen)
+
+    def front():
+        """Read ZMETA windows (in exchange order), plan each into frames, send
+        the PLAN with GLOBAL frame ids. Compression is async — no COMP read."""
+        win_id = -1
+        for zb in zmeta:
+            m = pl.DataFrame(zb)
+            n = m.height
+            if not n:
+                continue
+            win_id += 1                             # matches C's EXCH span b
+            span = m["buf_span"]
+            entry_off = span.cum_sum() - span       # offset within the window
+            lframe = (entry_off // frame_bytes).cast(pl.Int64)   # 0..F-1
+            base = state["base"]
+            gframe = (lframe + base)                # globally unique frame id
+            padbody = ((m["size"] + 511) // 512) * 512
+            m = m.with_columns(_gf=gframe, _eo=entry_off, _pb=padbody, _sp=span)
+            m = m.with_columns(_fs=pl.col("_eo").min().over("_gf"))  # frame start
+            in_off = (m["_eo"] - m["_fs"] + m["_sp"] - m["_pb"]).to_list()
+            gf = m["_gf"].to_list()
+            paths = m["path"].to_list(); szs = m["size"].to_list()
+            modes = m["mode"].to_list(); mts = m["mtime_ns"].to_list()
+            uids = m["uid"].to_list(); gids = m["gid"].to_list()
+            nframes = int(m["_gf"].n_unique())
+            # register member rows keyed by their global frame id BEFORE sending
+            # the PLAN — so the back thread always finds them when COMP arrives.
+            with plock:
+                for i in range(n):
+                    pending.setdefault(gf[i], []).append(
+                        (paths[i], szs[i], modes[i], mts[i], uids[i], gids[i],
+                         in_off[i]))
+            if instr_windows is not None and win_id < INSTR_MAX_WIN:
+                K = INSTR_ROWS; spanl = span.to_list()
+                instr_windows[win_id] = {
+                    "members": n, "frames": nframes, "frame_bytes": frame_bytes,
+                    "zmeta": {"cols": ["path", "size", "mode", "buf_span"],
+                              "rows": [[paths[i], szs[i], modes[i], int(spanl[i])]
+                                       for i in range(min(K, n))], "total": n},
+                    "plan": {"cols": ["op", "member", "→frame", "in_off"],
+                             "rows": [["COMPRESS", i, gf[i], in_off[i]]
+                                      for i in range(min(K, n))], "total": n},
+                    "comp": {"cols": ["frame", "coff", "clen"], "rows": [],
+                             "total": nframes,
+                             "gframes": list(range(base, base + min(K, nframes)))},
+                }
+            cmds = cmd_df(n, opcode=[OP_COMPRESS] * n, dep_group=m["_gf"])
+            plan_w.write_batch(_df_cols(cmds)); proc.stdin.flush()
+            state["base"] = base + nframes
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+    def back():
+        """Drain COMP (frames, out of order): link each frame's (coff,clen) to
+        its members and write the footer. Single writer of `fw`."""
+        while True:
+            b = comp.read_batch()
+            if b is None:
+                break
+            c = _to_pl(b)
+            for f, o, x in zip(c["user_data"].to_list(),
+                               c["read_size"].to_list(), c["cksum"].to_list()):
+                f = int(f)
+                if comp_results is not None:
+                    comp_results[f] = (int(o), int(x))
+                with plock:
+                    members = pending.pop(f)
+                for (path, size, mode, mtime, uid, gid, in_off) in members:
+                    fw.add(path, size, mode, mtime, uid, gid, f, int(o),
+                           int(x), in_off)
+
+    ft = threading.Thread(target=front)
+    bt = threading.Thread(target=back)
+    ft.start(); bt.start()
+    ft.join(); bt.join()
     comp_f.close()
     fw.close()
     _write_footer(out_path, ftmp, False); ftmp.close()
     if instr_windows is not None:
         import json as _json
-        _json.dump({"windows": instr_windows,
-                    "captured": len(instr_windows), "total_windows": win_id + 1},
-                   open(instr_path, "w"))
+        for w in instr_windows.values():          # fill deferred COMP previews
+            w["comp"]["rows"] = [[g, comp_results[g][0], comp_results[g][1]]
+                                 for g in w["comp"].pop("gframes")
+                                 if g in comp_results]
+        _json.dump({"windows": instr_windows, "captured": len(instr_windows),
+                    "total_windows": len(instr_windows)}, open(instr_path, "w"))
     assert proc.wait() == 0
-    return Result(members=fw.members, frames=base)
+    return Result(members=fw.members, frames=state["base"])
 
 
 def unpack_distributed(path, dest, transports, predicate=None, engine="auto",

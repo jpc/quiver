@@ -2365,84 +2365,128 @@ static void tr_dump(void) {
     fprintf(stderr, "trace: %d spans -> %s\n", TR.n, p);
 }
 
-/* ── zstream compressor pool (docs/ISA.md §5: keep the sink fed) ────────────
- * A persistent pool of M workers compresses a window's frames in parallel and
- * appends each to the output. The window is a large planning unit (many 16 MB
- * frames), so within one ZMETA→PLAN round-trip the pool always has frames
- * queued — the sink never idles on compression, the bottleneck at production
- * levels. Offsets are assigned under a lock in job order; the compress itself
- * (the slow part) runs outside it, and pwrite is positioned/non-overlapping. */
-typedef struct { const uint8_t *src; int64_t len; int level;
-                 int64_t coff; size_t clen; int err; } ZFrameJob;
+/* ── zstream async pipeline (docs/ISA.md §5: keep the sink fed) ─────────────
+ * The exchange (emit ZMETA → read PLAN) is serialized so Python's front thread
+ * is synchronous, but compression is OUT of that lock: a reader pushes its
+ * window's frame jobs onto a shared queue and moves straight to the next
+ * window, while a persistent compressor pool drains the queue continuously —
+ * frames from many windows compress concurrently, so the sink never idles.
+ * A window's decompressed buffer is refcounted (one ref per pending frame +
+ * the reader's ref); it recycles to a bounded pool when its last frame retires,
+ * which is also the backpressure — a runaway reader blocks on zbp_acquire. Each
+ * frame emits its own 1-row COMP as it completes (out of order); Python's back
+ * thread drains COMP and links the footer. */
+typedef struct ZBuf { uint8_t *buf; int64_t cap; _Atomic int refs;
+                      struct ZBuf *fl; } ZBuf;
 static struct {
-    pthread_mutex_t mu; pthread_cond_t cv_work, cv_done;
-    ZFrameJob *jobs; int njobs, next, done, stop, ofd;
-    pthread_mutex_t amu; int64_t append;
-    pthread_t tid[128]; int nthreads;
-} ZP;
+    pthread_mutex_t mu; pthread_cond_t cv;
+    ZBuf *freelist; int live, max_live; int64_t cap;
+} ZBP;
+static void zbp_init(int64_t cap, int max_live) {
+    memset(&ZBP, 0, sizeof ZBP);
+    pthread_mutex_init(&ZBP.mu, NULL); pthread_cond_init(&ZBP.cv, NULL);
+    ZBP.cap = cap; ZBP.max_live = max_live;
+}
+static ZBuf *zbp_acquire(void) {
+    pthread_mutex_lock(&ZBP.mu);
+    while (ZBP.live >= ZBP.max_live && !ZBP.freelist)
+        pthread_cond_wait(&ZBP.cv, &ZBP.mu);        /* backpressure */
+    ZBuf *b;
+    if (ZBP.freelist) { b = ZBP.freelist; ZBP.freelist = b->fl; }
+    else { b = malloc(sizeof(ZBuf)); b->buf = malloc((size_t)ZBP.cap);
+           b->cap = ZBP.cap; }
+    ZBP.live++;
+    pthread_mutex_unlock(&ZBP.mu);
+    atomic_store(&b->refs, 1);                       /* the reader's ref */
+    return b;
+}
+static void zbp_unref(ZBuf *b) {
+    if (atomic_fetch_sub(&b->refs, 1) != 1) return;  /* still referenced */
+    pthread_mutex_lock(&ZBP.mu);
+    ZBP.live--; b->fl = ZBP.freelist; ZBP.freelist = b;
+    pthread_cond_signal(&ZBP.cv);
+    pthread_mutex_unlock(&ZBP.mu);
+}
+static void zbp_destroy(void) {
+    for (ZBuf *b = ZBP.freelist; b; ) { ZBuf *n = b->fl; free(b->buf); free(b); b = n; }
+    ZBP.freelist = NULL;
+}
 
-static void *zp_worker(void *arg) {
+typedef struct ZSJob { struct ZSJob *next; ZBuf *zb; int64_t off, len, frame_id;
+                       int level; } ZSJob;
+static struct {
+    pthread_mutex_t mu; pthread_cond_t cv;
+    ZSJob *head, *tail; int done, ofd, comp_fd, err;
+    pthread_mutex_t amu; int64_t append;    /* append cursor */
+    pthread_mutex_t emu;                     /* COMP emit lock */
+    pthread_t tid[128]; int nthreads;
+} JQ;
+
+static void jq_push(ZSJob *j) {
+    pthread_mutex_lock(&JQ.mu);
+    j->next = NULL;
+    if (JQ.tail) JQ.tail->next = j; else JQ.head = j;
+    JQ.tail = j;
+    pthread_cond_signal(&JQ.cv);
+    pthread_mutex_unlock(&JQ.mu);
+}
+static ZSJob *jq_pop(void) {
+    pthread_mutex_lock(&JQ.mu);
+    while (!JQ.head && !JQ.done) pthread_cond_wait(&JQ.cv, &JQ.mu);
+    ZSJob *j = JQ.head;
+    if (j) { JQ.head = j->next; if (!JQ.head) JQ.tail = NULL; }
+    pthread_mutex_unlock(&JQ.mu);
+    return j;
+}
+
+static void *jq_worker(void *arg) {
     int lane = 1000 + *(int *)arg;              /* compressor lanes: 1000+j */
     uint8_t *cb = NULL; size_t ccap = 0;
     for (;;) {
-        pthread_mutex_lock(&ZP.mu);
-        while (ZP.next >= ZP.njobs && !ZP.stop)
-            pthread_cond_wait(&ZP.cv_work, &ZP.mu);
-        if (ZP.next >= ZP.njobs && ZP.stop) { pthread_mutex_unlock(&ZP.mu); break; }
-        int i = ZP.next++;
-        pthread_mutex_unlock(&ZP.mu);
-
-        ZFrameJob *j = &ZP.jobs[i];
+        ZSJob *j = jq_pop();
+        if (!j) break;
         double t0 = tr_now();
         size_t bound = ZSTD_compressBound((size_t)j->len);
         if (bound > ccap) { cb = realloc(cb, bound); ccap = bound; }
-        size_t cl = ZSTD_compress(cb, ccap, j->src, (size_t)j->len, j->level);
-        if (ZSTD_isError(cl)) { j->err = 1; }
+        size_t cl = ZSTD_compress(cb, ccap, j->zb->buf + j->off, (size_t)j->len,
+                                  j->level);
+        if (ZSTD_isError(cl)) JQ.err = 1;
         else {
-            pthread_mutex_lock(&ZP.amu);
-            int64_t off = ZP.append; ZP.append += (int64_t)cl;
-            pthread_mutex_unlock(&ZP.amu);
-            j->coff = off; j->clen = cl;
-            if (pwrite(ZP.ofd, cb, cl, off) != (ssize_t)cl) j->err = 1;
+            pthread_mutex_lock(&JQ.amu);
+            int64_t off = JQ.append; JQ.append += (int64_t)cl;
+            pthread_mutex_unlock(&JQ.amu);
+            if (pwrite(JQ.ofd, cb, cl, off) != (ssize_t)cl) JQ.err = 1;
+            uint64_t fid = (uint64_t)j->frame_id, clen = (uint64_t)cl;
+            int64_t coff = off;
+            pthread_mutex_lock(&JQ.emu);        /* one COMP row per frame */
+            emit_comp_batch(JQ.comp_fd, 1, &fid, &coff, &clen);
+            pthread_mutex_unlock(&JQ.emu);
         }
         tr_span(lane, TR_COMPRESS, t0, tr_now(), j->len, (int64_t)cl);
-        pthread_mutex_lock(&ZP.mu);
-        ZP.done++;
-        pthread_cond_signal(&ZP.cv_done);
-        pthread_mutex_unlock(&ZP.mu);
+        zbp_unref(j->zb);                       /* frame done; maybe recycle */
+        free(j);
     }
     free(cb);
     return NULL;
 }
 
-static int ZP_ids[128];
-static void zp_start(int ofd, int compressors) {
-    memset(&ZP, 0, sizeof ZP);
-    pthread_mutex_init(&ZP.mu, NULL); pthread_mutex_init(&ZP.amu, NULL);
-    pthread_cond_init(&ZP.cv_work, NULL); pthread_cond_init(&ZP.cv_done, NULL);
-    ZP.ofd = ofd;
-    ZP.nthreads = compressors > 128 ? 128 : (compressors < 1 ? 1 : compressors);
-    for (int t = 0; t < ZP.nthreads; t++) {
-        ZP_ids[t] = t;
-        pthread_create(&ZP.tid[t], NULL, zp_worker, &ZP_ids[t]);
+static int JQ_ids[128];
+static void jq_start(int ofd, int comp_fd, int compressors) {
+    memset(&JQ, 0, sizeof JQ);
+    pthread_mutex_init(&JQ.mu, NULL); pthread_cond_init(&JQ.cv, NULL);
+    pthread_mutex_init(&JQ.amu, NULL); pthread_mutex_init(&JQ.emu, NULL);
+    JQ.ofd = ofd; JQ.comp_fd = comp_fd;
+    JQ.nthreads = compressors > 128 ? 128 : (compressors < 1 ? 1 : compressors);
+    for (int t = 0; t < JQ.nthreads; t++) {
+        JQ_ids[t] = t;
+        pthread_create(&JQ.tid[t], NULL, jq_worker, &JQ_ids[t]);
     }
 }
-/* Compress a window's `n` frame jobs in parallel; blocks until all done. */
-static int zp_run_window(ZFrameJob *jobs, int n) {
-    pthread_mutex_lock(&ZP.mu);
-    ZP.jobs = jobs; ZP.njobs = n; ZP.next = 0; ZP.done = 0;
-    pthread_cond_broadcast(&ZP.cv_work);
-    while (ZP.done < n) pthread_cond_wait(&ZP.cv_done, &ZP.mu);
-    ZP.njobs = 0;                      /* workers idle until the next window */
-    pthread_mutex_unlock(&ZP.mu);
-    for (int i = 0; i < n; i++) if (jobs[i].err) return -1;
-    return 0;
-}
-static void zp_stop(void) {
-    pthread_mutex_lock(&ZP.mu);
-    ZP.stop = 1; pthread_cond_broadcast(&ZP.cv_work);
-    pthread_mutex_unlock(&ZP.mu);
-    for (int t = 0; t < ZP.nthreads; t++) pthread_join(ZP.tid[t], NULL);
+static void jq_stop(void) {
+    pthread_mutex_lock(&JQ.mu);
+    JQ.done = 1; pthread_cond_broadcast(&JQ.cv);
+    pthread_mutex_unlock(&JQ.mu);
+    for (int t = 0; t < JQ.nthreads; t++) pthread_join(JQ.tid[t], NULL);
 }
 
 /* Shared context for the zstream reader pool. Readers decode DIFFERENT sources
@@ -2463,11 +2507,9 @@ static struct {
 
 static void *zstream_reader(void *arg) {
     int lane = *(int *)arg;                      /* reader lanes: 0..R-1 */
-    int64_t bcap = ZS.batch + (4 << 20); uint8_t *buf = malloc((size_t)bcap);
     int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
     uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
-    int jcap = 256; ZFrameJob *jobs = malloc(sizeof(ZFrameJob) * (size_t)jcap);
-    int64_t batch = ZS.batch; int level = ZS.level, comp_fd = ZS.comp_fd;
+    int64_t batch = ZS.batch; int level = ZS.level;
     double win_t0 = tr_now();                    /* start of the current window */
 
     for (;;) {
@@ -2475,6 +2517,8 @@ static void *zstream_reader(void *arg) {
         if (si >= ZS.nsrc) break;
         Zsrc z;
         if (zsrc_open(&z, ZS.srcs[si])) continue;
+        ZBuf *zb = zbp_acquire();                /* refcounted window buffer */
+        uint8_t *buf = zb->buf; int64_t bcap = zb->cap;
         MetaBuilder mb; mb_init(&mb); mb.grow = 1;  /* one ZMETA batch/window */
         int64_t blen = 0, mstart = 0; int nm = 0; int32_t ordinal = 0;
         char pax_path[4096], gnu[4096], name[4096];
@@ -2489,9 +2533,10 @@ static void *zstream_reader(void *arg) {
                 int typ = hdr[156];
                 int64_t sz = zoctal(hdr + 124, 12);
                 int64_t bl = (sz + 511) / 512 * 512;
-                if (blen + 512 + bl + 8192 > bcap) {
+                if (blen + 512 + bl + 8192 > bcap) {     /* grow the window buf */
                     bcap = (blen + 512 + bl + 8192) * 2;
-                    buf = realloc(buf, (size_t)bcap);
+                    zb->buf = realloc(zb->buf, (size_t)bcap);
+                    zb->cap = bcap; buf = zb->buf;
                 }
                 if (typ == 'x' || typ == 'g') {          /* PAX: keep in buffer */
                     memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, bl);
@@ -2548,9 +2593,9 @@ static void *zstream_reader(void *arg) {
                            mem[m].span);
                 }
                 tr_span(lane, TR_DECODE, win_t0, tr_now(), nm, blen);
-                /* Serialized exchange: emit ZMETA, read PLAN, compress the
-                 * window's frames (pool), emit COMP — one reader at a time, so
-                 * the three fds stay ordered and Python is synchronous. */
+                /* Serialized exchange: emit ZMETA, read PLAN — one reader at a
+                 * time so stdin/stdout stay ordered. Compression is NOT here:
+                 * we push frame jobs onto the shared queue and move on. */
                 double w0 = tr_now();
                 pthread_mutex_lock(&ZS.exch);
                 double w1 = tr_now(); tr_span(lane, TR_EXCH_WAIT, w0, w1, 0, 0);
@@ -2560,45 +2605,40 @@ static void *zstream_reader(void *arg) {
                 if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) {
                     ZS.rc = 1; pthread_mutex_unlock(&ZS.exch); break;
                 }
-                /* pc: one row per member (ZMETA order); dep_group = frame id.
-                 * Build one job per frame (contiguous [mem[a].start, mem[r].start)
-                 * — includes interleaved dirs), then compress them in parallel. */
-                int64_t cn = pc.n_rows, wf = 0;
-                uint64_t *fg = malloc(8*(size_t)cn);      /* per-frame plan id */
-                int64_t r = 0;
+                /* pc: one row per member (ZMETA order); dep_group = GLOBAL frame
+                 * id (Python-assigned). Build one job per frame (contiguous
+                 * [mem[a].start, mem[r].start) — includes interleaved dirs). */
+                int64_t cn = pc.n_rows, wf = 0, r = 0;
                 while (r < cn) {
                     int64_t g = pc.dep_group[r], a = r;
                     while (r < cn && pc.dep_group[r] == g) r++;   /* frame [a,r) */
                     int64_t foff = mem[a].start;
                     int64_t fend = (r < nm) ? mem[r].start : blen;
-                    if (wf >= jcap) {
-                        jcap *= 2; jobs = realloc(jobs, sizeof(ZFrameJob)*(size_t)jcap);
-                        fg = realloc(fg, 8*(size_t)jcap);
-                    }
-                    jobs[wf] = (ZFrameJob){buf + foff, fend - foff, level, 0, 0, 0};
-                    fg[wf] = (uint64_t)g; wf++;
+                    ZSJob *jb = malloc(sizeof *jb);
+                    jb->zb = zb; jb->off = foff; jb->len = fend - foff;
+                    jb->frame_id = g; jb->level = level;
+                    /* one buffer ref per frame; the reader still holds its own
+                     * ref (=1) until after the loop, so refs can't hit 0 early. */
+                    atomic_fetch_add(&zb->refs, 1);
+                    jq_push(jb);
+                    wf++;
                 }
-                int cerr = zp_run_window(jobs, (int)wf); /* parallel compress */
-                uint64_t *fco = malloc(8*(size_t)wf), *fcl = malloc(8*(size_t)wf);
-                for (int64_t i = 0; i < wf; i++) {
-                    fco[i] = (uint64_t)jobs[i].coff; fcl[i] = (uint64_t)jobs[i].clen;
-                }
-                emit_comp_batch(comp_fd, wf, fg, (int64_t *)fco, fcl);
+                free_cmd_batch(&pc);
                 pthread_mutex_unlock(&ZS.exch);
                 tr_span(lane, TR_EXCH, w1, tr_now(), wf, wid);  /* b = window id */
                 atomic_fetch_add(&ZS.nframes, wf);
-                free(fg); free(fco); free(fcl);
-                free_cmd_batch(&pc);
                 for (int m = 0; m < nm; m++) free(mem[m].name);
-                blen = 0; mstart = 0; nm = 0;        /* recycle the buffer */
+                zbp_unref(zb);                       /* drop the reader's ref */
+                zb = zbp_acquire(); buf = zb->buf; bcap = zb->cap;  /* next window */
+                blen = 0; mstart = 0; nm = 0;
                 win_t0 = tr_now();                   /* next window starts now */
-                if (cerr) { ZS.rc = 1; done = 1; }
             }
         }
         mb_free(&mb); zsrc_close(&z);
+        zbp_unref(zb);                               /* the unused trailing buf */
         if (ZS.rc) break;
     }
-    free(buf); free(mem); free(jobs); free(pmeta); free(pbody);
+    free(mem); free(pmeta); free(pbody);
     return NULL;
 }
 
@@ -2611,13 +2651,16 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
     memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
     emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
     emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
-    zp_start(ofd, compressors);
+    if (readers < 1) readers = 1;
+    if (readers > 64) readers = 64;
+    jq_start(ofd, comp_fd, compressors);
+    /* bound resident buffers: a couple of windows per reader in flight + the
+     * compressors' — this is the decode-ahead depth AND the backpressure. */
+    zbp_init(batch + (4 << 20), readers * 3 + 4);
 
     memset(&ZS, 0, sizeof ZS);
     ZS.srcs = srcs; ZS.nsrc = nsrc; ZS.level = level; ZS.comp_fd = comp_fd;
     ZS.batch = batch; pthread_mutex_init(&ZS.exch, NULL);
-    if (readers < 1) readers = 1;
-    if (readers > 64) readers = 64;
     pthread_t rt[64]; int rid[64];
     for (int i = 0; i < readers; i++) {
         rid[i] = i;
@@ -2625,13 +2668,14 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
     }
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
 
-    zp_stop();
+    jq_stop();                              /* drains all pending frames */
+    zbp_destroy();
     emit_eos(1); emit_eos(comp_fd);
     close(ofd);
     tr_dump();
     fprintf(stderr, "zstream: %ld frames, %ld bytes (%d readers)\n",
-            (long)ZS.nframes, (long)ZP.append, readers);
-    return ZS.rc;
+            (long)ZS.nframes, (long)JQ.append, readers);
+    return ZS.rc || JQ.err;
 }
 
 
