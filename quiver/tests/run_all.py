@@ -813,6 +813,28 @@ def test_zframe_zstream(tmp):
     zframe.unpack(out2, str(tmp/"zsx2"))
     for rel, data in want2.items():
         assert (tmp/"zsx2"/rel).read_bytes() == data
+    # multi-reader parallel decode: N sources decoded concurrently, one
+    # serialized plan exchange + parallel compress — byte-exact round-trip.
+    msrc, mwant = [], {}
+    for s in range(5):
+        r = io.BytesIO()
+        with tarfile.open(fileobj=r, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+            for i in range(80):
+                b = (f"r{s}.{i}=".encode()) * (4 + i); nm = f"src{s}/f{i:03d}"
+                ti = tarfile.TarInfo(nm); ti.size = len(b); ti.mode = 0o644
+                ti.mtime = 1_700_000_000 + i
+                tf.addfile(ti, io.BytesIO(b)); mwant[nm] = b
+        p = str(tmp/f"mr{s}.tar.zstd")
+        with open(p, "wb") as fo:
+            fo.write(zstd.ZstdCompressor().compress(r.getvalue()))
+        msrc.append(p)
+    outm = str(tmp/"zmulti.tar.zstd")
+    rm3 = zframe.recompress_stream(msrc, outm, level=4, window_bytes=32 << 10,
+                                   frame_bytes=16 << 10, readers=3)
+    assert rm3.members == 400, rm3.members
+    zframe.unpack(outm, str(tmp/"zmx"))
+    for rel, data in mwant.items():
+        assert (tmp/"zmx"/rel).read_bytes() == data
     ok("zframe zstream: one-pass ZMETA→PLAN→COMP recompress, round-trips")
 
 

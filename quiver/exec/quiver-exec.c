@@ -2397,25 +2397,34 @@ static void zp_stop(void) {
     for (int t = 0; t < ZP.nthreads; t++) pthread_join(ZP.tid[t], NULL);
 }
 
-static int run_zstream(int comp_fd, const char **srcs, int nsrc,
-                       const char *out, int level, int64_t batch,
-                       int compressors) {
-    int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (ofd < 0) { perror("out"); return 2; }
-    memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
-    emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
-    emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
-    zp_start(ofd, compressors);
+/* Shared context for the zstream reader pool. Readers decode DIFFERENT sources
+ * in parallel (decode is the single-stream bottleneck, ~700 MB/s — the EVI
+ * win); the plan exchange (emit ZMETA → read PLAN) + parallel compress + emit
+ * COMP is serialized by `exch` so stdin/stdout/comp_fd stay ordered and Python
+ * stays synchronous. That serialized section runs the whole compressor pool, so
+ * its throughput cap (~1/T_compress) sits above the single-node WEKA write
+ * ceiling — parallel decode, not this lock, is what bounds a node. */
+static struct {
+    const char **srcs; int nsrc; _Atomic int src_i;
+    int level, comp_fd; int64_t batch;
+    pthread_mutex_t exch;
+    _Atomic int64_t nframes;
+    int rc;
+} ZS;
 
-    int64_t nframes = 0;
-    int64_t bcap = batch + (4 << 20); uint8_t *buf = malloc((size_t)bcap);
+static void *zstream_reader(void *arg) {
+    (void)arg;
+    int64_t bcap = ZS.batch + (4 << 20); uint8_t *buf = malloc((size_t)bcap);
     int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
     uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
     int jcap = 256; ZFrameJob *jobs = malloc(sizeof(ZFrameJob) * (size_t)jcap);
+    int64_t batch = ZS.batch; int level = ZS.level, comp_fd = ZS.comp_fd;
 
-    for (int si = 0; si < nsrc; si++) {
+    for (;;) {
+        int si = atomic_fetch_add(&ZS.src_i, 1);
+        if (si >= ZS.nsrc) break;
         Zsrc z;
-        if (zsrc_open(&z, srcs[si])) continue;
+        if (zsrc_open(&z, ZS.srcs[si])) continue;
         MetaBuilder mb; mb_init(&mb); mb.grow = 1;  /* one ZMETA batch/window */
         int64_t blen = 0, mstart = 0; int nm = 0; int32_t ordinal = 0;
         char pax_path[4096], gnu[4096], name[4096];
@@ -2488,9 +2497,15 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                            mem[m].mode, mem[m].mtime, mem[m].uid, mem[m].gid,
                            mem[m].span);
                 }
+                /* Serialized exchange: emit ZMETA, read PLAN, compress the
+                 * window's frames (pool), emit COMP — one reader at a time, so
+                 * the three fds stay ordered and Python is synchronous. */
+                pthread_mutex_lock(&ZS.exch);
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
                 CmdBatch pc;
-                if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) return 1;
+                if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) {
+                    ZS.rc = 1; pthread_mutex_unlock(&ZS.exch); break;
+                }
                 /* pc: one row per member (ZMETA order); dep_group = frame id.
                  * Build one job per frame (contiguous [mem[a].start, mem[r].start)
                  * — includes interleaved dirs), then compress them in parallel. */
@@ -2509,28 +2524,54 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                     jobs[wf] = (ZFrameJob){buf + foff, fend - foff, level, 0, 0, 0};
                     fg[wf] = (uint64_t)g; wf++;
                 }
-                if (zp_run_window(jobs, (int)wf)) return 1;   /* parallel compress */
+                int cerr = zp_run_window(jobs, (int)wf); /* parallel compress */
                 uint64_t *fco = malloc(8*(size_t)wf), *fcl = malloc(8*(size_t)wf);
                 for (int64_t i = 0; i < wf; i++) {
                     fco[i] = (uint64_t)jobs[i].coff; fcl[i] = (uint64_t)jobs[i].clen;
                 }
                 emit_comp_batch(comp_fd, wf, fg, (int64_t *)fco, fcl);
-                nframes += wf;
+                pthread_mutex_unlock(&ZS.exch);
+                atomic_fetch_add(&ZS.nframes, wf);
                 free(fg); free(fco); free(fcl);
                 free_cmd_batch(&pc);
                 for (int m = 0; m < nm; m++) free(mem[m].name);
                 blen = 0; mstart = 0; nm = 0;        /* recycle the buffer */
+                if (cerr) { ZS.rc = 1; done = 1; }
             }
         }
         mb_free(&mb); zsrc_close(&z);
+        if (ZS.rc) break;
     }
+    free(buf); free(mem); free(jobs); free(pmeta); free(pbody);
+    return NULL;
+}
+
+static int run_zstream(int comp_fd, const char **srcs, int nsrc,
+                       const char *out, int level, int64_t batch,
+                       int compressors, int readers) {
+    int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ofd < 0) { perror("out"); return 2; }
+    memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
+    emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
+    emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
+    zp_start(ofd, compressors);
+
+    memset(&ZS, 0, sizeof ZS);
+    ZS.srcs = srcs; ZS.nsrc = nsrc; ZS.level = level; ZS.comp_fd = comp_fd;
+    ZS.batch = batch; pthread_mutex_init(&ZS.exch, NULL);
+    if (readers < 1) readers = 1;
+    if (readers > 64) readers = 64;
+    pthread_t rt[64];
+    for (int i = 0; i < readers; i++)
+        pthread_create(&rt[i], NULL, zstream_reader, NULL);
+    for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
+
     zp_stop();
     emit_eos(1); emit_eos(comp_fd);
     close(ofd);
-    free(buf); free(mem); free(jobs); free(pmeta); free(pbody);
-    fprintf(stderr, "zstream: %ld frames, %ld bytes\n",
-            (long)nframes, (long)ZP.append);
-    return 0;
+    fprintf(stderr, "zstream: %ld frames, %ld bytes (%d readers)\n",
+            (long)ZS.nframes, (long)ZP.append, readers);
+    return ZS.rc;
 }
 
 
@@ -2586,12 +2627,14 @@ int main(int argc, char **argv) {
     }
 
     if (!strcmp(argv[1], "zstream")) {
-        /* zstream <comp_fd> <out> <level> <batch> <compressors> <src...> —
-         * one-pass planned recompress: ZMETA on stdout, PLAN on stdin,
-         * COMP on comp_fd; compressors compress a window's frames in parallel */
-        if (argc < 8) { fprintf(stderr, "zstream: too few args\n"); return 2; }
-        return run_zstream(atoi(argv[2]), (const char **)&argv[7], argc - 7,
-                           argv[3], atoi(argv[4]), atoll(argv[5]), atoi(argv[6]));
+        /* zstream <comp_fd> <out> <level> <batch> <compressors> <readers>
+         *         <src...> — one-pass planned recompress: ZMETA on stdout,
+         * PLAN on stdin, COMP on comp_fd. `readers` decode DIFFERENT sources
+         * in parallel; `compressors` compress a window's frames in parallel. */
+        if (argc < 9) { fprintf(stderr, "zstream: too few args\n"); return 2; }
+        return run_zstream(atoi(argv[2]), (const char **)&argv[8], argc - 8,
+                           argv[3], atoi(argv[4]), atoll(argv[5]),
+                           atoi(argv[6]), atoi(argv[7]));
     }
 
     struct io_uring ring;

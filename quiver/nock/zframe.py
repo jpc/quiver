@@ -1241,7 +1241,7 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
 
 
 def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
-                      frame_bytes=16 << 20, compressors=None):
+                      frame_bytes=16 << 20, compressors=None, readers=None):
     """One-pass planned recompress via the `zstream` port (docs/ISA.md §5) — the
     last de-fork. C decompresses each source ONCE into a live buffer (a large
     `window`) and yields member metadata (ZMETA); this driver plans the window
@@ -1257,9 +1257,10 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     import subprocess
     from ..wire import EXE, CMD_SCHEMA, cmd_df, _df_cols, OP_COMPRESS, _to_pl
     compressors = compressors or (os.cpu_count() or 8)
+    readers = readers or min(24, len(inputs))          # one decode stream/source
     r_comp, w_comp = os.pipe()
     argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(window_bytes),
-            str(compressors), *[str(i) for i in inputs]]
+            str(compressors), str(readers), *[str(i) for i in inputs]]
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             pass_fds=(w_comp,))
     os.close(w_comp)
