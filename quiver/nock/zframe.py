@@ -1289,7 +1289,33 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             pass_fds=(w_comp,))
     os.close(w_comp)
-    zmeta = StreamReader(proc.stdout)
+    # ZMETA is read on the critical path with POLARS' native (Rust) IPC reader,
+    # not pupyarrow's per-row Python parse (which built a decoded string list
+    # per member — 3.3× slower on the batch, and the front-thread bottleneck).
+    # We frame the raw messages ourselves and hand each batch to pl.read_ipc_
+    # stream as schema+batch+EOS. COMP stays on pupyarrow (tiny 1-row batches,
+    # off the critical path).
+    from ..pupyarrow import fb
+    _EOS = struct.pack("<II", 0xFFFFFFFF, 0)
+    _stdout = proc.stdout
+
+    def _raw_msg():                                 # one framed IPC message, raw
+        hdr = _stdout.read(8)
+        while hdr and len(hdr) < 8:
+            hdr += _stdout.read(8 - len(hdr))
+        if not hdr or len(hdr) < 8:
+            return None
+        cont, mlen = struct.unpack("<II", hdr)
+        if mlen == 0:
+            return None                             # EOS
+        meta = _stdout.read(mlen)
+        blen = fb.Tbl.root(meta).i64(fb.MSG.BODY_LENGTH)
+        body = b""
+        while blen and len(body) < blen:
+            body += _stdout.read(blen - len(body))
+        return hdr + meta + body
+
+    zmeta_schema = _raw_msg()                        # ZMETA schema (once)
     comp_f = os.fdopen(r_comp, "rb")
     comp = StreamReader(comp_f)
     plan_w = StreamWriter(proc.stdin, ZPLAN)
@@ -1311,8 +1337,11 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
         """Read ZMETA windows (in exchange order), plan each into frames, send
         the PLAN with GLOBAL frame ids, and accumulate the member sub-frame."""
         win_id = -1
-        for zb in zmeta:
-            m = pl.DataFrame(zb)
+        while True:
+            raw = _raw_msg()
+            if raw is None:
+                break
+            m = pl.read_ipc_stream(zmeta_schema + raw + _EOS)  # native parse
             n = m.height
             if not n:
                 continue
