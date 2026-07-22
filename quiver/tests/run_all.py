@@ -779,7 +779,7 @@ def test_zframe_zstream(tmp):
     with open(src, "wb") as fo:
         fo.write(zstd.ZstdCompressor().compress(raw.getvalue()))
     out = str(tmp/"zsout.tar.zstd")
-    res = zframe.recompress_stream([src], out, level=4, batch_bytes=16 << 10)
+    res = zframe.recompress_stream([src], out, level=4, window_bytes=64 << 10, frame_bytes=16 << 10)
     assert res.members == 250 and res.frames > 1, (res.members, res.frames)
     n = sp.run(f"zstd -dc {out} | tar t | wc -l", shell=True,
                capture_output=True, text=True).stdout.strip()
@@ -805,7 +805,7 @@ def test_zframe_zstream(tmp):
     with open(src2, "wb") as fo:
         fo.write(zstd.ZstdCompressor().compress(raw2.getvalue()))
     out2 = str(tmp/"zsout2.tar.zstd")
-    r2 = zframe.recompress_stream([src2], out2, level=4, batch_bytes=16 << 10)
+    r2 = zframe.recompress_stream([src2], out2, level=4, window_bytes=64 << 10, frame_bytes=16 << 10)
     assert r2.members == 120, r2.members
     n2 = sp.run(f"zstd -dc {out2} | tar t | wc -l", shell=True,
                 capture_output=True, text=True).stdout.strip()

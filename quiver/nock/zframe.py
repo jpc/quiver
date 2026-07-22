@@ -1240,23 +1240,26 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
     return _unpack_exec(idx, dest, path, None, engine, batch_rows)
 
 
-def recompress_stream(inputs, out_path, level=10, batch_bytes=16 << 20):
+def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
+                      frame_bytes=16 << 20, compressors=None):
     """One-pass planned recompress via the `zstream` port (docs/ISA.md §5) — the
-    last de-fork. C decompresses each source ONCE into a live buffer and yields
-    member metadata (ZMETA); this driver plans frames and sends the plan back
-    (PLAN); C compresses the planned slices from the *same* buffer and returns
-    (frame→coff,clen) as COMP. The footer is built from ZMETA + plan + COMP —
-    the 60-byte record retired, both directions on standard schemas.
+    last de-fork. C decompresses each source ONCE into a live buffer (a large
+    `window`) and yields member metadata (ZMETA); this driver plans the window
+    into `frame_bytes`-sized frames and sends the plan back (PLAN); C's
+    compressor pool compresses the planned slices from the *same* buffer in
+    parallel (keeping the sink fed) and returns (frame→coff,clen) as COMP. The
+    footer is built from ZMETA + plan + COMP — the 60-byte record retired, both
+    directions on standard schemas. in_off is computed exactly from buf_span
+    (C's per-member buffer span, which absorbs interleaved dir/PAX/GNU blocks).
 
-    First cut: one frame per window, synchronous, in_off computed from member
-    sizes (valid when the tar has no PAX/GNU extension blocks — long-name
-    sources need a buf_off column in ZMETA, the next increment). The union /
-    async pipeline and filter/reshard gather are follow-ups."""
+    Single reader + synchronous per-window (parallel compress within a window);
+    multi-reader parallel decode + async double-buffering are follow-ups."""
     import subprocess
     from ..wire import EXE, CMD_SCHEMA, cmd_df, _df_cols, OP_COMPRESS, _to_pl
+    compressors = compressors or (os.cpu_count() or 8)
     r_comp, w_comp = os.pipe()
-    argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(batch_bytes),
-            *[str(i) for i in inputs]]
+    argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(window_bytes),
+            str(compressors), *[str(i) for i in inputs]]
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             pass_fds=(w_comp,))
     os.close(w_comp)
@@ -1268,31 +1271,41 @@ def recompress_stream(inputs, out_path, level=10, batch_bytes=16 << 20):
 
     ftmp = tempfile.TemporaryFile()
     fw = _FooterStream(ftmp)
-    frame_id = 0
+    base = 0                                        # global frame id offset
     for zb in zmeta:                                # one batch per window
         m = pl.DataFrame(zb)
         n = m.height
         if not n:
             continue
-        # First cut: one frame per window (all members → this frame). in_off is
-        # computed exactly from buf_span (C's per-member buffer span, which
-        # absorbs interleaved dir/PAX/GNU blocks): a member's body sits at the
-        # end of its region, so in_off = entry_off_in_frame + span - padded_body.
+        # Assign members to frames within the window: greedy fill by buffer
+        # span, cutting every frame_bytes. Frame id (dep_group) must be locally
+        # 0..F-1 (C groups the PLAN by it) but globally unique in the footer.
         span = m["buf_span"]
+        entry_off = span.cum_sum() - span                  # offset within window
+        lframe = (entry_off // frame_bytes).cast(pl.Int64) # 0..F-1
         padbody = ((m["size"] + 511) // 512) * 512
-        entry_off = span.cum_sum() - span                  # within the frame
-        in_off = (entry_off + span - padbody).to_list()
-        cmds = cmd_df(n, opcode=[OP_COMPRESS] * n,
-                      dep_group=pl.Series([frame_id] * n, dtype=pl.Int64))
+        m = m.with_columns(_lf=lframe, _eo=entry_off, _pb=padbody, _sp=span)
+        m = m.with_columns(_fs=pl.col("_eo").min().over("_lf"))  # frame start
+        # in_off is relative to the member's FRAME: (entry within frame) + hdrlen,
+        # where hdrlen = span - padded_body (body sits at the end of the region).
+        in_off = (m["_eo"] - m["_fs"] + m["_sp"] - m["_pb"]).to_list()
+        lf = m["_lf"].to_list()
+        cmds = cmd_df(n, opcode=[OP_COMPRESS] * n, dep_group=m["_lf"])
         plan_w.write_batch(_df_cols(cmds)); proc.stdin.flush()
-        c = _to_pl(comp.read_batch())                      # COMP: frame coff/clen
-        coff, clen = int(c["read_size"][0]), int(c["cksum"][0])
-        for i, r in enumerate(m.iter_rows(named=True)):
-            fw.add(r["path"], r["size"], r["mode"], r["mtime_ns"], r["uid"],
-                   r["gid"], frame_id, coff, clen, in_off[i])
-        frame_id += 1
-    # C reads exactly one PLAN per window and exits after the last COMP, so no
-    # PLAN terminator is sent; just close (the pipe may already be gone).
+        c = _to_pl(comp.read_batch())                      # COMP: per-frame
+        # COMP rows: user_data = local frame id, read_size = coff, cksum = clen
+        ud = c["user_data"].to_list(); co = c["read_size"].to_list()
+        cl = c["cksum"].to_list()
+        coff = {int(u): int(o) for u, o in zip(ud, co)}
+        clen = {int(u): int(x) for u, x in zip(ud, cl)}
+        paths = m["path"].to_list(); szs = m["size"].to_list()
+        modes = m["mode"].to_list(); mts = m["mtime_ns"].to_list()
+        uids = m["uid"].to_list(); gids = m["gid"].to_list()
+        for i in range(n):
+            f = lf[i]
+            fw.add(paths[i], szs[i], modes[i], mts[i], uids[i], gids[i],
+                   base + f, coff[f], clen[f], in_off[i])
+        base += len(coff)
     try:
         proc.stdin.close()
     except BrokenPipeError:
@@ -1301,7 +1314,7 @@ def recompress_stream(inputs, out_path, level=10, batch_bytes=16 << 20):
     fw.close()
     _write_footer(out_path, ftmp, False); ftmp.close()
     assert proc.wait() == 0
-    return Result(members=fw.members, frames=frame_id)
+    return Result(members=fw.members, frames=base)
 
 
 def unpack_distributed(path, dest, transports, predicate=None, engine="auto",

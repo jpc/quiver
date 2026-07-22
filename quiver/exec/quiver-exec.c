@@ -1940,7 +1940,21 @@ typedef struct {
     char *pdata; int64_t pdata_len, pdata_cap; int64_t *poff;
     int32_t *source_id, *ordinal, *mode, *uid, *gid;
     int64_t *size, *mtime, *span;
+    int grow;                    /* 1: grow at cap (zstream); 0: flush (zscan) */
 } MetaBuilder;
+
+static void mb_grow(MetaBuilder *b) {
+    b->cap *= 2;
+    b->poff = realloc(b->poff, 8 * (size_t)(b->cap + 1));
+    b->source_id = realloc(b->source_id, 4 * (size_t)b->cap);
+    b->ordinal = realloc(b->ordinal, 4 * (size_t)b->cap);
+    b->mode = realloc(b->mode, 4 * (size_t)b->cap);
+    b->uid = realloc(b->uid, 4 * (size_t)b->cap);
+    b->gid = realloc(b->gid, 4 * (size_t)b->cap);
+    b->size = realloc(b->size, 8 * (size_t)b->cap);
+    b->mtime = realloc(b->mtime, 8 * (size_t)b->cap);
+    b->span = realloc(b->span, 8 * (size_t)b->cap);
+}
 
 static void mb_init(MetaBuilder *b) {
     memset(b, 0, sizeof *b);
@@ -1991,7 +2005,7 @@ static void mb_row(MetaBuilder *b, const char *name, int32_t src, int32_t ord,
     b->source_id[i] = src; b->ordinal[i] = ord; b->size[i] = size;
     b->mode[i] = mode; b->mtime[i] = mtime; b->uid[i] = uid; b->gid[i] = gid;
     b->span[i] = span;
-    if (b->n >= b->cap) mb_flush(b);
+    if (b->n >= b->cap) { if (b->grow) mb_grow(b); else mb_flush(b); }
 }
 
 static void *z_scan_reader(void *arg) {
@@ -2308,24 +2322,101 @@ static int emit_comp_batch(int fd, int64_t n, uint64_t *ud, int64_t *coff,
 typedef struct { int64_t start, span, size, mtime; int32_t mode, uid, gid;
                  char *name; } SMem;
 
+/* ── zstream compressor pool (docs/ISA.md §5: keep the sink fed) ────────────
+ * A persistent pool of M workers compresses a window's frames in parallel and
+ * appends each to the output. The window is a large planning unit (many 16 MB
+ * frames), so within one ZMETA→PLAN round-trip the pool always has frames
+ * queued — the sink never idles on compression, the bottleneck at production
+ * levels. Offsets are assigned under a lock in job order; the compress itself
+ * (the slow part) runs outside it, and pwrite is positioned/non-overlapping. */
+typedef struct { const uint8_t *src; int64_t len; int level;
+                 int64_t coff; size_t clen; int err; } ZFrameJob;
+static struct {
+    pthread_mutex_t mu; pthread_cond_t cv_work, cv_done;
+    ZFrameJob *jobs; int njobs, next, done, stop, ofd;
+    pthread_mutex_t amu; int64_t append;
+    pthread_t tid[128]; int nthreads;
+} ZP;
+
+static void *zp_worker(void *arg) {
+    (void)arg;
+    uint8_t *cb = NULL; size_t ccap = 0;
+    for (;;) {
+        pthread_mutex_lock(&ZP.mu);
+        while (ZP.next >= ZP.njobs && !ZP.stop)
+            pthread_cond_wait(&ZP.cv_work, &ZP.mu);
+        if (ZP.next >= ZP.njobs && ZP.stop) { pthread_mutex_unlock(&ZP.mu); break; }
+        int i = ZP.next++;
+        pthread_mutex_unlock(&ZP.mu);
+
+        ZFrameJob *j = &ZP.jobs[i];
+        size_t bound = ZSTD_compressBound((size_t)j->len);
+        if (bound > ccap) { cb = realloc(cb, bound); ccap = bound; }
+        size_t cl = ZSTD_compress(cb, ccap, j->src, (size_t)j->len, j->level);
+        if (ZSTD_isError(cl)) { j->err = 1; }
+        else {
+            pthread_mutex_lock(&ZP.amu);
+            int64_t off = ZP.append; ZP.append += (int64_t)cl;
+            pthread_mutex_unlock(&ZP.amu);
+            j->coff = off; j->clen = cl;
+            if (pwrite(ZP.ofd, cb, cl, off) != (ssize_t)cl) j->err = 1;
+        }
+        pthread_mutex_lock(&ZP.mu);
+        ZP.done++;
+        pthread_cond_signal(&ZP.cv_done);
+        pthread_mutex_unlock(&ZP.mu);
+    }
+    free(cb);
+    return NULL;
+}
+
+static void zp_start(int ofd, int compressors) {
+    memset(&ZP, 0, sizeof ZP);
+    pthread_mutex_init(&ZP.mu, NULL); pthread_mutex_init(&ZP.amu, NULL);
+    pthread_cond_init(&ZP.cv_work, NULL); pthread_cond_init(&ZP.cv_done, NULL);
+    ZP.ofd = ofd;
+    ZP.nthreads = compressors > 128 ? 128 : (compressors < 1 ? 1 : compressors);
+    for (int t = 0; t < ZP.nthreads; t++)
+        pthread_create(&ZP.tid[t], NULL, zp_worker, NULL);
+}
+/* Compress a window's `n` frame jobs in parallel; blocks until all done. */
+static int zp_run_window(ZFrameJob *jobs, int n) {
+    pthread_mutex_lock(&ZP.mu);
+    ZP.jobs = jobs; ZP.njobs = n; ZP.next = 0; ZP.done = 0;
+    pthread_cond_broadcast(&ZP.cv_work);
+    while (ZP.done < n) pthread_cond_wait(&ZP.cv_done, &ZP.mu);
+    ZP.njobs = 0;                      /* workers idle until the next window */
+    pthread_mutex_unlock(&ZP.mu);
+    for (int i = 0; i < n; i++) if (jobs[i].err) return -1;
+    return 0;
+}
+static void zp_stop(void) {
+    pthread_mutex_lock(&ZP.mu);
+    ZP.stop = 1; pthread_cond_broadcast(&ZP.cv_work);
+    pthread_mutex_unlock(&ZP.mu);
+    for (int t = 0; t < ZP.nthreads; t++) pthread_join(ZP.tid[t], NULL);
+}
+
 static int run_zstream(int comp_fd, const char **srcs, int nsrc,
-                       const char *out, int level, int64_t batch) {
+                       const char *out, int level, int64_t batch,
+                       int compressors) {
     int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (ofd < 0) { perror("out"); return 2; }
     memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
     emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
     emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
+    zp_start(ofd, compressors);
 
-    int64_t append = 0, nframes = 0;
+    int64_t nframes = 0;
     int64_t bcap = batch + (4 << 20); uint8_t *buf = malloc((size_t)bcap);
     int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
     uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
-    size_t cbnd = ZSTD_compressBound((size_t)bcap); uint8_t *comp = malloc(cbnd);
+    int jcap = 256; ZFrameJob *jobs = malloc(sizeof(ZFrameJob) * (size_t)jcap);
 
     for (int si = 0; si < nsrc; si++) {
         Zsrc z;
         if (zsrc_open(&z, srcs[si])) continue;
-        MetaBuilder mb; mb_init(&mb);
+        MetaBuilder mb; mb_init(&mb); mb.grow = 1;  /* one ZMETA batch/window */
         int64_t blen = 0, mstart = 0; int nm = 0; int32_t ordinal = 0;
         char pax_path[4096], gnu[4096], name[4096];
         int has_pax = 0, has_gnu = 0; int64_t pax_size = -1;
@@ -2342,7 +2433,6 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                 if (blen + 512 + bl + 8192 > bcap) {
                     bcap = (blen + 512 + bl + 8192) * 2;
                     buf = realloc(buf, (size_t)bcap);
-                    comp = realloc(comp, cbnd = ZSTD_compressBound((size_t)bcap));
                 }
                 if (typ == 'x' || typ == 'g') {          /* PAX: keep in buffer */
                     memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, bl);
@@ -2386,9 +2476,9 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                 has_pax = has_gnu = 0; pax_size = -1;
             }
             /* window full (or source done): finalize spans, plan, compress.
-             * Cap members below the ZMETA batch size so mb never auto-flushes
-             * mid-window — one ZMETA batch ↔ one PLAN batch ↔ one window. */
-            if ((blen >= batch || nm >= SCAN_BATCH / 2 || (done && nm)) && nm) {
+             * mb.grow keeps the whole window in one ZMETA batch (↔ one PLAN ↔
+             * one COMP batch), so the window is bounded only by `batch` bytes. */
+            if ((blen >= batch || (done && nm)) && nm) {
                 /* span[m] absorbs trailing/leading non-file blocks; the last
                  * member's span runs to blen (buffer end). */
                 for (int m = 0; m < nm; m++) {
@@ -2401,27 +2491,32 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
                 CmdBatch pc;
                 if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) return 1;
-                /* pc: one row per member (ZMETA order); dep_group = frame id */
+                /* pc: one row per member (ZMETA order); dep_group = frame id.
+                 * Build one job per frame (contiguous [mem[a].start, mem[r].start)
+                 * — includes interleaved dirs), then compress them in parallel. */
                 int64_t cn = pc.n_rows, wf = 0;
-                uint64_t *fud = malloc(8*(size_t)cn); int64_t *fco = malloc(8*(size_t)cn);
-                uint64_t *fcl = malloc(8*(size_t)cn);
+                uint64_t *fg = malloc(8*(size_t)cn);      /* per-frame plan id */
                 int64_t r = 0;
                 while (r < cn) {
                     int64_t g = pc.dep_group[r], a = r;
                     while (r < cn && pc.dep_group[r] == g) r++;   /* frame [a,r) */
-                    /* contiguous frame: from member a's start to member r's
-                     * start (or buffer end) — includes any interleaved dirs. */
                     int64_t foff = mem[a].start;
                     int64_t fend = (r < nm) ? mem[r].start : blen;
-                    size_t cl = ZSTD_compress(comp, cbnd, buf + foff,
-                                              (size_t)(fend - foff), level);
-                    if (ZSTD_isError(cl)) return 1;
-                    if (pwrite(ofd, comp, cl, append) != (ssize_t)cl) return 1;
-                    fud[wf] = (uint64_t)g; fco[wf] = append; fcl[wf] = cl;
-                    append += (int64_t)cl; wf++; nframes++;
+                    if (wf >= jcap) {
+                        jcap *= 2; jobs = realloc(jobs, sizeof(ZFrameJob)*(size_t)jcap);
+                        fg = realloc(fg, 8*(size_t)jcap);
+                    }
+                    jobs[wf] = (ZFrameJob){buf + foff, fend - foff, level, 0, 0, 0};
+                    fg[wf] = (uint64_t)g; wf++;
                 }
-                emit_comp_batch(comp_fd, wf, fud, fco, fcl);
-                free(fud); free(fco); free(fcl);
+                if (zp_run_window(jobs, (int)wf)) return 1;   /* parallel compress */
+                uint64_t *fco = malloc(8*(size_t)wf), *fcl = malloc(8*(size_t)wf);
+                for (int64_t i = 0; i < wf; i++) {
+                    fco[i] = (uint64_t)jobs[i].coff; fcl[i] = (uint64_t)jobs[i].clen;
+                }
+                emit_comp_batch(comp_fd, wf, fg, (int64_t *)fco, fcl);
+                nframes += wf;
+                free(fg); free(fco); free(fcl);
                 free_cmd_batch(&pc);
                 for (int m = 0; m < nm; m++) free(mem[m].name);
                 blen = 0; mstart = 0; nm = 0;        /* recycle the buffer */
@@ -2429,10 +2524,12 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
         }
         mb_free(&mb); zsrc_close(&z);
     }
+    zp_stop();
     emit_eos(1); emit_eos(comp_fd);
     close(ofd);
-    free(buf); free(mem); free(comp); free(pmeta); free(pbody);
-    fprintf(stderr, "zstream: %ld frames, %ld bytes\n", (long)nframes, (long)append);
+    free(buf); free(mem); free(jobs); free(pmeta); free(pbody);
+    fprintf(stderr, "zstream: %ld frames, %ld bytes\n",
+            (long)nframes, (long)ZP.append);
     return 0;
 }
 
@@ -2489,11 +2586,12 @@ int main(int argc, char **argv) {
     }
 
     if (!strcmp(argv[1], "zstream")) {
-        /* zstream <comp_fd> <out> <level> <batch> <src...> — one-pass planned
-         * recompress: ZMETA on stdout, PLAN on stdin, COMP on comp_fd */
-        if (argc < 7) { fprintf(stderr, "zstream: too few args\n"); return 2; }
-        return run_zstream(atoi(argv[2]), (const char **)&argv[6], argc - 6,
-                           argv[3], atoi(argv[4]), atoll(argv[5]));
+        /* zstream <comp_fd> <out> <level> <batch> <compressors> <src...> —
+         * one-pass planned recompress: ZMETA on stdout, PLAN on stdin,
+         * COMP on comp_fd; compressors compress a window's frames in parallel */
+        if (argc < 8) { fprintf(stderr, "zstream: too few args\n"); return 2; }
+        return run_zstream(atoi(argv[2]), (const char **)&argv[7], argc - 7,
+                           argv[3], atoi(argv[4]), atoll(argv[5]), atoi(argv[6]));
     }
 
     struct io_uring ring;
