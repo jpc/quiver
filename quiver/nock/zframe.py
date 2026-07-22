@@ -1366,7 +1366,8 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                 instr_windows[win_id] = {
                     "members": n, "frames": nframes, "frame_bytes": frame_bytes,
                     "zmeta": {"cols": ["path", "size", "mode", "buf_span"],
-                              "rows": [[paths[i], szs[i], modes[i], int(spanl[i])]
+                              "rows": [[paths[i], int(szs[i]), int(modes[i]),
+                                        int(spanl[i])]
                                        for i in range(min(K, n))], "total": n},
                     "plan": {"cols": ["op", "member", "→frame", "in_off"],
                              "rows": [["COMPRESS", i, int(gf[i]), int(in_off[i])]

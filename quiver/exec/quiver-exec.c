@@ -1493,7 +1493,7 @@ static int run_scan(const char *root, int use_uring, int threads,
  * at ~10 cores; this saturates all of them. */
 
 typedef struct { uint8_t *ib, *ob; size_t icap, isz, ipos, ocap, osz, opos;
-                 int fd, eof; ZSTD_DStream *ds; } Zsrc;
+                 int fd, eof; ZSTD_DStream *ds; int64_t in_consumed; } Zsrc;
 
 static int zsrc_open(Zsrc *z, const char *p) {
     z->fd = open(p, O_RDONLY);
@@ -1501,7 +1501,7 @@ static int zsrc_open(Zsrc *z, const char *p) {
     z->ds = ZSTD_createDStream(); ZSTD_initDStream(z->ds);
     z->icap = ZSTD_DStreamInSize(); z->ib = malloc(z->icap);
     z->ocap = ZSTD_DStreamOutSize(); z->ob = malloc(z->ocap);
-    z->isz = z->ipos = z->osz = z->opos = 0; z->eof = 0;
+    z->isz = z->ipos = z->osz = z->opos = 0; z->eof = 0; z->in_consumed = 0;
     return 0;
 }
 static void zsrc_close(Zsrc *z) {
@@ -1513,7 +1513,8 @@ static size_t zsrc_read(Zsrc *z, uint8_t *dst, size_t n) {
         while (z->opos >= z->osz) {                 /* refill decompressed */
             if (z->ipos >= z->isz && !z->eof) {
                 ssize_t r = read(z->fd, z->ib, z->icap);
-                if (r <= 0) z->eof = 1; else { z->isz = r; z->ipos = 0; }
+                if (r <= 0) z->eof = 1;
+                else { z->isz = r; z->ipos = 0; z->in_consumed += r; }
             }
             if (z->ipos >= z->isz && z->eof) return got;
             ZSTD_inBuffer in = {z->ib, z->isz, z->ipos};
@@ -2328,7 +2329,7 @@ typedef struct { int64_t start, span, size, mtime; int32_t mode, uid, gid;
  * offline. Off unless QUIVER_TRACE is set; a global mutex-guarded array flushed
  * at the end — fine for a short trace run, zero cost when off. */
 enum { TR_DECODE, TR_EXCH_WAIT, TR_EXCH, TR_COMPRESS };
-typedef struct { int lane, kind; double t0, t1; int64_t a, b; } TrSpan;
+typedef struct { int lane, kind; double t0, t1; int64_t a, b, c; } TrSpan;
 static struct { pthread_mutex_t mu; TrSpan *v; int n, cap, on; } TR =
     { .mu = PTHREAD_MUTEX_INITIALIZER };
 static double tr_now(void) {
@@ -2336,14 +2337,18 @@ static double tr_now(void) {
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;          /* ms */
 }
 static void tr_init(void) { TR.on = getenv("QUIVER_TRACE") != NULL; }
-static void tr_span(int lane, int kind, double t0, double t1,
-                    int64_t a, int64_t b) {
+static void tr_span3(int lane, int kind, double t0, double t1,
+                     int64_t a, int64_t b, int64_t c) {
     if (!TR.on) return;
     pthread_mutex_lock(&TR.mu);
     if (TR.n >= TR.cap) { TR.cap = TR.cap ? TR.cap * 2 : 4096;
                           TR.v = realloc(TR.v, sizeof(TrSpan) * (size_t)TR.cap); }
-    TR.v[TR.n++] = (TrSpan){lane, kind, t0, t1, a, b};
+    TR.v[TR.n++] = (TrSpan){lane, kind, t0, t1, a, b, c};
     pthread_mutex_unlock(&TR.mu);
+}
+static void tr_span(int lane, int kind, double t0, double t1,
+                    int64_t a, int64_t b) {
+    tr_span3(lane, kind, t0, t1, a, b, 0);
 }
 static void tr_dump(void) {
     const char *p = getenv("QUIVER_TRACE");
@@ -2356,9 +2361,10 @@ static void tr_dump(void) {
     for (int i = 0; i < TR.n; i++) {
         TrSpan *s = &TR.v[i];
         fprintf(f, "  {\"lane\":%d,\"kind\":%d,\"t0\":%.3f,\"t1\":%.3f,"
-                   "\"a\":%lld,\"b\":%lld}%s\n",
+                   "\"a\":%lld,\"b\":%lld,\"c\":%lld}%s\n",
                 s->lane, s->kind, s->t0 - base, s->t1 - base,
-                (long long)s->a, (long long)s->b, i + 1 < TR.n ? "," : "");
+                (long long)s->a, (long long)s->b, (long long)s->c,
+                i + 1 < TR.n ? "," : "");
     }
     fprintf(f, "]\n");
     fclose(f);
@@ -2519,6 +2525,7 @@ static void *zstream_reader(void *arg) {
         if (zsrc_open(&z, ZS.srcs[si])) continue;
         ZBuf *zb = zbp_acquire();                /* refcounted window buffer */
         uint8_t *buf = zb->buf; int64_t bcap = zb->cap;
+        int64_t win_in0 = 0;                     /* compressed input at win start */
         MetaBuilder mb; mb_init(&mb); mb.grow = 1;  /* one ZMETA batch/window */
         int64_t blen = 0, mstart = 0; int nm = 0; int32_t ordinal = 0;
         char pax_path[4096], gnu[4096], name[4096];
@@ -2592,7 +2599,9 @@ static void *zstream_reader(void *arg) {
                            mem[m].mode, mem[m].mtime, mem[m].uid, mem[m].gid,
                            mem[m].span);
                 }
-                tr_span(lane, TR_DECODE, win_t0, tr_now(), nm, blen);
+                /* DECODE span: a=members, b=decompressed out, c=compressed in */
+                tr_span3(lane, TR_DECODE, win_t0, tr_now(), nm, blen,
+                         z.in_consumed - win_in0);
                 /* Serialized exchange: emit ZMETA, read PLAN — one reader at a
                  * time so stdin/stdout stay ordered. Compression is NOT here:
                  * we push frame jobs onto the shared queue and move on. */
@@ -2632,6 +2641,7 @@ static void *zstream_reader(void *arg) {
                 zb = zbp_acquire(); buf = zb->buf; bcap = zb->cap;  /* next window */
                 blen = 0; mstart = 0; nm = 0;
                 win_t0 = tr_now();                   /* next window starts now */
+                win_in0 = z.in_consumed;             /* input baseline for next */
             }
         }
         mb_free(&mb); zsrc_close(&z);
