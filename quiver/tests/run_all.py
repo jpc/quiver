@@ -787,6 +787,32 @@ def test_zframe_zstream(tmp):
     zframe.unpack(out, str(tmp/"zsx"))
     for rel, data in want.items():
         assert (tmp/"zsx"/rel).read_bytes() == data
+    # buf_span robustness: interleaved DIRECTORY entries + long (PAX) paths —
+    # the naive sum-of-member-lens framing drops those blocks; span absorbs them.
+    want2 = {}
+    raw2 = io.BytesIO()
+    with tarfile.open(fileobj=raw2, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for dd in range(4):
+            di = tarfile.TarInfo(f"deep/dir{dd}"); di.type = tarfile.DIRTYPE
+            di.mode = 0o755; tf.addfile(di)             # interleaved dir entries
+            for i in range(30):
+                nm = f"deep/dir{dd}/" + ("verylongsegment" * 8) + f"/f{i:03d}"
+                b = (f"p{dd}.{i}=".encode()) * (5 + i)
+                ti = tarfile.TarInfo(nm); ti.size = len(b); ti.mode = 0o644
+                ti.mtime = 1_700_000_000 + i
+                tf.addfile(ti, io.BytesIO(b)); want2[nm] = b
+    src2 = str(tmp/"zss2.tar.zstd")
+    with open(src2, "wb") as fo:
+        fo.write(zstd.ZstdCompressor().compress(raw2.getvalue()))
+    out2 = str(tmp/"zsout2.tar.zstd")
+    r2 = zframe.recompress_stream([src2], out2, level=4, batch_bytes=16 << 10)
+    assert r2.members == 120, r2.members
+    n2 = sp.run(f"zstd -dc {out2} | tar t | wc -l", shell=True,
+                capture_output=True, text=True).stdout.strip()
+    assert int(n2) >= 120, n2                          # files (+ dirs) all present
+    zframe.unpack(out2, str(tmp/"zsx2"))
+    for rel, data in want2.items():
+        assert (tmp/"zsx2"/rel).read_bytes() == data
     ok("zframe zstream: one-pass ZMETA→PLAN→COMP recompress, round-trips")
 
 

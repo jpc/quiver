@@ -1274,17 +1274,22 @@ def recompress_stream(inputs, out_path, level=10, batch_bytes=16 << 20):
         n = m.height
         if not n:
             continue
-        foot = 512 + ((m["size"] + 511) // 512) * 512      # tar footprint/member
-        in_off = (foot.cum_sum() - foot) + 512             # body offset in frame
-        cmds = cmd_df(n, opcode=[OP_COMPRESS] * n,         # all → this frame
+        # First cut: one frame per window (all members → this frame). in_off is
+        # computed exactly from buf_span (C's per-member buffer span, which
+        # absorbs interleaved dir/PAX/GNU blocks): a member's body sits at the
+        # end of its region, so in_off = entry_off_in_frame + span - padded_body.
+        span = m["buf_span"]
+        padbody = ((m["size"] + 511) // 512) * 512
+        entry_off = span.cum_sum() - span                  # within the frame
+        in_off = (entry_off + span - padbody).to_list()
+        cmds = cmd_df(n, opcode=[OP_COMPRESS] * n,
                       dep_group=pl.Series([frame_id] * n, dtype=pl.Int64))
         plan_w.write_batch(_df_cols(cmds)); proc.stdin.flush()
         c = _to_pl(comp.read_batch())                      # COMP: frame coff/clen
         coff, clen = int(c["read_size"][0]), int(c["cksum"][0])
-        io = in_off.to_list()
         for i, r in enumerate(m.iter_rows(named=True)):
             fw.add(r["path"], r["size"], r["mode"], r["mtime_ns"], r["uid"],
-                   r["gid"], frame_id, coff, clen, io[i])
+                   r["gid"], frame_id, coff, clen, in_off[i])
         frame_id += 1
     # C reads exactly one PLAN per window and exits after the last COMP, so no
     # PLAN terminator is sent; just close (the pipe may already be gone).

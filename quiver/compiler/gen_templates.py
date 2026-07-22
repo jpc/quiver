@@ -14,10 +14,14 @@ SCHEMAS = {
               ("cksum","u64"),("etag","large_binary"),("parts","i32")],
              [[1,2],[0,-5],[10,20],[3,4],[b"aa",b"bb"],[0,2]]),
     # zscan member metadata → the planner (replaces a bespoke 36B record)
+    # buf_span (trailing): zstream emits each member's total buffer span
+    # (bytes since the previous member, absorbing intervening dir/PAX/GNU
+    # blocks) so the planner computes exact in_off; zscan emits the tar
+    # footprint (zexec ignores it) — a harmless extra column for that path.
     "ZMETA": ([("path","large_string"),("source_id","i32"),("ordinal","i32"),
                ("size","i64"),("mode","i32"),("mtime_ns","i64"),
-               ("uid","i32"),("gid","i32")],
-              [["a","bb"],[1,2],[3,4],[5,6],[7,8],[9,10],[11,12],[13,14]]),
+               ("uid","i32"),("gid","i32"),("buf_span","i64")],
+              [["a","bb"],[1,2],[3,4],[5,6],[7,8],[9,10],[11,12],[13,14],[15,16]]),
     # child_count: -1 on a normal stat row; >=0 marks a directory
     # close-event (path=dir, is_dir=1) carrying its emitted-child count,
     # emitted at getdents-EOF only when the scan is asked for closes.

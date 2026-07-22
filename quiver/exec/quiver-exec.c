@@ -1939,7 +1939,7 @@ typedef struct {
     int64_t n, cap;
     char *pdata; int64_t pdata_len, pdata_cap; int64_t *poff;
     int32_t *source_id, *ordinal, *mode, *uid, *gid;
-    int64_t *size, *mtime;
+    int64_t *size, *mtime, *span;
 } MetaBuilder;
 
 static void mb_init(MetaBuilder *b) {
@@ -1954,10 +1954,12 @@ static void mb_init(MetaBuilder *b) {
     b->gid = malloc(4 * (size_t)b->cap);
     b->size = malloc(8 * (size_t)b->cap);
     b->mtime = malloc(8 * (size_t)b->cap);
+    b->span = malloc(8 * (size_t)b->cap);
 }
 static void mb_free(MetaBuilder *b) {
     free(b->pdata); free(b->poff); free(b->source_id); free(b->ordinal);
     free(b->mode); free(b->uid); free(b->gid); free(b->size); free(b->mtime);
+    free(b->span);
 }
 static int mb_flush(MetaBuilder *b) {          /* col order matches ZMETA */
     if (b->n == 0) return 0;
@@ -1966,7 +1968,7 @@ static int mb_flush(MetaBuilder *b) {          /* col order matches ZMETA */
         {NULL,0},{b->source_id, 4*b->n}, {NULL,0},{b->ordinal, 4*b->n},
         {NULL,0},{b->size, 8*b->n}, {NULL,0},{b->mode, 4*b->n},
         {NULL,0},{b->mtime, 8*b->n}, {NULL,0},{b->uid, 4*b->n},
-        {NULL,0},{b->gid, 4*b->n},
+        {NULL,0},{b->gid, 4*b->n}, {NULL,0},{b->span, 8*b->n},
     };
     pthread_mutex_lock(&Z.omu);
     int rc = emit_batch(1, ZMETA_BATCH_TMPL, ZMETA_TMPL_LEN,
@@ -1979,7 +1981,7 @@ static int mb_flush(MetaBuilder *b) {          /* col order matches ZMETA */
 }
 static void mb_row(MetaBuilder *b, const char *name, int32_t src, int32_t ord,
                    int64_t size, int32_t mode, int64_t mtime,
-                   int32_t uid, int32_t gid) {
+                   int32_t uid, int32_t gid, int64_t span) {
     int64_t nl = (int64_t)strlen(name);
     while (b->pdata_len + nl > b->pdata_cap)
         b->pdata = realloc(b->pdata, (size_t)(b->pdata_cap *= 2));
@@ -1988,6 +1990,7 @@ static void mb_row(MetaBuilder *b, const char *name, int32_t src, int32_t ord,
     b->poff[i + 1] = b->pdata_len;
     b->source_id[i] = src; b->ordinal[i] = ord; b->size[i] = size;
     b->mode[i] = mode; b->mtime[i] = mtime; b->uid[i] = uid; b->gid[i] = gid;
+    b->span[i] = span;
     if (b->n >= b->cap) mb_flush(b);
 }
 
@@ -2041,7 +2044,8 @@ static void *z_scan_reader(void *arg) {
             if (typ == '0' || typ == 0) {
                 mb_row(&mb, name, si, ordinal, rsize, zoctal(hdr + 100, 8),
                        zoctal(hdr + 136, 12) * 1000000000LL,
-                       zoctal(hdr + 108, 8), zoctal(hdr + 116, 8));
+                       zoctal(hdr + 108, 8), zoctal(hdr + 116, 8),
+                       512 + (rsize + 511) / 512 * 512);   /* tar footprint */
                 ordinal++;
             }
             has_pax = 0; has_gnu = 0; pax_size = -1;
@@ -2295,7 +2299,14 @@ static int emit_comp_batch(int fd, int64_t n, uint64_t *ud, int64_t *coff,
     return rc;
 }
 
-typedef struct { int64_t off, len, size, mtime; int32_t mode, uid, gid; } SMem;
+/* One file member in a window. `start` is the buffer offset where this
+ * member's region begins — i.e. the end of the previous file member, so any
+ * intervening dir/PAX/GNU blocks belong to THIS member's span. `span` (filled
+ * at window cut) = next member's start (or buffer end) − start, and absorbs
+ * those blocks, so a frame = the contiguous byte range [mem[a].start,
+ * mem[r].start) with nothing dropped and no gather. */
+typedef struct { int64_t start, span, size, mtime; int32_t mode, uid, gid;
+                 char *name; } SMem;
 
 static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                        const char *out, int level, int64_t batch) {
@@ -2315,7 +2326,7 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
         Zsrc z;
         if (zsrc_open(&z, srcs[si])) continue;
         MetaBuilder mb; mb_init(&mb);
-        int64_t blen = 0; int nm = 0; int32_t ordinal = 0;
+        int64_t blen = 0, mstart = 0; int nm = 0; int32_t ordinal = 0;
         char pax_path[4096], gnu[4096], name[4096];
         int has_pax = 0, has_gnu = 0; int64_t pax_size = -1;
         uint8_t hdr[512]; int done = 0;
@@ -2333,12 +2344,12 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                     buf = realloc(buf, (size_t)bcap);
                     comp = realloc(comp, cbnd = ZSTD_compressBound((size_t)bcap));
                 }
-                if (typ == 'x' || typ == 'g') {
+                if (typ == 'x' || typ == 'g') {          /* PAX: keep in buffer */
                     memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, bl);
                     z_parse_pax(buf + blen + 512, sz, pax_path, &has_pax, &pax_size);
                     blen += 512 + bl; continue;
                 }
-                if (typ == 'L') {
+                if (typ == 'L') {                        /* GNU long name */
                     memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, bl);
                     int nl = sz < 4095 ? (int)sz : 4095;
                     memcpy(gnu, buf + blen + 512, nl);
@@ -2357,24 +2368,36 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                 }
                 int64_t rsize = pax_size >= 0 ? pax_size : sz;
                 int64_t rbl = (rsize + 511) / 512 * 512;
-                int64_t off = blen;
                 memcpy(buf + blen, hdr, 512); zsrc_read(&z, buf + blen + 512, rbl);
                 blen += 512 + rbl;
+                /* Only files become members; a dir (typ '5') etc. stays in the
+                 * buffer and is absorbed into the NEXT file member's span. */
                 if (typ == '0' || typ == 0) {
                     if (nm >= mcap_m) mem = realloc(mem, sizeof(SMem)*(size_t)(mcap_m*=2));
-                    mem[nm] = (SMem){off, 512 + rbl, rsize,
-                        zoctal(hdr+136,12)*1000000000LL, (int32_t)zoctal(hdr+100,8),
-                        (int32_t)zoctal(hdr+108,8), (int32_t)zoctal(hdr+116,8)};
-                    mb_row(&mb, name, 0, ordinal++, rsize, mem[nm].mode,
-                           mem[nm].mtime, mem[nm].uid, mem[nm].gid);
-                    nm++;
+                    mem[nm].start = mstart; mem[nm].size = rsize;
+                    mem[nm].mtime = zoctal(hdr+136,12)*1000000000LL;
+                    mem[nm].mode = (int32_t)zoctal(hdr+100,8);
+                    mem[nm].uid = (int32_t)zoctal(hdr+108,8);
+                    mem[nm].gid = (int32_t)zoctal(hdr+116,8);
+                    mem[nm].name = strdup(name);
+                    nm++; ordinal++;
+                    mstart = blen;                   /* next member starts here */
                 }
                 has_pax = has_gnu = 0; pax_size = -1;
             }
-            /* window full (or source done): plan it, compress its frames.
+            /* window full (or source done): finalize spans, plan, compress.
              * Cap members below the ZMETA batch size so mb never auto-flushes
              * mid-window — one ZMETA batch ↔ one PLAN batch ↔ one window. */
             if ((blen >= batch || nm >= SCAN_BATCH / 2 || (done && nm)) && nm) {
+                /* span[m] absorbs trailing/leading non-file blocks; the last
+                 * member's span runs to blen (buffer end). */
+                for (int m = 0; m < nm; m++) {
+                    int64_t next = (m + 1 < nm) ? mem[m+1].start : blen;
+                    mem[m].span = next - mem[m].start;
+                    mb_row(&mb, mem[m].name, 0, (int32_t)m, mem[m].size,
+                           mem[m].mode, mem[m].mtime, mem[m].uid, mem[m].gid,
+                           mem[m].span);
+                }
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
                 CmdBatch pc;
                 if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) return 1;
@@ -2386,10 +2409,12 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                 while (r < cn) {
                     int64_t g = pc.dep_group[r], a = r;
                     while (r < cn && pc.dep_group[r] == g) r++;   /* frame [a,r) */
-                    int64_t foff = mem[a].off, flen = 0;
-                    for (int64_t m = a; m < r; m++) flen += mem[m].len;
+                    /* contiguous frame: from member a's start to member r's
+                     * start (or buffer end) — includes any interleaved dirs. */
+                    int64_t foff = mem[a].start;
+                    int64_t fend = (r < nm) ? mem[r].start : blen;
                     size_t cl = ZSTD_compress(comp, cbnd, buf + foff,
-                                              (size_t)flen, level);
+                                              (size_t)(fend - foff), level);
                     if (ZSTD_isError(cl)) return 1;
                     if (pwrite(ofd, comp, cl, append) != (ssize_t)cl) return 1;
                     fud[wf] = (uint64_t)g; fco[wf] = append; fcl[wf] = cl;
@@ -2398,7 +2423,8 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                 emit_comp_batch(comp_fd, wf, fud, fco, fcl);
                 free(fud); free(fco); free(fcl);
                 free_cmd_batch(&pc);
-                blen = 0; nm = 0;                    /* recycle the buffer */
+                for (int m = 0; m < nm; m++) free(mem[m].name);
+                blen = 0; mstart = 0; nm = 0;        /* recycle the buffer */
             }
         }
         mb_free(&mb); zsrc_close(&z);
