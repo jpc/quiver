@@ -2273,8 +2273,13 @@ static int run_zexec(const char *plan_path, const char **srcs, int nsrc,
  * compress); the union/async pipeline (keep the sinks fed) is the follow-up.
  * Frames are contiguous member runs, so a frame is a byte slice of the buffer
  * (no gather; filter/reshard gather is the next increment). */
-static int read_cmd_stream(CmdBatch *cb, uint8_t **meta, size_t *mcap,
-                           uint8_t **body, size_t *bcap) {
+/* Read one ZPLAN batch — a NARROW plan: a single i64 `dep_group` column (the
+ * per-member frame id). The wide CMD word costs ~16 ms/window to serialize at
+ * EVI size (the three empty var-length columns dominate); the plan only needs
+ * dep_group, so this 1-column form is ~85× cheaper. An i64 array has 2 buffers
+ * (validity[0], values[1]); copy the values into *dg. Returns 1 at EOS. */
+static int read_zplan(int64_t **dg, int64_t *dgcap, int64_t *n_out,
+                      uint8_t **meta, size_t *mcap, uint8_t **body, size_t *bcap) {
     for (;;) {
         uint32_t hdr[2];
         int r = read_full(0, hdr, 8);
@@ -2291,7 +2296,16 @@ static int read_cmd_stream(CmdBatch *cb, uint8_t **meta, size_t *mcap,
         }
         int64_t htp = fb_field(*meta, rt, 1);
         if (htp >= 0 && (*meta)[htp] == 1) continue;          /* schema msg */
-        if (parse_cmd_batch(*meta, *body, cb)) return -1;
+        int64_t rb = fb_offset_field(*meta, rt, 2);
+        int64_t nrows = fb_i64(*meta, fb_field(*meta, rb, 0));
+        int64_t bufs = fb_offset_field(*meta, rb, 2);
+        if (fb_u32(*meta, bufs) < 2) return -1;
+        int64_t voff = fb_i64(*meta, bufs + 4 + 16 * 1);      /* values buffer */
+        if (nrows > *dgcap) {
+            *dg = realloc(*dg, sizeof(int64_t) * (size_t)nrows); *dgcap = nrows;
+        }
+        memcpy(*dg, *body + voff, sizeof(int64_t) * (size_t)nrows);
+        *n_out = nrows;
         return 0;
     }
 }
@@ -2508,6 +2522,10 @@ static struct {
     pthread_mutex_t exch;
     _Atomic int64_t nframes;
     int64_t win_id;            /* monotonic exchange counter (under exch lock) */
+    /* C-level serialization profile (accumulated under exch lock, ms): the
+     * ZMETA emit (C→Py), the plan round-trip (read_zplan — Py planning + wire),
+     * and the exch-lock wait. Reported in the run summary. */
+    double t_zmeta, t_plan, t_wait; int64_t n_win;
     int rc;
 } ZS;
 
@@ -2515,6 +2533,7 @@ static void *zstream_reader(void *arg) {
     int lane = *(int *)arg;                      /* reader lanes: 0..R-1 */
     int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
     uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
+    int64_t *dg = NULL, dgcap = 0;               /* ZPLAN dep_group buffer */
     int64_t batch = ZS.batch; int level = ZS.level;
     double win_t0 = tr_now();                    /* start of the current window */
 
@@ -2610,17 +2629,21 @@ static void *zstream_reader(void *arg) {
                 double w1 = tr_now(); tr_span(lane, TR_EXCH_WAIT, w0, w1, 0, 0);
                 int64_t wid = ZS.win_id++;           /* window id (exch order) */
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
-                CmdBatch pc;
-                if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) {
+                double w2 = tr_now();
+                int64_t cn;                          /* ZPLAN: dep_group[member] */
+                if (read_zplan(&dg, &dgcap, &cn, &pmeta, &pmc, &pbody, &pbc)) {
                     ZS.rc = 1; pthread_mutex_unlock(&ZS.exch); break;
                 }
-                /* pc: one row per member (ZMETA order); dep_group = GLOBAL frame
-                 * id (Python-assigned). Build one job per frame (contiguous
-                 * [mem[a].start, mem[r].start) — includes interleaved dirs). */
-                int64_t cn = pc.n_rows, wf = 0, r = 0;
+                double w3 = tr_now();
+                ZS.t_wait += w1 - w0; ZS.t_zmeta += w2 - w1;
+                ZS.t_plan += w3 - w2; ZS.n_win++;
+                /* dg[i] = GLOBAL frame id (Python-assigned). Build one job per
+                 * frame (contiguous [mem[a].start, mem[r].start), includes any
+                 * interleaved dirs). */
+                int64_t wf = 0, r = 0;
                 while (r < cn) {
-                    int64_t g = pc.dep_group[r], a = r;
-                    while (r < cn && pc.dep_group[r] == g) r++;   /* frame [a,r) */
+                    int64_t g = dg[r], a = r;
+                    while (r < cn && dg[r] == g) r++;             /* frame [a,r) */
                     int64_t foff = mem[a].start;
                     int64_t fend = (r < nm) ? mem[r].start : blen;
                     ZSJob *jb = malloc(sizeof *jb);
@@ -2632,7 +2655,6 @@ static void *zstream_reader(void *arg) {
                     jq_push(jb);
                     wf++;
                 }
-                free_cmd_batch(&pc);
                 pthread_mutex_unlock(&ZS.exch);
                 tr_span(lane, TR_EXCH, w1, tr_now(), wf, wid);  /* b = window id */
                 atomic_fetch_add(&ZS.nframes, wf);
@@ -2648,7 +2670,7 @@ static void *zstream_reader(void *arg) {
         zbp_unref(zb);                               /* the unused trailing buf */
         if (ZS.rc) break;
     }
-    free(mem); free(pmeta); free(pbody);
+    free(mem); free(pmeta); free(pbody); free(dg);
     return NULL;
 }
 
@@ -2685,6 +2707,11 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
     tr_dump();
     fprintf(stderr, "zstream: %ld frames, %ld bytes (%d readers)\n",
             (long)ZS.nframes, (long)JQ.append, readers);
+    if (ZS.n_win)
+        fprintf(stderr, "zstream exch/window (ms): zmeta-emit %.3f  plan-rt "
+                "%.3f  lock-wait %.3f  (%ld windows)\n",
+                ZS.t_zmeta / ZS.n_win, ZS.t_plan / ZS.n_win,
+                ZS.t_wait / ZS.n_win, (long)ZS.n_win);
     return ZS.rc || JQ.err;
 }
 

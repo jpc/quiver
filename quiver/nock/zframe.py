@@ -1273,33 +1273,16 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     Multi-reader parallel decode + an async compressor pool (compression is
     decoupled from the serialized plan exchange), 2-thread driver."""
     import subprocess
-    from ..wire import EXE, CMD_SCHEMA, OP_COMPRESS, _to_pl
+    from ..wire import EXE, _to_pl
     compressors = compressors or (os.cpu_count() or 8)
     readers = readers or min(24, len(inputs))          # one decode stream/source
 
-    # The PLAN is intrinsically one opcode (COMPRESS) — only dep_group varies.
-    # Build the CMD-schema column list directly (bypassing cmd_df's 15-column
-    # DataFrame construction + cast + _df_cols), the per-window planning cost
-    # the profile flagged: ~4.2 ms → ~0.05 ms/window (85×). Constant columns
-    # are memoized by row count so a run of same-size windows reuses them.
-    _pc_cache = {}
-    def _plan_cols(n, gframe_np):
-        c = _pc_cache.get(n)
-        if c is None:
-            es = [""] * n; eb = [b""] * n; z = np.zeros(n, np.int64)
-            c = (np.full(n, OP_COMPRESS, np.uint8), es, eb, z,
-                 np.ones(n, np.int64), np.full(n, -1, np.int32),
-                 np.full(n, -1, np.int64), np.full(n, -1, np.int32),
-                 np.full(n, -1, np.int32), np.full(n, -1, np.int64),
-                 np.arange(n, dtype=np.uint64))
-            if len(_pc_cache) < 512:
-                _pc_cache[n] = c
-        opcode, es, eb, z, ones, m1_32, m1_64, u1_32, g1_32, pr1, ud = c
-        # CMD_SCHEMA order: user_data, opcode, dep_group, path, dst_path, header,
-        # header_offset, data_offset, size, pad_align, mode, mtime_ns, uid, gid,
-        # parent_row.
-        return [ud, opcode, gframe_np, es, es, eb, z, z, z, ones,
-                m1_32, m1_64, u1_32, g1_32, pr1]
+    # The PLAN only needs the per-member frame id — so it rides a NARROW,
+    # single-column ZPLAN schema (dep_group:i64), not the wide 15-column CMD
+    # word. Serializing the wide word cost ~16 ms/window at EVI size (the three
+    # empty var-length columns dominate); the 1-column form is ~85× cheaper
+    # (~0.2 ms). C's read_zplan copies the i64 values buffer straight out.
+    ZPLAN = [("dep_group", "i64")]
     r_comp, w_comp = os.pipe()
     argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(window_bytes),
             str(compressors), str(readers), *[str(i) for i in inputs]]
@@ -1309,7 +1292,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     zmeta = StreamReader(proc.stdout)
     comp_f = os.fdopen(r_comp, "rb")
     comp = StreamReader(comp_f)
-    plan_w = StreamWriter(proc.stdin, CMD_SCHEMA)
+    plan_w = StreamWriter(proc.stdin, ZPLAN)
     proc.stdin.flush()
 
     instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # per-window capture
@@ -1352,7 +1335,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             # exchange lock waiting on it); only THEN do bookkeeping. Store the
             # whole window frame by reference (O(1)) — the column select + concat
             # + join happen once at the end, off the serialized critical path.
-            plan_w.write_batch(_plan_cols(n, gf_np)); proc.stdin.flush()
+            plan_w.write_batch([gf_np]); proc.stdin.flush()
             M.append(m)
             state["base"] = base + nframes
             if instr_windows is not None and win_id < INSTR_MAX_WIN:
