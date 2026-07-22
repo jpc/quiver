@@ -1273,12 +1273,16 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     ftmp = tempfile.TemporaryFile()
     fw = _FooterStream(ftmp)
     base = 0                                        # global frame id offset
-    instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # capture a sample window
+    instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # per-window capture
+    instr_windows = {} if instr_path else None
+    win_id = -1
+    INSTR_MAX_WIN, INSTR_ROWS = 64, 10              # bound the capture
     for zb in zmeta:                                # one batch per window
         m = pl.DataFrame(zb)
         n = m.height
         if not n:
             continue
+        win_id += 1                                 # matches C's EXCH span b
         # Assign members to frames within the window: greedy fill by buffer
         # span, cutting every frame_bytes. Frame id (dep_group) must be locally
         # 0..F-1 (C groups the PLAN by it) but globally unique in the footer.
@@ -1303,31 +1307,26 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
         paths = m["path"].to_list(); szs = m["size"].to_list()
         modes = m["mode"].to_list(); mts = m["mtime_ns"].to_list()
         uids = m["uid"].to_list(); gids = m["gid"].to_list()
-        # instruction-stream preview: capture the three streams for one window
-        # (truncated) — the ZMETA in, PLAN out, and COMP back, as the executor
-        # and planner actually exchanged them.
-        if instr_path and base:                     # skip window 0 (tiny warmup)
-            import json as _json
-            K = 12
+        # instruction-stream preview: capture each window's three streams
+        # (truncated) — the ZMETA in, PLAN out, COMP back — keyed by window id
+        # so the visualizer can show the instructions for any exchange block.
+        if instr_windows is not None and win_id < INSTR_MAX_WIN:
+            K = INSTR_ROWS
             frames_out = sorted(coff)
-            _json.dump({
-                "window": {"members": n, "frames": len(coff),
-                           "frame_bytes": frame_bytes},
-                "zmeta": {"cols": ["path", "size", "mode", "mtime_ns",
-                                   "uid", "gid", "buf_span"],
-                          "rows": [[paths[i], szs[i], modes[i], mts[i],
-                                    uids[i], gids[i], int(span[i])]
+            spanl = span.to_list()
+            instr_windows[win_id] = {
+                "members": n, "frames": len(coff), "frame_bytes": frame_bytes,
+                "zmeta": {"cols": ["path", "size", "mode", "buf_span"],
+                          "rows": [[paths[i], szs[i], modes[i], int(spanl[i])]
                                    for i in range(min(K, n))], "total": n},
-                "plan": {"cols": ["opcode", "member", "→ frame (dep_group)",
-                                  "in_off"],
+                "plan": {"cols": ["op", "member", "→frame", "in_off"],
                          "rows": [["COMPRESS", i, base + lf[i], in_off[i]]
                                   for i in range(min(K, n))], "total": n},
                 "comp": {"cols": ["frame", "coff", "clen"],
                          "rows": [[base + f, coff[f], clen[f]]
                                   for f in frames_out[:K]],
                          "total": len(coff)},
-            }, open(instr_path, "w"), indent=0)
-            instr_path = None                       # once
+            }
         for i in range(n):
             f = lf[i]
             fw.add(paths[i], szs[i], modes[i], mts[i], uids[i], gids[i],
@@ -1340,6 +1339,11 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     comp_f.close()
     fw.close()
     _write_footer(out_path, ftmp, False); ftmp.close()
+    if instr_windows is not None:
+        import json as _json
+        _json.dump({"windows": instr_windows,
+                    "captured": len(instr_windows), "total_windows": win_id + 1},
+                   open(instr_path, "w"))
     assert proc.wait() == 0
     return Result(members=fw.members, frames=base)
 

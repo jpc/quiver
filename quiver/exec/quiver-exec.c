@@ -2457,6 +2457,7 @@ static struct {
     int level, comp_fd; int64_t batch;
     pthread_mutex_t exch;
     _Atomic int64_t nframes;
+    int64_t win_id;            /* monotonic exchange counter (under exch lock) */
     int rc;
 } ZS;
 
@@ -2553,6 +2554,7 @@ static void *zstream_reader(void *arg) {
                 double w0 = tr_now();
                 pthread_mutex_lock(&ZS.exch);
                 double w1 = tr_now(); tr_span(lane, TR_EXCH_WAIT, w0, w1, 0, 0);
+                int64_t wid = ZS.win_id++;           /* window id (exch order) */
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
                 CmdBatch pc;
                 if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) {
@@ -2583,7 +2585,7 @@ static void *zstream_reader(void *arg) {
                 }
                 emit_comp_batch(comp_fd, wf, fg, (int64_t *)fco, fcl);
                 pthread_mutex_unlock(&ZS.exch);
-                tr_span(lane, TR_EXCH, w1, tr_now(), wf, 0);
+                tr_span(lane, TR_EXCH, w1, tr_now(), wf, wid);  /* b = window id */
                 atomic_fetch_add(&ZS.nframes, wf);
                 free(fg); free(fco); free(fcl);
                 free_cmd_batch(&pc);
