@@ -1285,6 +1285,17 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             pass_fds=(w_comp,))
     os.close(w_comp)
+    # Warm Polars' Rust runtime (rayon thread pool + per-op-kind execution paths
+    # + allocator) NOW — concurrently with C's first-window decode (~10-16 ms),
+    # so window 0's planning isn't paying a ~2-5× cold-start on the serialized
+    # critical path. Exercises the exact ops the front thread uses.
+    _warm = pl.DataFrame({"buf_span": [600, 700], "size": [88, 99]})
+    _we = _warm["buf_span"].cum_sum() - _warm["buf_span"]
+    _warm = _warm.with_columns(_g=(_we // frame_bytes).cast(pl.Int64), _e=_we)
+    _warm = _warm.with_columns(_f=pl.col("_e").min().over("_g"))
+    _wb = io.BytesIO(); _warm.select("_g").write_ipc_stream(
+        _wb, compat_level=pl.CompatLevel.oldest())
+    pl.read_ipc_stream(_wb.getvalue())
     # All three streams go through Polars' native IPC (quiver.ipc): ZMETA in
     # (front thread, the critical-path parse), COMP in (back thread), PLAN out.
     zmeta = ipc.Reader(proc.stdout)                  # ZMETA ← native Polars
