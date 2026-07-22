@@ -32,6 +32,10 @@ def main(argv=None):
                     help="C-engine reader threads (parse fans out per source)")
     sp.add_argument("--py", action="store_true",
                     help="use the pure-Python engine (GIL-bound; supports --limit)")
+    sp.add_argument("--stream", action="store_true",
+                    help="one-pass planned engine (zstream port: decompress once, "
+                         "plan the window, compress live buffers). No "
+                         "filter/reshard/S3/WAL yet — those stay on the C engine.")
     sp.add_argument("--glob", action="append", default=None, metavar="PAT",
                     help="keep only members matching PAT (repeatable); "
                          "triggers the scan→plan→exec path")
@@ -102,7 +106,12 @@ def main(argv=None):
                 f"{int(el)//3600:d}:{int(el)%3600//60:02d}:{int(el)%60:02d}   ")
             sys.stderr.flush()
 
-        if a.py:
+        if a.stream:
+            res = zframe.recompress_stream(
+                a.inputs, a.out, level=a.level,
+                frame_bytes=int(a.batch_mb * (1 << 20)),
+                compressors=a.workers, readers=a.readers)
+        elif a.py:
             res = zframe.recompress(a.inputs, a.out,
                                     batch_bytes=int(a.batch_mb * (1 << 20)),
                                     level=a.level, workers=a.workers,

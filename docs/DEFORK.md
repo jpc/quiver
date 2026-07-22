@@ -47,9 +47,39 @@
 >   Test asserts the sharded executor == Python oracle byte-for-byte over a
 >   2-shard tree. (Replaced the runtime path→fd cache first tried here, per the
 >   AOT-over-runtime discipline.) `merge` itself is already zero-copy/logical.
-> - ⏳ Remaining: recompress records→`COMP` completions (the §10.4 unification
->   half), and distributed unpack (partition the frame/shard set across nodes —
->   now unblocked by the portable static binary).
+> - ✅ **distributed unpack** — `unpack_distributed` partitions the frame/shard
+>   set across N executors (round-robin, balanced by frame), no reduce (disjoint
+>   dest files); transports gained `sources=`. Test: 3-executor == single-node
+>   byte-for-byte, linear + sharded.
+> - ✅ **§10.4 recompress records→ZMETA+COMP: the `zstream` port** — the last
+>   fork closed. One-pass planned recompress (`recompress_stream`, CLI
+>   `recompress --stream`): C decompresses each source **once** into a live
+>   buffer, emits member metadata (`ZMETA`, now with a `buf_span` column so the
+>   planner computes exact `in_off` through dirs/PAX/GNU), reads a `PLAN`
+>   (member→frame) back, compresses the planned live-buffer slices with a
+>   persistent **compressor pool** (multi-frame windows keep the sink fed), and
+>   reports `COMP` (frame→coff,clen). The 60-byte record is retired; both
+>   directions ride the standard schemas. **Multi-reader parallel decode**
+>   (`ZS`/`zstream_reader`, N sources decoded concurrently, one serialized plan
+>   exchange). Validated at EVI scale: 739,619 members == tar oracle,
+>   byte-identical; readers 1→8 = 380→776 MB/s (2×). Env-gated span tracer +
+>   offline HTML visualizer.
+>
+> **The de-fork is complete** — every read/write tool is on the buffer machine;
+> `zstream` is the one-pass recompress. Two follow-ups remain, both optimizations
+> not forks:
+> 1. **`zstream` async pipeline** (the measured next win). Today compress runs
+>    *inside* the serialized exchange lock, so the exchange is the critical path
+>    (the trace shows blue exchange bars back-to-back; readers=8 plateaus at
+>    776 MB/s, ~2×, not ~8×). To overlap compression *across* windows — "keep the
+>    sinks fed" fully — move `DEFLATE` out of the lock into a queue-fed pool with
+>    **refcounted buffers** (a buffer recycles when its last frame retires) and
+>    **out-of-order `COMP`** drained by a second Python thread (front: ZMETA→plan→
+>    PLAN; back: COMP→footer). Only matters when compute-bound; a single node at
+>    level 6 is otherwise WEKA-write-bound (~1.25 GB/s).
+> 2. **Retire zpack/zexec** once `zstream` also does filter / reshard / S3 / WAL
+>    (a `sink_id`/predicate column in the PLAN + the multi-sink append). Until
+>    then those features stay on the validated C engine (`recompress_c`).
 
 **Why.** We designed one machine — `scan`/generators → Polars plan → the *one*
 executor over a command stream → link the footer (`docs/ISA.md`,
