@@ -469,6 +469,24 @@ def test_zframe_c(tmp):
                 capture_output=True, text=True).stdout.strip()
     assert n2 == "300", n2                      # no embedded footer to trip tar
     assert zframe.read_index(sc).height == 300  # index served from sidecar
+    # multi-frame footer: a footer larger than one skippable frame's u32 length
+    # splits across SEVERAL skippable frames (NOCKIDXM) and stays embedded — no
+    # sidecar. Force it with a tiny per-frame chunk on a normal footer.
+    _sc0 = zframe._SKIP_CHUNK
+    zframe._SKIP_CHUNK = 4096
+    try:
+        mf = str(tmp/"zmf.tar.zstd")
+        zframe.recompress_c([str(tmp/"a.tar.zstd")], mf, level=4,
+                            batch_bytes=16 << 10)
+        assert not os.path.exists(mf + ".nock")       # embedded, not sidecar
+        n3 = sp.run(f"zstd -dc {mf} | tar t | wc -l", shell=True,
+                    capture_output=True, text=True).stdout.strip()
+        assert n3 == "300", n3                         # zstd skips every frame
+        assert zframe.read_index(mf).height == 300     # reconstructed from frames
+        zframe.unpack(mf, str(tmp/"zmfx"))
+        assert (tmp/"zmfx"/"a"/"f0007").read_bytes() == (b"a-7-") * (25 + 7)
+    finally:
+        zframe._SKIP_CHUNK = _sc0
     # oversized member: a single member larger than batch_bytes forces a
     # grown (non-recycled) frame buffer — must still round-trip byte-exact
     # (docs/ISA.md §5: member-aligned frames never split; big member = own frame)

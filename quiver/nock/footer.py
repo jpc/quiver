@@ -29,7 +29,13 @@ from ..pupyarrow.writer import write_feather
 from .format import BLOCK, RawFormat
 
 MAGIC = b"NOCKIDX1"
-TRAILER_LEN = 8 + len(MAGIC)
+# Multi-skippable-frame index: when the footer exceeds a single zstd skippable
+# frame's u32 length, it is split across several back-to-back skippable frames
+# (each standard-zstd-skippable) instead of spilling to a sidecar. The trailer
+# then records the total footer-region byte SPAN (not the IPC length) and this
+# magic; the reader walks the frames and concatenates their payloads.
+MAGIC_MULTI = b"NOCKIDXM"
+TRAILER_LEN = 8 + len(MAGIC)          # both magics are 8 bytes
 ARROW_MAGIC = b"ARROW1"
 
 FOOTER_COLS = ["path", "offset", "data_offset", "size", "read_size",
