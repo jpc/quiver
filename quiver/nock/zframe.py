@@ -1289,7 +1289,7 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
 
 def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                       frame_bytes=16 << 20, compressors=None, readers=None,
-                      force_sidecar=False):
+                      force_sidecar=False, predicate=None):
     """One-pass planned recompress via the `zstream` port (docs/ISA.md §5) — the
     last de-fork. C decompresses each source ONCE into a live buffer (a large
     `window`) and yields member metadata (ZMETA); this driver plans the window
@@ -1313,9 +1313,11 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     # empty var-length columns dominate); the 1-column form is ~85× cheaper
     # (~0.2 ms). C's read_zplan copies the i64 values buffer straight out.
     ZPLAN = [("dep_group", "i64")]
+    nsink = 1                                          # reshard fan-out (later)
     r_comp, w_comp = os.pipe()
     argv = [EXE, "zstream", str(w_comp), out_path, str(level), str(window_bytes),
-            str(compressors), str(readers), *[str(i) for i in inputs]]
+            str(compressors), str(readers), str(nsink),
+            *[str(i) for i in inputs]]
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             pass_fds=(w_comp,))
     os.close(w_comp)
@@ -1362,18 +1364,28 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                 continue
             win_id += 1                             # matches C's EXCH span b
             span = m["buf_span"]
-            entry_off = span.cum_sum() - span       # offset within the window
-            lframe = (entry_off // frame_bytes).cast(pl.Int64)   # 0..F-1
             base = state["base"]
-            gframe = lframe + base                   # globally unique frame id
             padbody = ((m["size"] + 511) // 512) * 512
-            m = m.with_columns(_gf=gframe, _eo=entry_off, _pb=padbody, _sp=span)
+            # keep mask (filter): a dropped member gets frame -1 and never enters
+            # a frame (C skips it, its bytes are excluded); frames pack only KEPT
+            # members, so both the frame assignment and in_off use the KEPT span.
+            m = m.with_columns(_sp=span, _pb=padbody)
+            if predicate is not None:
+                m = m.with_columns(_keep=predicate)
+            else:
+                m = m.with_columns(_keep=pl.lit(True))
+            kept_span = pl.when(pl.col("_keep")).then(pl.col("_sp")).otherwise(0)
+            m = m.with_columns(_ks=kept_span)
+            m = m.with_columns(_eo=(pl.col("_ks").cum_sum() - pl.col("_ks")))
+            lframe = (pl.col("_eo") // frame_bytes).cast(pl.Int64)
+            m = m.with_columns(
+                _gf=pl.when(pl.col("_keep")).then(lframe + base).otherwise(-1))
             m = m.with_columns(_fs=pl.col("_eo").min().over("_gf"))  # frame start
             m = m.with_columns(
                 frame=pl.col("_gf").cast(pl.Int32),
                 in_off=(pl.col("_eo") - pl.col("_fs") + pl.col("_sp")
                         - pl.col("_pb")))
-            nframes = int(m["_gf"].n_unique())
+            nframes = int(m.filter(pl.col("_gf") >= 0)["_gf"].n_unique())
             # Send the PLAN FIRST to unblock the C reader (it's holding the
             # exchange lock waiting on it); only THEN do bookkeeping. Store the
             # whole window frame by reference (O(1)) — the column select + concat
@@ -1432,6 +1444,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                                 pl.Int32, pl.Int32, pl.Int32, pl.Int64)))
     members = (pl.concat([w.select(mcols) for w in M]) if M
                else pl.DataFrame(schema=_mschema))
+    members = members.filter(pl.col("frame") >= 0)   # drop filtered-out members
     frames = (pl.concat(C) if C else pl.DataFrame(
         schema={"frame": pl.Int32, "frame_coff": pl.Int64,
                 "frame_clen": pl.Int64}))

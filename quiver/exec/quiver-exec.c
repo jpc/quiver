@@ -2310,13 +2310,21 @@ static void zbp_destroy(void) {
     ZBP.freelist = NULL;
 }
 
-typedef struct ZSJob { struct ZSJob *next; ZBuf *zb; int64_t off, len, frame_id;
-                       int level; } ZSJob;
+/* A frame is a set of buffer RUNS. Plain recompress → 1 run (contiguous); a
+ * filter drops members → a few runs (gaps); reshard interleaves sinks → many
+ * runs. One run = one-shot ZSTD_compress; several = stream them into one frame
+ * with ZSTD_compressStream2 (no coalescing copy — zstd reads each run in place).
+ * `sink` routes the compressed frame to an output (0 = the single default). */
+typedef struct { int64_t off, len; } Run;
+typedef struct ZSJob { struct ZSJob *next; ZBuf *zb; int64_t frame_id;
+                       int level, sink, nruns; Run *runs; } ZSJob;
+#define ZS_MAXSINK 4096
 static struct {
     pthread_mutex_t mu; pthread_cond_t cv;
-    ZSJob *head, *tail; int done, ofd, comp_fd, err;
-    pthread_mutex_t amu; int64_t append;    /* append cursor */
-    pthread_mutex_t emu;                     /* COMP emit lock */
+    ZSJob *head, *tail; int done, comp_fd, err;
+    int nsink; int fd[ZS_MAXSINK]; int64_t append[ZS_MAXSINK];  /* per-sink out */
+    pthread_mutex_t slock[ZS_MAXSINK];       /* per-sink append lock */
+    pthread_mutex_t emu;                      /* COMP emit lock */
     pthread_t tid[128]; int nthreads;
 } JQ;
 
@@ -2340,51 +2348,97 @@ static ZSJob *jq_pop(void) {
 static void *jq_worker(void *arg) {
     int lane = 1000 + *(int *)arg;              /* compressor lanes: 1000+j */
     uint8_t *cb = NULL; size_t ccap = 0;
+    ZSTD_CCtx *cc = ZSTD_createCCtx();          /* for the streaming (gather) path */
     for (;;) {
         ZSJob *j = jq_pop();
         if (!j) break;
         double t0 = tr_now();
-        size_t bound = ZSTD_compressBound((size_t)j->len);
+        int64_t total = 0;
+        for (int k = 0; k < j->nruns; k++) total += j->runs[k].len;
+        size_t bound = ZSTD_compressBound((size_t)total);
         if (bound > ccap) { cb = realloc(cb, bound); ccap = bound; }
-        size_t cl = ZSTD_compress(cb, ccap, j->zb->buf + j->off, (size_t)j->len,
-                                  j->level);
+        size_t cl = 0;
+        if (j->nruns == 1) {                    /* fast: one contiguous slice */
+            cl = ZSTD_compress(cb, ccap, j->zb->buf + j->runs[0].off,
+                               (size_t)j->runs[0].len, j->level);
+        } else {                                /* gather: stream the runs */
+            ZSTD_CCtx_reset(cc, ZSTD_reset_session_only);
+            ZSTD_CCtx_setParameter(cc, ZSTD_c_compressionLevel, j->level);
+            /* pledge the size so the frame header carries the content size —
+             * INFLATE sizes its output buffer from ZSTD_getFrameContentSize. */
+            ZSTD_CCtx_setPledgedSrcSize(cc, (unsigned long long)total);
+            ZSTD_outBuffer out = {cb, ccap, 0};
+            for (int k = 0; k < j->nruns; k++) {
+                ZSTD_inBuffer in = {j->zb->buf + j->runs[k].off,
+                                    (size_t)j->runs[k].len, 0};
+                while (in.pos < in.size) {
+                    size_t rc = ZSTD_compressStream2(cc, &out, &in,
+                                                     ZSTD_e_continue);
+                    if (ZSTD_isError(rc)) { JQ.err = 1; break; }
+                }
+            }
+            size_t rem;                          /* finalize the frame */
+            do {
+                ZSTD_inBuffer ein = {NULL, 0, 0};
+                rem = ZSTD_compressStream2(cc, &out, &ein, ZSTD_e_end);
+                if (ZSTD_isError(rem)) { JQ.err = 1; break; }
+            } while (rem != 0);
+            cl = out.pos;
+        }
         if (ZSTD_isError(cl)) JQ.err = 1;
         else {
-            pthread_mutex_lock(&JQ.amu);
-            int64_t off = JQ.append; JQ.append += (int64_t)cl;
-            pthread_mutex_unlock(&JQ.amu);
-            if (pwrite(JQ.ofd, cb, cl, off) != (ssize_t)cl) JQ.err = 1;
+            int s = j->sink;                     /* per-sink append (offset order) */
+            pthread_mutex_lock(&JQ.slock[s]);
+            int64_t off = JQ.append[s]; JQ.append[s] += (int64_t)cl;
+            if (pwrite(JQ.fd[s], cb, cl, off) != (ssize_t)cl) JQ.err = 1;
+            pthread_mutex_unlock(&JQ.slock[s]);
             uint64_t fid = (uint64_t)j->frame_id, clen = (uint64_t)cl;
             int64_t coff = off;
             pthread_mutex_lock(&JQ.emu);        /* one COMP row per frame */
             emit_comp_batch(JQ.comp_fd, 1, &fid, &coff, &clen);
             pthread_mutex_unlock(&JQ.emu);
         }
-        tr_span(lane, TR_COMPRESS, t0, tr_now(), j->len, (int64_t)cl);
+        tr_span(lane, TR_COMPRESS, t0, tr_now(), total, (int64_t)cl);
         zbp_unref(j->zb);                       /* frame done; maybe recycle */
-        free(j);
+        free(j->runs); free(j);
     }
+    ZSTD_freeCCtx(cc);
     free(cb);
     return NULL;
 }
 
 static int JQ_ids[128];
-static void jq_start(int ofd, int comp_fd, int compressors) {
+/* Open `nsink` sink outputs: nsink==1 → `pattern` as-is; else `pattern` with a
+ * printf %d for the shard id (reshard). Each sink is a self-contained output. */
+static int jq_start(int comp_fd, int compressors, int nsink, const char *pattern) {
     memset(&JQ, 0, sizeof JQ);
     pthread_mutex_init(&JQ.mu, NULL); pthread_cond_init(&JQ.cv, NULL);
-    pthread_mutex_init(&JQ.amu, NULL); pthread_mutex_init(&JQ.emu, NULL);
-    JQ.ofd = ofd; JQ.comp_fd = comp_fd;
+    pthread_mutex_init(&JQ.emu, NULL);
+    JQ.comp_fd = comp_fd;
+    JQ.nsink = nsink < 1 ? 1 : (nsink > ZS_MAXSINK ? ZS_MAXSINK : nsink);
+    for (int s = 0; s < JQ.nsink; s++) {
+        pthread_mutex_init(&JQ.slock[s], NULL);
+        char path[4096];
+        if (JQ.nsink == 1) snprintf(path, sizeof path, "%s", pattern);
+        else snprintf(path, sizeof path, pattern, s);
+        JQ.fd[s] = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (JQ.fd[s] < 0) { perror(path); return -1; }
+    }
     JQ.nthreads = compressors > 128 ? 128 : (compressors < 1 ? 1 : compressors);
     for (int t = 0; t < JQ.nthreads; t++) {
         JQ_ids[t] = t;
         pthread_create(&JQ.tid[t], NULL, jq_worker, &JQ_ids[t]);
     }
+    return 0;
 }
-static void jq_stop(void) {
+static int64_t jq_stop(void) {              /* returns total bytes written */
     pthread_mutex_lock(&JQ.mu);
     JQ.done = 1; pthread_cond_broadcast(&JQ.cv);
     pthread_mutex_unlock(&JQ.mu);
     for (int t = 0; t < JQ.nthreads; t++) pthread_join(JQ.tid[t], NULL);
+    int64_t total = 0;
+    for (int s = 0; s < JQ.nsink; s++) { total += JQ.append[s]; close(JQ.fd[s]); }
+    return total;
 }
 
 /* Shared context for the zstream reader pool. Readers decode DIFFERENT sources
@@ -2515,23 +2569,49 @@ static void *zstream_reader(void *arg) {
                 double w3 = tr_now();
                 ZS.t_wait += w1 - w0; ZS.t_zmeta += w2 - w1;
                 ZS.t_plan += w3 - w2; ZS.n_win++;
-                /* dg[i] = GLOBAL frame id (Python-assigned). Build one job per
-                 * frame (contiguous [mem[a].start, mem[r].start), includes any
-                 * interleaved dirs). */
-                int64_t wf = 0, r = 0;
-                while (r < cn) {
-                    int64_t g = dg[r], a = r;
-                    while (r < cn && dg[r] == g) r++;             /* frame [a,r) */
-                    int64_t foff = mem[a].start;
-                    int64_t fend = (r < nm) ? mem[r].start : blen;
-                    ZSJob *jb = malloc(sizeof *jb);
-                    jb->zb = zb; jb->off = foff; jb->len = fend - foff;
-                    jb->frame_id = g; jb->level = level;
-                    /* one buffer ref per frame; the reader still holds its own
-                     * ref (=1) until after the loop, so refs can't hit 0 early. */
-                    atomic_fetch_add(&zb->refs, 1);
-                    jq_push(jb);
-                    wf++;
+                /* dg[i] = GLOBAL frame id (Python-assigned), -1 = dropped. A
+                 * frame is a set of RUNS: a maximal consecutive-member span with
+                 * the same frame is one run [mem[a].start, mem[r].start); a drop
+                 * or frame change ends it, so a filtered/resharded frame gathers
+                 * several non-contiguous runs. Collect runs per frame (ids are
+                 * contiguous per window) and push one job per frame. */
+                int64_t fmin = INT64_MAX, fmax = -1;
+                for (int64_t i = 0; i < cn; i++) if (dg[i] >= 0) {
+                    if (dg[i] < fmin) fmin = dg[i];
+                    if (dg[i] > fmax) fmax = dg[i];
+                }
+                int64_t wf = 0;
+                if (fmax >= 0) {
+                    int64_t nf = fmax - fmin + 1;
+                    Run **fr = calloc((size_t)nf, sizeof(Run *));
+                    int *frn = calloc((size_t)nf, sizeof(int));
+                    int *frc = calloc((size_t)nf, sizeof(int));
+                    int64_t r = 0;
+                    while (r < cn) {
+                        int64_t g = dg[r], a = r;
+                        while (r < cn && dg[r] == g) r++;         /* run [a,r) */
+                        if (g < 0) continue;                      /* dropped */
+                        int64_t off = mem[a].start;
+                        int64_t end = (r < nm) ? mem[r].start : blen;
+                        int64_t fi = g - fmin;
+                        if (frn[fi] >= frc[fi]) {
+                            frc[fi] = frc[fi] ? frc[fi] * 2 : 4;
+                            fr[fi] = realloc(fr[fi], sizeof(Run) * (size_t)frc[fi]);
+                        }
+                        fr[fi][frn[fi]++] = (Run){off, end - off};
+                    }
+                    for (int64_t fi = 0; fi < nf; fi++) {
+                        if (!frn[fi]) continue;
+                        ZSJob *jb = malloc(sizeof *jb);
+                        jb->zb = zb; jb->frame_id = fmin + fi; jb->level = level;
+                        jb->sink = 0; jb->runs = fr[fi]; jb->nruns = frn[fi];
+                        /* one buffer ref per frame; the reader holds its own ref
+                         * (=1) until after the loop, so refs can't hit 0 early. */
+                        atomic_fetch_add(&zb->refs, 1);
+                        jq_push(jb);
+                        wf++;
+                    }
+                    free(fr); free(frn); free(frc);
                 }
                 pthread_mutex_unlock(&ZS.exch);
                 tr_span(lane, TR_EXCH, w1, tr_now(), wf, wid);  /* b = window id */
@@ -2554,16 +2634,14 @@ static void *zstream_reader(void *arg) {
 
 static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                        const char *out, int level, int64_t batch,
-                       int compressors, int readers) {
-    int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (ofd < 0) { perror("out"); return 2; }
+                       int compressors, int readers, int nsink) {
     tr_init();
     memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
     emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
     emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
     if (readers < 1) readers = 1;
     if (readers > 64) readers = 64;
-    jq_start(ofd, comp_fd, compressors);
+    if (jq_start(comp_fd, compressors, nsink, out)) return 2;   /* opens sinks */
     /* bound resident buffers: a couple of windows per reader in flight + the
      * compressors' — this is the decode-ahead depth AND the backpressure. */
     zbp_init(batch + (4 << 20), readers * 3 + 4);
@@ -2578,13 +2656,12 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
     }
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
 
-    jq_stop();                              /* drains all pending frames */
+    int64_t nbytes = jq_stop();              /* drains all frames, closes sinks */
     zbp_destroy();
     emit_eos(1); emit_eos(comp_fd);
-    close(ofd);
     tr_dump();
-    fprintf(stderr, "zstream: %ld frames, %ld bytes (%d readers)\n",
-            (long)ZS.nframes, (long)JQ.append, readers);
+    fprintf(stderr, "zstream: %ld frames, %ld bytes (%d readers, %d sinks)\n",
+            (long)ZS.nframes, (long)nbytes, readers, nsink);
     if (ZS.n_win)
         fprintf(stderr, "zstream exch/window (ms): zmeta-emit %.3f  plan-rt "
                 "%.3f  lock-wait %.3f  (%ld windows)\n",
@@ -2639,13 +2716,14 @@ int main(int argc, char **argv) {
 
     if (!strcmp(argv[1], "zstream")) {
         /* zstream <comp_fd> <out> <level> <batch> <compressors> <readers>
-         *         <src...> — one-pass planned recompress: ZMETA on stdout,
-         * PLAN on stdin, COMP on comp_fd. `readers` decode DIFFERENT sources
-         * in parallel; `compressors` compress a window's frames in parallel. */
-        if (argc < 9) { fprintf(stderr, "zstream: too few args\n"); return 2; }
-        return run_zstream(atoi(argv[2]), (const char **)&argv[8], argc - 8,
+         *         <nsink> <src...> — one-pass planned recompress: ZMETA on
+         * stdout, PLAN on stdin, COMP on comp_fd. `readers` decode DIFFERENT
+         * sources in parallel; `compressors` compress in parallel; `nsink` is
+         * the reshard fan-out (out has a %d for the shard when nsink>1). */
+        if (argc < 10) { fprintf(stderr, "zstream: too few args\n"); return 2; }
+        return run_zstream(atoi(argv[2]), (const char **)&argv[9], argc - 9,
                            argv[3], atoi(argv[4]), atoll(argv[5]),
-                           atoi(argv[6]), atoi(argv[7]));
+                           atoi(argv[6]), atoi(argv[7]), atoi(argv[8]));
     }
 
     struct io_uring ring;
