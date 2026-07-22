@@ -1312,23 +1312,21 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     plan_w = StreamWriter(proc.stdin, CMD_SCHEMA)
     proc.stdin.flush()
 
-    ftmp = tempfile.TemporaryFile()
-    fw = _FooterStream(ftmp)
     instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # per-window capture
     instr_windows = {} if instr_path else None
     INSTR_MAX_WIN, INSTR_ROWS = 64, 10              # bound the capture
-    # pending[gframe] = the frame's members as COLUMN SLICES (path list + numpy
-    # arrays) the FRONT thread planned but whose (coff,clen) the BACK thread
-    # hasn't linked yet. Guarded by `plock`; back pops, front pushes. Slices
-    # (not per-member tuples) keep both hot loops vectorized so the back thread
-    # doesn't starve the serialized planner on the GIL.
-    pending, plock = {}, threading.Lock()
-    state = {"base": 0, "frames": 0, "err": None}
-    comp_results = {} if instr_windows is not None else None  # gframe→(coff,clen)
+    state = {"base": 0}
+    # Accumulate-and-join (no per-frame streaming state, no shared dict/lock):
+    # the FRONT thread appends each window's planned member sub-frame; the BACK
+    # thread appends the completion frames as they arrive (any order); at the
+    # end we pl.concat both and JOIN on frame id — one vectorized pass links
+    # (coff,clen) to every member. Both threads do only an O(1) list-append per
+    # window/batch, so neither starves the serialized planner on the GIL.
+    M, C = [], []                                    # member / completion frames
 
     def front():
         """Read ZMETA windows (in exchange order), plan each into frames, send
-        the PLAN with GLOBAL frame ids. Compression is async — no COMP read."""
+        the PLAN with GLOBAL frame ids, and accumulate the member sub-frame."""
         win_id = -1
         for zb in zmeta:
             m = pl.DataFrame(zb)
@@ -1340,37 +1338,30 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             entry_off = span.cum_sum() - span       # offset within the window
             lframe = (entry_off // frame_bytes).cast(pl.Int64)   # 0..F-1
             base = state["base"]
-            gframe = (lframe + base)                # globally unique frame id
+            gframe = lframe + base                   # globally unique frame id
             padbody = ((m["size"] + 511) // 512) * 512
             m = m.with_columns(_gf=gframe, _eo=entry_off, _pb=padbody, _sp=span)
             m = m.with_columns(_fs=pl.col("_eo").min().over("_gf"))  # frame start
-            in_off = (m["_eo"] - m["_fs"] + m["_sp"] - m["_pb"]).to_numpy()
-            gf_np = m["_gf"].to_numpy()
-            paths = m["path"].to_list()
-            szs = m["size"].to_numpy(); modes = m["mode"].to_numpy()
-            mts = m["mtime_ns"].to_numpy(); uids = m["uid"].to_numpy()
-            gids = m["gid"].to_numpy()
-            # frames are contiguous runs of members (gf non-decreasing); slice at
-            # the run boundaries — O(frames) vectorized slices, not O(members).
-            bnd = np.flatnonzero(np.diff(gf_np)) + 1
-            starts = np.concatenate(([0], bnd)); ends = np.concatenate((bnd, [n]))
-            nframes = len(starts)
-            with plock:
-                for a, b in zip(starts.tolist(), ends.tolist()):
-                    pending[int(gf_np[a])] = (
-                        paths[a:b], szs[a:b], modes[a:b], mts[a:b], uids[a:b],
-                        gids[a:b], in_off[a:b])
-            gf = gf_np                              # for the instr preview
+            m = m.with_columns(
+                in_off=(pl.col("_eo") - pl.col("_fs") + pl.col("_sp")
+                        - pl.col("_pb")))
+            in_off = m["in_off"]
+            nframes = int(m["_gf"].n_unique())
+            M.append(m.select(
+                "path", "size", "mode", "mtime_ns", "uid", "gid",
+                pl.col("_gf").cast(pl.Int32).alias("frame"), "in_off"))
             if instr_windows is not None and win_id < INSTR_MAX_WIN:
-                K = INSTR_ROWS; spanl = span.to_list()
+                K = INSTR_ROWS
+                paths = m["path"].to_list(); szl = m["size"].to_list()
+                mol = m["mode"].to_list(); spl = span.to_list()
+                iol = in_off.to_list(); gfl = m["_gf"].to_list()
                 instr_windows[win_id] = {
                     "members": n, "frames": nframes, "frame_bytes": frame_bytes,
                     "zmeta": {"cols": ["path", "size", "mode", "buf_span"],
-                              "rows": [[paths[i], int(szs[i]), int(modes[i]),
-                                        int(spanl[i])]
+                              "rows": [[paths[i], szl[i], mol[i], spl[i]]
                                        for i in range(min(K, n))], "total": n},
                     "plan": {"cols": ["op", "member", "→frame", "in_off"],
-                             "rows": [["COMPRESS", i, int(gf[i]), int(in_off[i])]
+                             "rows": [["COMPRESS", i, gfl[i], iol[i]]
                                       for i in range(min(K, n))], "total": n},
                     "comp": {"cols": ["frame", "coff", "clen"], "rows": [],
                              "total": nframes,
@@ -1385,39 +1376,54 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             pass
 
     def back():
-        """Drain COMP (frames, out of order): link each frame's (coff,clen) to
-        its members and write the footer. Single writer of `fw`."""
+        """Drain COMP frames (any order) and accumulate them — no per-frame
+        linking here; the join at the end does it in one vectorized pass."""
         while True:
             b = comp.read_batch()
             if b is None:
                 break
             c = _to_pl(b)
-            for f, o, x in zip(c["user_data"].to_list(),
-                               c["read_size"].to_list(), c["cksum"].to_list()):
-                f = int(f); o = int(o); x = int(x)
-                if comp_results is not None:
-                    comp_results[f] = (o, x)
-                with plock:
-                    paths, szs, modes, mts, uids, gids, ioff = pending.pop(f)
-                fw.add_many(paths, szs, modes, mts, uids, gids, ioff, f, o, x)
+            C.append(c.select(
+                pl.col("user_data").cast(pl.Int32).alias("frame"),
+                pl.col("read_size").cast(pl.Int64).alias("frame_coff"),
+                pl.col("cksum").cast(pl.Int64).alias("frame_clen")))
 
     ft = threading.Thread(target=front)
     bt = threading.Thread(target=back)
     ft.start(); bt.start()
     ft.join(); bt.join()
     comp_f.close()
-    fw.close()
+    assert proc.wait() == 0
+
+    # one vectorized join: members ⨝ frames on frame id → the footer
+    _mschema = {c: t for c, t in zip(
+        ("path", "size", "mode", "mtime_ns", "uid", "gid", "frame", "in_off"),
+        (pl.String, pl.Int64, pl.Int32, pl.Int64, pl.Int32, pl.Int32,
+         pl.Int32, pl.Int64))}
+    members = pl.concat(M) if M else pl.DataFrame(schema=_mschema)
+    frames = (pl.concat(C) if C else pl.DataFrame(
+        schema={"frame": pl.Int32, "frame_coff": pl.Int64,
+                "frame_clen": pl.Int64}))
+    footer = (members.join(frames, on="frame", how="left")
+                     .select([c for c, _ in _FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    sw = StreamWriter(ftmp, _FOOTER_IPC)
+    for s in range(0, footer.height, 1 << 20):      # chunk the write
+        sw.write_batch(_schema_cols(footer[s:s + (1 << 20)], _FOOTER_IPC))
+    sw.close()
     _write_footer(out_path, ftmp, False); ftmp.close()
+
     if instr_windows is not None:
         import json as _json
-        for w in instr_windows.values():          # fill deferred COMP previews
-            w["comp"]["rows"] = [[g, comp_results[g][0], comp_results[g][1]]
-                                 for g in w["comp"].pop("gframes")
-                                 if g in comp_results]
+        cr = dict(zip(frames["frame"].to_list(),
+                      zip(frames["frame_coff"].to_list(),
+                          frames["frame_clen"].to_list())))
+        for w in instr_windows.values():
+            w["comp"]["rows"] = [[g, cr[g][0], cr[g][1]]
+                                 for g in w["comp"].pop("gframes") if g in cr]
         _json.dump({"windows": instr_windows, "captured": len(instr_windows),
                     "total_windows": len(instr_windows)}, open(instr_path, "w"))
-    assert proc.wait() == 0
-    return Result(members=fw.members, frames=state["base"])
+    return Result(members=footer.height, frames=state["base"])
 
 
 def unpack_distributed(path, dest, transports, predicate=None, engine="auto",
