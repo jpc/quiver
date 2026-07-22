@@ -246,3 +246,29 @@ against a real EVI source (15,589 members): member count == the `tar t` oracle,
 output is a clean tar (15,589 members), 200/200 sampled members round-trip
 byte-exact. Confirms the `buf_span` in_off computation on real ustar data (with a
 leading directory entry).
+
+## zstream async pipeline — EVI-scale throughput (2026-07-22)
+
+Same 8 EVI sources / 208 cores, level 6, readers=8. The async pipeline (compress
+decoupled from the serialized plan exchange — a queue-fed compressor pool draining
+refcounted window buffers, out-of-order COMP, 2-thread Python driver) vs the prior
+synchronous version (compress under the exchange lock):
+
+| variant | throughput | vs sync |
+|---|---|---|
+| sync (compress in exchange lock) | 776 MB/s | 1.0× |
+| **async (compress decoupled)** | **2563 MB/s** | **3.3×** |
+
+Byte-exact: 739,619 members == tar oracle, 11.6 GB output identical.
+
+**It's now WEKA-bound, not compute-bound.** At 2563 MB/s decompressed × level-6
+ratio ≈ 820 MB/s compressed write, plus ≈ 850 MB/s compressed read = **≈ 1.67 GB/s
+combined**, right at the measured single-node WEKA ceiling (read 896 + write 1246,
+combined bandwidth ~1.6–1.7 GB/s). So the pipeline has reached the hardware limit
+on one node; more throughput needs more nodes (distributed, each hitting its local
+WEKA ceiling) — exactly the design's prediction that the async pipeline only
+matters until WEKA saturates.
+
+Front-thread planning cost (the serial exchange) was cut alongside: direct
+plan-column build (85× vs cmd_df) + vectorized footer (add_many) — at 256 MB
+windows it amortizes over ~18k members/window and is no longer the bottleneck.

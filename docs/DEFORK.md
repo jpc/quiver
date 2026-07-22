@@ -68,15 +68,16 @@
 > **The de-fork is complete** — every read/write tool is on the buffer machine;
 > `zstream` is the one-pass recompress. Two follow-ups remain, both optimizations
 > not forks:
-> 1. **`zstream` async pipeline** (the measured next win). Today compress runs
->    *inside* the serialized exchange lock, so the exchange is the critical path
->    (the trace shows blue exchange bars back-to-back; readers=8 plateaus at
->    776 MB/s, ~2×, not ~8×). To overlap compression *across* windows — "keep the
->    sinks fed" fully — move `DEFLATE` out of the lock into a queue-fed pool with
->    **refcounted buffers** (a buffer recycles when its last frame retires) and
->    **out-of-order `COMP`** drained by a second Python thread (front: ZMETA→plan→
->    PLAN; back: COMP→footer). Only matters when compute-bound; a single node at
->    level 6 is otherwise WEKA-write-bound (~1.25 GB/s).
+> 1. **`zstream` async pipeline** ✅ DONE. Compress moved out of the serialized
+>    exchange into a queue-fed compressor pool draining **refcounted** window
+>    buffers (recycle when the last frame retires = backpressure + decode-ahead),
+>    **out-of-order `COMP`** drained by a second Python thread (front: ZMETA→plan
+>    →PLAN; back: COMP→footer). Plus front-thread wins: direct plan-column build
+>    (85× vs cmd_df) + vectorized footer (`add_many`). **EVI-scale: 776 → 2563
+>    MB/s (3.3×), byte-exact; now WEKA-bound** (~1.67 GB/s combined ≈ the
+>    single-node ceiling), exactly the design's prediction. Env-gated span tracer
+>    + offline HTML visualizer (timeline, per-window instruction previews,
+>    in→out bytes per block).
 > 2. **Retire zpack/zexec** once `zstream` also does filter / reshard / S3 / WAL
 >    (a `sink_id`/predicate column in the PLAN + the multi-sink append). Until
 >    then those features stay on the validated C engine (`recompress_c`).
