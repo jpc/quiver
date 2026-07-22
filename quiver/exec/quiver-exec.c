@@ -42,6 +42,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -2322,6 +2323,48 @@ static int emit_comp_batch(int fd, int64_t n, uint64_t *ud, int64_t *coff,
 typedef struct { int64_t start, span, size, mtime; int32_t mode, uid, gid;
                  char *name; } SMem;
 
+/* ── lightweight span tracer (env QUIVER_TRACE=path → JSON) ─────────────────
+ * Records (lane, kind, t0, t1, detail) spans so the pipeline can be visualized
+ * offline. Off unless QUIVER_TRACE is set; a global mutex-guarded array flushed
+ * at the end — fine for a short trace run, zero cost when off. */
+enum { TR_DECODE, TR_EXCH_WAIT, TR_EXCH, TR_COMPRESS };
+typedef struct { int lane, kind; double t0, t1; int64_t a, b; } TrSpan;
+static struct { pthread_mutex_t mu; TrSpan *v; int n, cap, on; } TR =
+    { .mu = PTHREAD_MUTEX_INITIALIZER };
+static double tr_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;          /* ms */
+}
+static void tr_init(void) { TR.on = getenv("QUIVER_TRACE") != NULL; }
+static void tr_span(int lane, int kind, double t0, double t1,
+                    int64_t a, int64_t b) {
+    if (!TR.on) return;
+    pthread_mutex_lock(&TR.mu);
+    if (TR.n >= TR.cap) { TR.cap = TR.cap ? TR.cap * 2 : 4096;
+                          TR.v = realloc(TR.v, sizeof(TrSpan) * (size_t)TR.cap); }
+    TR.v[TR.n++] = (TrSpan){lane, kind, t0, t1, a, b};
+    pthread_mutex_unlock(&TR.mu);
+}
+static void tr_dump(void) {
+    const char *p = getenv("QUIVER_TRACE");
+    if (!p || !TR.on) return;
+    FILE *f = fopen(p, "w");
+    if (!f) return;
+    double base = TR.n ? TR.v[0].t0 : 0;
+    for (int i = 1; i < TR.n; i++) if (TR.v[i].t0 < base) base = TR.v[i].t0;
+    fprintf(f, "[\n");
+    for (int i = 0; i < TR.n; i++) {
+        TrSpan *s = &TR.v[i];
+        fprintf(f, "  {\"lane\":%d,\"kind\":%d,\"t0\":%.3f,\"t1\":%.3f,"
+                   "\"a\":%lld,\"b\":%lld}%s\n",
+                s->lane, s->kind, s->t0 - base, s->t1 - base,
+                (long long)s->a, (long long)s->b, i + 1 < TR.n ? "," : "");
+    }
+    fprintf(f, "]\n");
+    fclose(f);
+    fprintf(stderr, "trace: %d spans -> %s\n", TR.n, p);
+}
+
 /* ── zstream compressor pool (docs/ISA.md §5: keep the sink fed) ────────────
  * A persistent pool of M workers compresses a window's frames in parallel and
  * appends each to the output. The window is a large planning unit (many 16 MB
@@ -2339,7 +2382,7 @@ static struct {
 } ZP;
 
 static void *zp_worker(void *arg) {
-    (void)arg;
+    int lane = 1000 + *(int *)arg;              /* compressor lanes: 1000+j */
     uint8_t *cb = NULL; size_t ccap = 0;
     for (;;) {
         pthread_mutex_lock(&ZP.mu);
@@ -2350,6 +2393,7 @@ static void *zp_worker(void *arg) {
         pthread_mutex_unlock(&ZP.mu);
 
         ZFrameJob *j = &ZP.jobs[i];
+        double t0 = tr_now();
         size_t bound = ZSTD_compressBound((size_t)j->len);
         if (bound > ccap) { cb = realloc(cb, bound); ccap = bound; }
         size_t cl = ZSTD_compress(cb, ccap, j->src, (size_t)j->len, j->level);
@@ -2361,6 +2405,7 @@ static void *zp_worker(void *arg) {
             j->coff = off; j->clen = cl;
             if (pwrite(ZP.ofd, cb, cl, off) != (ssize_t)cl) j->err = 1;
         }
+        tr_span(lane, TR_COMPRESS, t0, tr_now(), j->len, (int64_t)cl);
         pthread_mutex_lock(&ZP.mu);
         ZP.done++;
         pthread_cond_signal(&ZP.cv_done);
@@ -2370,14 +2415,17 @@ static void *zp_worker(void *arg) {
     return NULL;
 }
 
+static int ZP_ids[128];
 static void zp_start(int ofd, int compressors) {
     memset(&ZP, 0, sizeof ZP);
     pthread_mutex_init(&ZP.mu, NULL); pthread_mutex_init(&ZP.amu, NULL);
     pthread_cond_init(&ZP.cv_work, NULL); pthread_cond_init(&ZP.cv_done, NULL);
     ZP.ofd = ofd;
     ZP.nthreads = compressors > 128 ? 128 : (compressors < 1 ? 1 : compressors);
-    for (int t = 0; t < ZP.nthreads; t++)
-        pthread_create(&ZP.tid[t], NULL, zp_worker, NULL);
+    for (int t = 0; t < ZP.nthreads; t++) {
+        ZP_ids[t] = t;
+        pthread_create(&ZP.tid[t], NULL, zp_worker, &ZP_ids[t]);
+    }
 }
 /* Compress a window's `n` frame jobs in parallel; blocks until all done. */
 static int zp_run_window(ZFrameJob *jobs, int n) {
@@ -2413,12 +2461,13 @@ static struct {
 } ZS;
 
 static void *zstream_reader(void *arg) {
-    (void)arg;
+    int lane = *(int *)arg;                      /* reader lanes: 0..R-1 */
     int64_t bcap = ZS.batch + (4 << 20); uint8_t *buf = malloc((size_t)bcap);
     int mcap_m = SCAN_BATCH; SMem *mem = malloc(sizeof(SMem) * (size_t)mcap_m);
     uint8_t *pmeta = NULL, *pbody = NULL; size_t pmc = 0, pbc = 0;
     int jcap = 256; ZFrameJob *jobs = malloc(sizeof(ZFrameJob) * (size_t)jcap);
     int64_t batch = ZS.batch; int level = ZS.level, comp_fd = ZS.comp_fd;
+    double win_t0 = tr_now();                    /* start of the current window */
 
     for (;;) {
         int si = atomic_fetch_add(&ZS.src_i, 1);
@@ -2497,10 +2546,13 @@ static void *zstream_reader(void *arg) {
                            mem[m].mode, mem[m].mtime, mem[m].uid, mem[m].gid,
                            mem[m].span);
                 }
+                tr_span(lane, TR_DECODE, win_t0, tr_now(), nm, blen);
                 /* Serialized exchange: emit ZMETA, read PLAN, compress the
                  * window's frames (pool), emit COMP — one reader at a time, so
                  * the three fds stay ordered and Python is synchronous. */
+                double w0 = tr_now();
                 pthread_mutex_lock(&ZS.exch);
+                double w1 = tr_now(); tr_span(lane, TR_EXCH_WAIT, w0, w1, 0, 0);
                 mb_flush(&mb);                       /* ZMETA(window) → stdout */
                 CmdBatch pc;
                 if (read_cmd_stream(&pc, &pmeta, &pmc, &pbody, &pbc)) {
@@ -2531,11 +2583,13 @@ static void *zstream_reader(void *arg) {
                 }
                 emit_comp_batch(comp_fd, wf, fg, (int64_t *)fco, fcl);
                 pthread_mutex_unlock(&ZS.exch);
+                tr_span(lane, TR_EXCH, w1, tr_now(), wf, 0);
                 atomic_fetch_add(&ZS.nframes, wf);
                 free(fg); free(fco); free(fcl);
                 free_cmd_batch(&pc);
                 for (int m = 0; m < nm; m++) free(mem[m].name);
                 blen = 0; mstart = 0; nm = 0;        /* recycle the buffer */
+                win_t0 = tr_now();                   /* next window starts now */
                 if (cerr) { ZS.rc = 1; done = 1; }
             }
         }
@@ -2551,6 +2605,7 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
                        int compressors, int readers) {
     int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (ofd < 0) { perror("out"); return 2; }
+    tr_init();
     memset(&Z, 0, sizeof Z); pthread_mutex_init(&Z.omu, NULL);
     emit_schema(1, ZMETA_SCHEMA_META, ZMETA_SCHEMA_LEN);   /* stdout: ZMETA */
     emit_schema(comp_fd, COMP_SCHEMA_META, COMP_SCHEMA_LEN);/* comp_fd: COMP */
@@ -2561,14 +2616,17 @@ static int run_zstream(int comp_fd, const char **srcs, int nsrc,
     ZS.batch = batch; pthread_mutex_init(&ZS.exch, NULL);
     if (readers < 1) readers = 1;
     if (readers > 64) readers = 64;
-    pthread_t rt[64];
-    for (int i = 0; i < readers; i++)
-        pthread_create(&rt[i], NULL, zstream_reader, NULL);
+    pthread_t rt[64]; int rid[64];
+    for (int i = 0; i < readers; i++) {
+        rid[i] = i;
+        pthread_create(&rt[i], NULL, zstream_reader, &rid[i]);
+    }
     for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
 
     zp_stop();
     emit_eos(1); emit_eos(comp_fd);
     close(ofd);
+    tr_dump();
     fprintf(stderr, "zstream: %ld frames, %ld bytes (%d readers)\n",
             (long)ZS.nframes, (long)ZP.append, readers);
     return ZS.rc;
