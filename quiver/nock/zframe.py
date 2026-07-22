@@ -1343,18 +1343,23 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
             m = m.with_columns(_gf=gframe, _eo=entry_off, _pb=padbody, _sp=span)
             m = m.with_columns(_fs=pl.col("_eo").min().over("_gf"))  # frame start
             m = m.with_columns(
+                frame=pl.col("_gf").cast(pl.Int32),
                 in_off=(pl.col("_eo") - pl.col("_fs") + pl.col("_sp")
                         - pl.col("_pb")))
-            in_off = m["in_off"]
+            gf_np = m["_gf"].to_numpy()
             nframes = int(m["_gf"].n_unique())
-            M.append(m.select(
-                "path", "size", "mode", "mtime_ns", "uid", "gid",
-                pl.col("_gf").cast(pl.Int32).alias("frame"), "in_off"))
+            # Send the PLAN FIRST to unblock the C reader (it's holding the
+            # exchange lock waiting on it); only THEN do bookkeeping. Store the
+            # whole window frame by reference (O(1)) — the column select + concat
+            # + join happen once at the end, off the serialized critical path.
+            plan_w.write_batch(_plan_cols(n, gf_np)); proc.stdin.flush()
+            M.append(m)
+            state["base"] = base + nframes
             if instr_windows is not None and win_id < INSTR_MAX_WIN:
                 K = INSTR_ROWS
                 paths = m["path"].to_list(); szl = m["size"].to_list()
                 mol = m["mode"].to_list(); spl = span.to_list()
-                iol = in_off.to_list(); gfl = m["_gf"].to_list()
+                iol = m["in_off"].to_list(); gfl = m["_gf"].to_list()
                 instr_windows[win_id] = {
                     "members": n, "frames": nframes, "frame_bytes": frame_bytes,
                     "zmeta": {"cols": ["path", "size", "mode", "buf_span"],
@@ -1367,9 +1372,6 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                              "total": nframes,
                              "gframes": list(range(base, base + min(K, nframes)))},
                 }
-            plan_w.write_batch(_plan_cols(n, m["_gf"].to_numpy()))
-            proc.stdin.flush()
-            state["base"] = base + nframes
         try:
             proc.stdin.close()
         except BrokenPipeError:
@@ -1395,12 +1397,14 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     comp_f.close()
     assert proc.wait() == 0
 
-    # one vectorized join: members ⨝ frames on frame id → the footer
-    _mschema = {c: t for c, t in zip(
-        ("path", "size", "mode", "mtime_ns", "uid", "gid", "frame", "in_off"),
-        (pl.String, pl.Int64, pl.Int32, pl.Int64, pl.Int32, pl.Int32,
-         pl.Int32, pl.Int64))}
-    members = pl.concat(M) if M else pl.DataFrame(schema=_mschema)
+    # one vectorized pass, all off the critical path: select the footer member
+    # columns from the accumulated windows, concat, and JOIN the completion
+    # frames on frame id — links (coff,clen) to every member.
+    mcols = ["path", "size", "mode", "mtime_ns", "uid", "gid", "frame", "in_off"]
+    _mschema = dict(zip(mcols, (pl.String, pl.Int64, pl.Int32, pl.Int64,
+                                pl.Int32, pl.Int32, pl.Int32, pl.Int64)))
+    members = (pl.concat([w.select(mcols) for w in M]) if M
+               else pl.DataFrame(schema=_mschema))
     frames = (pl.concat(C) if C else pl.DataFrame(
         schema={"frame": pl.Int32, "frame_coff": pl.Int64,
                 "frame_clen": pl.Int64}))
