@@ -1744,101 +1744,6 @@ static void z_parse_pax(const uint8_t *b, int64_t n, char *path, int *hp,
     }
 }
 
-static void *z_reader(void *arg) {
-    (void)arg;
-    for (;;) {
-        int si = atomic_fetch_add(&Z.src_i, 1);
-        if (si >= Z.nsrc) break;
-        Zsrc z;
-        if (zsrc_open(&z, Z.srcs[si])) continue;
-        int64_t bcap; uint8_t *buf = bp_acquire(&bcap); int64_t blen = 0;
-        int rcap = 8192, nrec = 0;
-        ZRec *recs = malloc(sizeof(ZRec) * rcap);
-        char pax_path[4096], gnu[4096];
-        int has_pax = 0, has_gnu = 0; int64_t pax_size = -1;
-        uint8_t hdr[512];
-        for (;;) {
-            if (zsrc_read(&z, hdr, 512) < 512) break;
-            int allz = 1;
-            for (int k = 0; k < 512; k++) if (hdr[k]) { allz = 0; break; }
-            if (allz) break;
-            int typ = hdr[156];
-            int64_t size = zoctal(hdr + 124, 12);
-            int64_t bl = (size + 511) / 512 * 512;
-            if (blen + 512 + bl + 1024 > (int64_t)bcap) {
-                bcap = (blen + 512 + bl + 1024) * 2; buf = realloc(buf, bcap);
-            }
-            if (typ == 'x' || typ == 'g') {
-                memcpy(buf + blen, hdr, 512);
-                zsrc_read(&z, buf + blen + 512, bl);
-                z_parse_pax(buf + blen + 512, size, pax_path, &has_pax, &pax_size);
-                blen += 512 + bl; continue;
-            }
-            if (typ == 'L') {
-                memcpy(buf + blen, hdr, 512);
-                zsrc_read(&z, buf + blen + 512, bl);
-                int nl = size < 4095 ? (int)size : 4095;
-                memcpy(gnu, buf + blen + 512, nl);
-                while (nl && gnu[nl - 1] == 0) nl--;
-                gnu[nl] = 0; has_gnu = 1;
-                blen += 512 + bl; continue;
-            }
-            char name[4096];
-            if (has_pax) strcpy(name, pax_path);
-            else if (has_gnu) strcpy(name, gnu);
-            else {
-                char nm[101], pre[156];
-                memcpy(nm, hdr, 100); nm[100] = 0;
-                memcpy(pre, hdr + 345, 155); pre[155] = 0;
-                if (pre[0]) snprintf(name, sizeof name, "%s/%s", pre, nm);
-                else { strncpy(name, nm, sizeof name - 1); name[sizeof name-1]=0; }
-            }
-            int64_t rsize = pax_size >= 0 ? pax_size : size;
-            int64_t rbl = (rsize + 511) / 512 * 512;
-            if (blen + 512 + rbl + 1024 > bcap) {      /* oversized: grow frame */
-                bcap = (blen + 512 + rbl + 1024) * 2; buf = realloc(buf, (size_t)bcap);
-            }
-            int64_t body_off = blen + 512;
-            memcpy(buf + blen, hdr, 512);
-            zsrc_read(&z, buf + blen + 512, rbl);
-            blen += 512 + rbl;
-            if (typ == '0' || typ == 0) {
-                if (nrec >= rcap) { rcap *= 2; recs = realloc(recs, sizeof(ZRec)*rcap); }
-                recs[nrec].path = strdup(name);
-                recs[nrec].size = rsize;
-                recs[nrec].mode = zoctal(hdr + 100, 8);
-                recs[nrec].mtime = zoctal(hdr + 136, 12) * 1000000000LL;
-                recs[nrec].uid = zoctal(hdr + 108, 8);
-                recs[nrec].gid = zoctal(hdr + 116, 8);
-                recs[nrec].in_off = body_off;
-                nrec++;
-            }
-            has_pax = 0; has_gnu = 0; pax_size = -1;
-            if (blen >= Z.batch) {
-                ZJob *j = malloc(sizeof *j);
-                j->buf = buf; j->cap = bcap; j->len = blen;
-                j->recs = recs; j->nrecs = nrec; j->lframe = -1; j->sink = 0;
-                z_push(j);
-                buf = bp_acquire(&bcap); blen = 0;
-                rcap = 8192; nrec = 0; recs = malloc(sizeof(ZRec) * rcap);
-            }
-        }
-        if (blen) {                                    /* source's final frame */
-            ZJob *j = malloc(sizeof *j);
-            j->buf = buf; j->cap = bcap; j->len = blen;
-            j->recs = recs; j->nrecs = nrec; j->lframe = -1; j->sink = 0;
-            z_push(j);
-        } else { bp_release(buf, bcap); free(recs); }
-        zsrc_close(&z);
-    }
-    /* last reader out flips readers_done */
-    pthread_mutex_lock(&Z.qmu);
-    if (--Z.nreaders_left == 0) { Z.readers_done = 1;
-        pthread_cond_broadcast(&Z.qcv); }
-    pthread_mutex_unlock(&Z.qmu);
-    return NULL;
-}
-
 static void *z_compressor(void *arg) {
     (void)arg;
     ZSTD_CCtx *cc = ZSTD_createCCtx();
@@ -1886,36 +1791,9 @@ static void *z_compressor(void *arg) {
     return NULL;
 }
 
-static int run_zpack(const char **srcs, int nsrc, const char *out,
-                     int level, int64_t batch, int readers, int compressors) {
-    memset(&Z, 0, sizeof Z);
-    Z.srcs = srcs; Z.nsrc = nsrc; Z.level = level; Z.batch = batch;
-    Z.nreaders_left = readers;
-    pthread_mutex_init(&Z.qmu, NULL); pthread_cond_init(&Z.qcv, NULL);
-    pthread_mutex_init(&Z.omu, NULL);
-    Z.nsink = 1;                               /* single output, preopened */
-    Z.fd = malloc(sizeof(int)); Z.aoff = calloc(1, sizeof(int64_t));
-    Z.slock = malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init(&Z.slock[0], NULL);
-    Z.fd[0] = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (Z.fd[0] < 0) { perror("output"); return 2; }
-    pthread_t rt[64], ct[128];
-    if (readers > 64) readers = 64;
-    if (compressors > 128) compressors = 128;
-    bp_init(batch + (4 << 20), readers + compressors + 96 + 32);
-    for (int i = 0; i < compressors; i++)
-        pthread_create(&ct[i], NULL, z_compressor, NULL);
-    for (int i = 0; i < readers; i++)
-        pthread_create(&rt[i], NULL, z_reader, NULL);
-    for (int i = 0; i < readers; i++) pthread_join(rt[i], NULL);
-    for (int i = 0; i < compressors; i++) pthread_join(ct[i], NULL);
-    bp_destroy();
-    fflush(stdout);
-    close(Z.fd[0]);
-    fprintf(stderr, "zpack: %ld frames, %ld bytes\n",
-            (long)Z.frame_idx, (long)Z.aoff[0]);
-    return 0;
-}
+/* (The fused `zpack` mode and its `z_reader` are retired — plain recompress is
+ * now the one-pass `zstream` port. zscan/zexec remain for the filter/reshard/
+ * S3/WAL paths, which need gather that zstream doesn't do yet.) */
 
 /* ── zscan / zexec: the fold with a plan seam ──────────────────────────────
  * zscan decompresses+parses only, emitting member metadata (no compression)
@@ -2742,14 +2620,6 @@ int main(int argc, char **argv) {
                 use_uring ? "uring" : "sync", threads);
         return run_scan(argv[2], use_uring, threads, prefix, glob,
                         emit_closes);
-    }
-
-    if (!strcmp(argv[1], "zpack")) {
-        /* zpack <out> <level> <batch> <readers> <compressors> <src...> */
-        if (argc < 8) { fprintf(stderr, "zpack: too few args\n"); return 2; }
-        return run_zpack((const char **)&argv[7], argc - 7, argv[2],
-                         atoi(argv[3]), atoll(argv[4]), atoi(argv[5]),
-                         atoi(argv[6]));
     }
 
     if (!strcmp(argv[1], "zscan")) {

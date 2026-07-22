@@ -1001,19 +1001,13 @@ def recompress_c(inputs, out_path: str, level: int = 6,
             os.unlink(plan_path)
         return Result(members=members, frames=frames)
 
-    proc = subprocess.Popen(                                 # A: fused fast path
-        [EXE, "zpack", out_path, str(level), str(batch_bytes),
-         str(readers), str(compressors), *inputs],
-        stdout=subprocess.PIPE, bufsize=1 << 22)
-    members, frames, _ = _ingest_footer(
-        proc.stdout, lambda sink, ftmp: _write_footer(out_path, ftmp,
-                                                      _force_sidecar),
-        progress, progress_every, cin_total,
-        lambda footers: (os.path.getsize(out_path)
-                         if os.path.exists(out_path) else 0))
-    if proc.wait() != 0:
-        raise RuntimeError(f"zpack exited {proc.returncode}")
-    return Result(members=members, frames=frames)
+    # A: plain fast path — the one-pass zstream engine (the fused C `zpack` mode
+    # it replaced is retired). Filter/reshard/S3/WAL still route to zexec above,
+    # since zstream compresses only contiguous buffer slices (no gather yet).
+    return recompress_stream(
+        inputs, out_path, level=level,
+        window_bytes=max(256 << 20, batch_bytes), frame_bytes=batch_bytes,
+        readers=readers, compressors=compressors, force_sidecar=_force_sidecar)
 
 
 def read_index(path: str) -> pl.DataFrame:
@@ -1255,7 +1249,8 @@ def unpack(path, dest, predicate=None, workers=None, engine="auto",
 
 
 def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
-                      frame_bytes=16 << 20, compressors=None, readers=None):
+                      frame_bytes=16 << 20, compressors=None, readers=None,
+                      force_sidecar=False):
     """One-pass planned recompress via the `zstream` port (docs/ISA.md §5) — the
     last de-fork. C decompresses each source ONCE into a live buffer (a large
     `window`) and yields member metadata (ZMETA); this driver plans the window
@@ -1405,7 +1400,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
                      .select([c for c, _ in _FOOTER_IPC]))
     ftmp = tempfile.TemporaryFile()
     ipc.write_all(ftmp, footer)                     # whole footer stream (Polars)
-    _write_footer(out_path, ftmp, False); ftmp.close()
+    _write_footer(out_path, ftmp, force_sidecar); ftmp.close()
 
     if instr_windows is not None:
         import json as _json
