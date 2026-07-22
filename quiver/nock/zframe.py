@@ -1273,6 +1273,7 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
     ftmp = tempfile.TemporaryFile()
     fw = _FooterStream(ftmp)
     base = 0                                        # global frame id offset
+    instr_path = os.environ.get("QUIVER_TRACE_INSTR")   # capture a sample window
     for zb in zmeta:                                # one batch per window
         m = pl.DataFrame(zb)
         n = m.height
@@ -1302,6 +1303,31 @@ def recompress_stream(inputs, out_path, level=10, window_bytes=256 << 20,
         paths = m["path"].to_list(); szs = m["size"].to_list()
         modes = m["mode"].to_list(); mts = m["mtime_ns"].to_list()
         uids = m["uid"].to_list(); gids = m["gid"].to_list()
+        # instruction-stream preview: capture the three streams for one window
+        # (truncated) — the ZMETA in, PLAN out, and COMP back, as the executor
+        # and planner actually exchanged them.
+        if instr_path and base:                     # skip window 0 (tiny warmup)
+            import json as _json
+            K = 12
+            frames_out = sorted(coff)
+            _json.dump({
+                "window": {"members": n, "frames": len(coff),
+                           "frame_bytes": frame_bytes},
+                "zmeta": {"cols": ["path", "size", "mode", "mtime_ns",
+                                   "uid", "gid", "buf_span"],
+                          "rows": [[paths[i], szs[i], modes[i], mts[i],
+                                    uids[i], gids[i], int(span[i])]
+                                   for i in range(min(K, n))], "total": n},
+                "plan": {"cols": ["opcode", "member", "→ frame (dep_group)",
+                                  "in_off"],
+                         "rows": [["COMPRESS", i, base + lf[i], in_off[i]]
+                                  for i in range(min(K, n))], "total": n},
+                "comp": {"cols": ["frame", "coff", "clen"],
+                         "rows": [[base + f, coff[f], clen[f]]
+                                  for f in frames_out[:K]],
+                         "total": len(coff)},
+            }, open(instr_path, "w"), indent=0)
+            instr_path = None                       # once
         for i in range(n):
             f = lf[i]
             fw.add(paths[i], szs[i], modes[i], mts[i], uids[i], gids[i],
