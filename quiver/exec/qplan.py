@@ -942,6 +942,54 @@ def unpack(archive: str, dest: str, qvm_exe: str, npool: int = 16,
     run(instr, qvm_exe, archive, npool=npool, nworkers=nworkers)
 
 
+# --------------------------------------------------------------- merge (reduce)
+def merge(shards: list[str], out_path: str) -> int:
+    """The distributed reduce, ZERO-COPY: join N shard footers into one index
+    tagged with shard_id, keeping each shard's frame offsets local — no byte
+    movement. The merged archive is a manifest [u32 hlen][shard paths][footer
+    ipc]; on extract it is byte-indistinguishable from a single-node run over the
+    union. Returns the file-member count."""
+    parts, fbase = [], 0
+    for k, shard in enumerate(shards):
+        idx = _zf.read_index(shard)
+        parts.append(idx.with_columns(
+            pl.when(pl.col("frame") >= 0).then(pl.col("frame") + fbase)
+              .otherwise(-1).cast(pl.Int32).alias("frame"),
+            pl.lit(k, dtype=pl.Int32).alias("shard_id")))
+        fbase += int(idx.filter(pl.col("frame") >= 0)["frame"].n_unique())
+    merged = (pl.concat(parts, how="vertical_relaxed") if parts
+              else pl.DataFrame(schema={**_zf._ZF_SCHEMA, "shard_id": pl.Int32}))
+    header = ("\n".join(os.path.abspath(s) for s in shards) + "\n").encode()
+    with open(out_path, "wb") as f:                 # [u32 hlen][paths][footer ipc]
+        f.write(struct.pack("<I", len(header))); f.write(header)
+        ipc.write_all(f, merged)
+    return int(merged.filter(pl.col("frame") >= 0).height)
+
+
+def read_merged(out_path: str) -> tuple[list[str], pl.DataFrame]:
+    """Return (shard_paths, joined_index) from a merge manifest."""
+    with open(out_path, "rb") as f:
+        (hlen,) = struct.unpack("<I", f.read(4))
+        shards = [ln for ln in f.read(hlen).decode().split("\n") if ln]
+        raw = f.read()
+    idx = ipc.read_all(raw)
+    return shards, idx
+
+
+def unpack_merged(manifest: str, dest: str, qvm_exe: str, npool: int = 16,
+                  nworkers: int = 8, workers: int = 4) -> int:
+    """Unpack a merged shard-set: each shard is a standalone nock, so unpack them
+    all into `dest` (parallel WITHIN a shard via the fiber scheduler, and up to
+    `workers` shards concurrently). Overlapping mkdirs are benign (EEXIST).
+    Returns the number of shards unpacked."""
+    import concurrent.futures
+    shards, _ = read_merged(manifest)
+    os.makedirs(dest, exist_ok=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(lambda sh: unpack(sh, dest, qvm_exe, npool, nworkers), shards))
+    return len(shards)
+
+
 def verify(archive: str, qvm_exe: str, npool: int = 16, nworkers: int = 8
            ) -> tuple[int, list[int]]:
     """Integrity check: re-inflate every frame with the xxh64 DIGEST flag and

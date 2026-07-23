@@ -1177,6 +1177,18 @@ def test_qvm(tmp):
     assert seen == nt
     ok("qvm reshard: N self-contained shards, correct routing, byte-exact")
 
+    # merge (zero-copy reduce): join shard footers into one manifest, then unpack
+    shards = [str(tmp / f"qvm_sh.shard{sh}.tar.zstd") for sh in range(3)]
+    man = str(tmp / "qvm_merged.nockm")
+    nmg = qplan.merge(shards, man)
+    mshards, midx = qplan.read_merged(man)
+    assert nmg == nt and len(mshards) == 3
+    assert set(midx.filter(pl.col("frame") >= 0)["shard_id"].to_list()) == {0, 1, 2}
+    qplan.unpack_merged(man, str(tmp / "qvm_merged_x"), qvm, npool=8)
+    for pth in midx.filter(pl.col("frame") >= 0)["path"]:   # exactly the packed set
+        assert (tmp / "qvm_merged_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm merge: zero-copy reduce of N shards → one index, unpacks byte-exact")
+
     # pipe sink: frames streamed through a pipe (the S3/TCP shape, hold-through-write)
     sp = wire.scan(str(src), "uring", 4)          # rescan (keep* were added above)
     pp = str(tmp / "qvm_pipe.nock")
