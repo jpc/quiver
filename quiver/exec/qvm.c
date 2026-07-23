@@ -872,7 +872,9 @@ static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
         const uint8_t *bd = m + mlen;
         if (htype == 3) {                                    /* RecordBatch */
             int64_t rb = fb_offset_field(m, rt, 2);
-            nrows = fb_i64(m, fb_field(m, rb, 0));
+            int64_t lf = fb_field(m, rb, 0);   /* length; omitted (==-1) when 0 —
+                                                * flatbuffers drop default fields */
+            nrows = lf >= 0 ? fb_i64(m, lf) : 0;
             bufs  = fb_offset_field(m, rb, 2);
             meta = m; body = bd; break;                      /* single batch */
         }

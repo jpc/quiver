@@ -486,6 +486,163 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
     return instr, members
 
 
+def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
+                              frame_bytes: int, level: int, frame_base: int,
+                              predicate: pl.Expr | None = None
+                              ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """A self-contained window gather whose bytes arrive INLINE (no seekable
+    source): thread 0 allocs buf 0, inline-`mov`s the whole window into it, spawns
+    a `deflate` child per frame (multi-run gather of window-relative ranges), and
+    frees. Used by the fully-streaming compressed recompress, where each window's
+    raw bytes are decoded in Python and carried in the instruction stream. Returns
+    (instr_df, members_df); an all-filtered window yields an empty no-op batch."""
+    df = pl.DataFrame(rows)
+    if predicate is not None:
+        df = df.filter(predicate)
+    if df.height == 0:
+        return _empty_batch(), pl.DataFrame(schema={"frame": pl.Int64})
+    df = df.sort("offset").with_columns(rel=pl.col("offset") - win_start)
+    df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
+    df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
+    df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
+    df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
+    df = df.with_columns(_pe=(pl.col("rel") + pl.col("range")).shift(1),
+                         _pf=pl.col("frame").shift(1))
+    df = df.with_columns(_new=((pl.col("rel") != pl.col("_pe"))
+                               | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
+    df = df.with_columns(run=pl.col("_new").cum_sum())
+    runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
+                                   off=pl.col("rel").min(),
+                                   rlen=pl.col("range").sum()).sort("off"))
+    frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
+    nf = frames.height
+    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
+    payloads = {}
+    for r in rbf.iter_rows(named=True):
+        a = np.empty(2 * len(r["off"]), dtype="<i8")
+        a[0::2] = r["off"]; a[1::2] = r["rlen"]
+        payloads[int(r["frame"])] = a.tobytes()
+    wlen = len(win_bytes)
+    root = pl.concat([
+        pl.DataFrame([{"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": wlen}]),
+        pl.DataFrame({"tid": [0], "_sub": [1], "op": [OP_MOV], "src": [E_INLINE],
+                      "dst": [E_BUF], "buf_id": [0], "buf_off": [0],
+                      "payload": [win_bytes]}),
+        pl.DataFrame([
+            {"tid": 0, "_sub": 2, "op": OP_SPAWN, "lo": 1, "cap": nf},
+            {"tid": 0, "_sub": 3, "op": OP_JOIN, "lo": 1, "cap": nf},
+            {"tid": 0, "_sub": 4, "op": OP_FREE, "buf_id": 0}]),
+    ], how="diagonal_relaxed")
+    deflate = frames.with_columns(
+        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
+        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
+        buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
+        sink=pl.lit(0), level=pl.lit(level),
+        frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
+    instr = _finalize([root, deflate])
+    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
+                        frame=pl.col("frame") + frame_base, in_off="in_off")
+    return instr, members
+
+
+def _tar_window_stream(src_path: str, window_bytes: int):
+    """Stream-decode a .tar.zstd ONCE and yield (win_start, raw_window_bytes,
+    member_rows) windows cut on cumulative member footprint — never materializing
+    the whole decompressed tar. A tee records the decoded bytes as tarfile reads
+    them (bounded to the current window, trimmed as windows are emitted); a
+    member's padding lands in the tee only once tarfile advances past it, so a
+    closed window is sliced one member late."""
+    import zstandard, tarfile
+
+    class _Tee:
+        def __init__(self, src): self.src = src; self.buf = bytearray(); self.base = 0
+        def read(self, n):
+            c = self.src.read(n); self.buf.extend(c); return c
+        def end(self): return self.base + len(self.buf)
+        def sl(self, a, b): return bytes(self.buf[a - self.base:b - self.base])
+        def trim(self, upto): del self.buf[:upto - self.base]; self.base = upto
+
+    zr = zstandard.ZstdDecompressor().stream_reader(open(src_path, "rb"))
+    tee = _Tee(zr)
+    tf = tarfile.open(fileobj=tee, mode="r|")
+    acc, wc, wstart, pend = [], 0, None, None
+    for m in tf:
+        if pend and tee.end() >= pend[1]:         # prior window's bytes now complete
+            yield pend[0], tee.sl(pend[0], pend[1]), pend[2]
+            tee.trim(pend[1]); pend = None
+        if not m.isfile():
+            continue
+        hl = m.offset_data - m.offset
+        rng = hl + ((m.size + 511) // 512) * 512
+        row = {"path": m.name, "size": m.size, "mode": m.mode,
+               "mtime_ns": int(m.mtime) * 1_000_000_000, "uid": m.uid, "gid": m.gid,
+               "offset": m.offset, "header_len": hl, "range": rng}
+        if wstart is None:
+            wstart = m.offset
+        acc.append(row); wc += rng
+        if wc >= window_bytes:
+            pend = (wstart, m.offset + rng, acc); acc, wc, wstart = [], 0, None
+    if pend:                                       # EOF: trailing bytes all in tee
+        yield pend[0], tee.sl(pend[0], pend[1]), pend[2]; tee.trim(pend[1])
+    if acc:
+        we = acc[-1]["offset"] + acc[-1]["range"]
+        yield acc[0]["offset"], tee.sl(acc[0]["offset"], we), acc
+
+
+def recompress_zst_stream(src_path: str, out_path: str, qvm_exe: str,
+                          window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
+                          level: int = 6, npool: int = 4, nworkers: int = 8,
+                          predicate: pl.Expr | None = None, chunk: int = 32) -> int:
+    """Fully-streaming recompress of a COMPRESSED foreign source (.tar.zstd) into
+    a nock (ISA2 §5.5 feedback mode): decode the source ONCE with a streaming
+    decompressor, cutting windows on the fly, and recompress each as it is
+    produced — NEVER materializing the whole decompressed tar (bounded to one
+    window of raw bytes, carried inline in the instruction stream). Windows are
+    driven by a chunked non-recursive driver: thread 0 issues `chunk` window
+    CALLs sequentially (each window batch retires, freeing its inline bytes),
+    then a continuation CALL fetches the next chunk — so peak memory is one
+    window, not the archive. Returns the member count."""
+    gen = _tar_window_stream(src_path, window_bytes)
+    collected: list[pl.DataFrame] = []
+    st = {"base": 0, "next": 0, "done": False}
+    CONT = -2
+
+    def driver_chunk():
+        start = st["next"]; st["next"] += chunk
+        rows = [{"tid": 0, "_sub": i, "op": OP_CALL, "frame_id": start + i}
+                for i in range(chunk)]
+        rows.append({"tid": 0, "_sub": chunk, "op": OP_CALL, "frame_id": CONT})
+        return _finalize([pl.DataFrame(rows)])
+
+    def handler(cid):
+        if cid == -1 or cid == CONT:              # entry / continuation: next chunk
+            return _empty_batch() if st["done"] else driver_chunk()
+        if st["done"]:                            # a filler CALL past end-of-stream
+            return _empty_batch()
+        try:
+            win_start, win_bytes, rows = next(gen)
+        except StopIteration:
+            st["done"] = True
+            return _empty_batch()
+        instr, members = plan_window_gather_inline(
+            rows, win_start, win_bytes, frame_bytes, level, st["base"], predicate)
+        collected.append(members)
+        st["base"] += members["frame"].n_unique() if members.height else 0
+        return instr
+
+    open(out_path, "wb").close()
+    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
+                     nworkers=nworkers, want_comp=True)
+    members_all = (pl.concat(collected) if collected
+                   else pl.DataFrame(schema={"frame": pl.Int64}))
+    footer = (members_all.join(comp, on="frame", how="left")
+                         .select([c for c, _ in _zf._FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    ipc.write_all(ftmp, footer)
+    _zf._write_footer(out_path, ftmp, False); ftmp.close()
+    return footer.height
+
+
 def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
                         window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
                         level: int = 6, nworkers: int = 8, depth: int = 2,
@@ -810,4 +967,7 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
 
 
 def _empty_batch() -> pl.DataFrame:
-    return _finalize([pl.DataFrame({"tid": [], "_sub": []})])
+    # a 0-instruction batch: qvm builds one thread with an empty program that
+    # completes immediately, resuming the CALLer. Fully typed so encode_stream
+    # emits a valid (empty) Arrow batch.
+    return pl.DataFrame(schema=INSTR_COLS)

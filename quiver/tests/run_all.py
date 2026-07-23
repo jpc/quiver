@@ -1232,11 +1232,23 @@ def test_qvm(tmp):
         fo.write(_zstd.ZstdCompressor().compress(fi.read()))
     za = str(tmp / "qvm_zre.nock")
     nz = qplan.recompress_zst(tzst, za, qvm, frame_bytes=16 << 10)
-    zidx = _zf.read_index(za)
+    zidx = _zf.read_index(za).filter(pl.col("frame") >= 0)
     qplan.unpack(za, str(tmp / "qvm_zre_x"), qvm, npool=8)
     for pth in zidx["path"]:
         assert (tmp / "qvm_zre_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm recompress .tar.zstd: compressed foreign source, byte-exact")
+
+    # fully-streaming recompress: decode the .tar.zstd ONCE, window-at-a-time,
+    # never materializing the whole decompressed tar (bytes carried inline)
+    zs = str(tmp / "qvm_zrestream.nock")
+    ns = qplan.recompress_zst_stream(tzst, zs, qvm, window_bytes=64 << 10,
+                                     frame_bytes=16 << 10, chunk=8)
+    sidx = _zf.read_index(zs).filter(pl.col("frame") >= 0)
+    qplan.unpack(zs, str(tmp / "qvm_zrs_x"), qvm, npool=8)
+    for pth in sidx["path"]:
+        assert (tmp / "qvm_zrs_x" / pth).read_bytes() == (src / pth).read_bytes()
+    assert ns == nz, (ns, nz)                      # same members as decode-scan
+    ok("qvm recompress streaming: .tar.zstd decoded once, bounded, byte-exact")
 
 
 def main():
