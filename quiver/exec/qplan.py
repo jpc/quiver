@@ -353,6 +353,29 @@ def recompress(tar_path: str, out_path: str, qvm_exe: str,
     return footer.height
 
 
+def recompress_zst(src_path: str, out_path: str, qvm_exe: str,
+                   frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
+                   nworkers: int = 8, predicate: pl.Expr | None = None) -> int:
+    """Recompress a COMPRESSED foreign source (.tar.zstd) into a nock. The
+    multi-run gather needs random access to the decoded stream, so this is the
+    decode-scan path: streaming-decompress the source to a temp .tar (bounded
+    memory, single decode), discover members from it, then recompress via the
+    multi-run gather. The fully-streaming one-window-at-a-time loop that never
+    materializes (legacy zstream's ZMETA/PLAN feedback) is the remaining
+    optimization for very large sources. Returns the member count."""
+    import zstandard
+    fd, tmp = tempfile.mkstemp(suffix=".tar"); os.close(fd)
+    try:
+        with open(src_path, "rb") as fi, open(tmp, "wb") as fo:
+            zstandard.ZstdDecompressor().copy_stream(fi, fo,
+                                                     read_size=1 << 20,
+                                                     write_size=1 << 20)
+        return recompress(tmp, out_path, qvm_exe, frame_bytes, level, npool,
+                          nworkers, predicate)
+    finally:
+        os.unlink(tmp)
+
+
 def _shard_paths(out_path: str, n: int) -> list[str]:
     if n == 1:
         return [out_path]

@@ -1170,6 +1170,20 @@ def test_qvm(tmp):
         assert (tmp / "qvm_re_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm recompress: tar->nock multi-run gather from shared window (filter)")
 
+    # compressed-source recompress: foreign .tar.zstd -> nock (decode-scan)
+    import zstandard as _zstd
+    tzst = str(tmp / "qvm_re.tar.zstd")
+    with open(tarp, "rb") as fi, open(tzst, "wb") as fo:
+        _zstd.ZstdDecompressor()  # no-op import guard
+        fo.write(_zstd.ZstdCompressor().compress(fi.read()))
+    za = str(tmp / "qvm_zre.nock")
+    nz = qplan.recompress_zst(tzst, za, qvm, frame_bytes=16 << 10)
+    zidx = _zf.read_index(za)
+    qplan.unpack(za, str(tmp / "qvm_zre_x"), qvm, npool=8)
+    for pth in zidx["path"]:
+        assert (tmp / "qvm_zre_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm recompress .tar.zstd: compressed foreign source, byte-exact")
+
 
 def main():
     tmp = Path(tempfile.mkdtemp())
