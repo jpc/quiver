@@ -186,6 +186,19 @@ def plan_pack_unc(scan: pl.DataFrame, root: str
     return instr, footer, total
 
 
+# directories in the nock footer: frame=-1 sentinel rows (no data, no frame).
+# unpack reads them to mkdir + restore dir mode/mtime; old footers simply have
+# none and fall back to ancestor-derived mkdirs without metadata.
+def _dir_footer_rows(scan: pl.DataFrame) -> pl.DataFrame:
+    d = scan.filter(pl.col("is_dir"))
+    return d.select(
+        path=pl.col("path"), size=pl.lit(0, pl.Int64),
+        mode=pl.col("mode").cast(pl.Int32), mtime_ns=pl.col("mtime_ns").cast(pl.Int64),
+        uid=pl.col("uid").cast(pl.Int32), gid=pl.col("gid").cast(pl.Int32),
+        frame=pl.lit(-1, pl.Int32), frame_coff=pl.lit(-1, pl.Int64),
+        frame_clen=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64))
+
+
 # -------------------------------------------------------------- pack (compressed)
 def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
               level: int = 6, npool: int = 16, predicate: pl.Expr | None = None,
@@ -594,14 +607,30 @@ def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
     comp = run(instr, qvm_exe, "-", sinks=tuple(outs), npool=npool,
                nworkers=nworkers, want_comp=True)
     joined = members.join(comp, on="frame", how="left")
+    dirs = _dir_footer_rows(scan)                 # dir metadata (frame=-1 rows)
+    # canonical footer dtypes (frame is i32 so the dir sentinel -1 fits; also
+    # aligns the written footer with its declared _FOOTER_IPC schema)
+    _pl = {"large_string": pl.Utf8, "i64": pl.Int64, "i32": pl.Int32}
+    fs = {c: _pl[t] for c, t in _zf._FOOTER_IPC}
     total = 0
     for s, o in enumerate(outs):
-        part = (joined.filter(pl.col("sink") == s) if nsinks > 1 else joined) \
-            .select([c for c, _ in _zf._FOOTER_IPC])
+        pf = joined.filter(pl.col("sink") == s) if nsinks > 1 else joined
+        part = pf.select([pl.col(c).cast(fs[c]) for c, _ in _zf._FOOTER_IPC])
+        total += part.height                      # member count = files only
+        # a single archive records the WHOLE dir tree (incl. empty dirs); each
+        # reshard shard records only its own files' ancestor dirs (self-contained)
+        sd = dirs
+        if nsinks > 1 and dirs.height:
+            anc = set()
+            for p in pf["path"]:
+                anc.update(_ancestors(p))
+            sd = dirs.filter(pl.col("path").is_in(list(anc)))
+        if sd.height:                             # dirs carry frame=-1 (no data)
+            part = pl.concat([part, sd.select(
+                [pl.col(c).cast(fs[c]) for c in part.columns])])
         ftmp = tempfile.TemporaryFile()
         ipc.write_all(ftmp, part)
         _zf._write_footer(o, ftmp, False); ftmp.close()
-        total += part.height
     return total
 
 
@@ -609,8 +638,11 @@ def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
 def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
     """compressed nock -> fs: one thread per frame — alloc, inflate the frame
     from the archive, scatter its members to files, free. mkdir preamble in
-    thread 0. Reads the footer via the shared nock reader."""
-    idx = _zf.read_index(archive).sort(["frame", "in_off"])
+    thread 0, then a FINISH phase restoring dir mode+mtime from the footer's
+    directory rows (frame=-1). Reads the footer via the shared nock reader."""
+    full = _zf.read_index(archive)
+    dmeta = full.filter(pl.col("frame") < 0).sort("path")   # dir rows (metadata)
+    idx = full.filter(pl.col("frame") >= 0).sort(["frame", "in_off"])   # files
     frames = (idx.group_by("frame").agg(
                   coff=pl.col("frame_coff").first(),
                   clen=pl.col("frame_clen").first(),
@@ -620,9 +652,10 @@ def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
     frames = frames.with_columns(
         cap=((pl.col("dlen") + 511) // 512) * 512 + 2048,        # inflate headroom
         bufid=(pl.col("frank") % npool).cast(pl.Int32))
+    # mkdir set: footer dir paths ∪ ancestors of every path (parents always exist)
     dirs, seen = [], set()
-    for p in idx["path"]:
-        for a in _ancestors(p):
+    for p in list(dmeta["path"]) + list(idx["path"]):
+        for a in list(_ancestors(p)) + ([p] if p in set(dmeta["path"]) else []):
             if a not in seen:
                 seen.add(a); dirs.append(a)
     dd = [(dest, 0)] + [(os.path.join(dest, d), d.count("/") + 1) for d in dirs]
@@ -631,7 +664,7 @@ def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
                     "lo": fbase, "cap": fbase + nf - 1},
                    {"tid": 0, "_sub": sub + 1, "op": OP_JOIN,
                     "lo": fbase, "cap": fbase + nf - 1}]
-    root_df = pl.DataFrame(phase_rows)
+    sub += 2
 
     idx = idx.join(frames.select("frame", "frank", "bufid"), on="frame") \
              .with_columns(tid=pl.col("frank") + fbase,
@@ -652,7 +685,23 @@ def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
                          mode=pl.col("mode") & 0o7777)
     free = frames.select(tid=ftid, _sub=pl.lit(_BIG),
                          op=pl.lit(OP_FREE), buf_id=pl.col("bufid"))
-    return _finalize([root_df, mkdir_df, alloc, inflate, scatter, free])
+
+    # finish: restore dir mode+mtime, one thread per footer dir, after all frames
+    dbase = fbase + nf
+    nd = dmeta.height
+    dir_meta = pl.DataFrame({"tid": [], "_sub": []})
+    if nd:
+        dm = dmeta.with_row_index("k")
+        dir_meta = dm.select(
+            tid=pl.col("k") + dbase, _sub=pl.lit(0), op=pl.lit(OP_SETMETA),
+            path=pl.lit(dest.rstrip("/") + "/") + pl.col("path"),
+            mode=pl.col("mode") & 0o7777, mtime_ns=pl.col("mtime_ns"))
+        phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN,
+                        "lo": dbase, "cap": dbase + nd - 1},
+                       {"tid": 0, "_sub": sub + 1, "op": OP_JOIN,
+                        "lo": dbase, "cap": dbase + nd - 1}]
+    root_df = pl.DataFrame(phase_rows)
+    return _finalize([root_df, mkdir_df, alloc, inflate, scatter, free, dir_meta])
 
 
 def unpack(archive: str, dest: str, qvm_exe: str, npool: int = 16,

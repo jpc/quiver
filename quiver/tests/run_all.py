@@ -1079,14 +1079,24 @@ def test_qvm(tmp):
     from quiver.exec import qplan
     qvm = str(tmp / "qvm"); qplan.build_qvm(qvm)
     src = tmp / "qvm_src"; make_tree(src, n=200)
+    dir_mt = {"t0": 1_000_000_000, "t1/m1": 1_100_000_000,
+              "żółć/empty_dir": 1_200_000_000}     # incl. an empty dir
+    for d0, ts in dir_mt.items():
+        os.utime(src / d0, (ts, ts))              # distinctive dir mtimes
     s = wire.scan(str(src), "uring", 4)
+
+    def _dirs_ok(root):                            # dir mode+mtime restored?
+        return all((root / d0).is_dir()
+                   and (root / d0).stat().st_mtime_ns == ts * 1_000_000_000
+                   for d0, ts in dir_mt.items())
 
     # cp: fs -> fs (copy_file_range), spawn/join per file, buffer-pool backpressure
     qplan.run(qplan.plan_cp(s, str(src), str(tmp / "qvm_cp")), qvm, "-")
     for p in src.rglob("*"):
         if p.is_file():
             assert (tmp / "qvm_cp" / p.relative_to(src)).read_bytes() == p.read_bytes()
-    ok("qvm cp: fiber scheduler fs->fs copy_file_range, spawn-range + join")
+    assert _dirs_ok(tmp / "qvm_cp"), "cp must restore dir mode+mtime (incl. empty)"
+    ok("qvm cp: fs->fs copy_file_range, spawn-range + join, dir mtimes restored")
 
     # uncompressed pack: inline PAX header + copy_file_range body, GNU-tar valid
     instr, footer, total = qplan.plan_pack_unc(s, str(src))
@@ -1110,7 +1120,8 @@ def test_qvm(tmp):
             assert (tmp / "qvm_up" / p.relative_to(src)).read_bytes() == p.read_bytes()
             nf += 1
     assert nmem == nf
-    ok("qvm pack/unpack: compressed nock round-trips byte-exact (codec + sink)")
+    assert _dirs_ok(tmp / "qvm_up"), "unpack must restore dir mode+mtime from footer"
+    ok("qvm pack/unpack: compressed nock round-trips byte-exact + dir mtimes")
 
     # filter: predicate keeps a subset (planning fewer members)
     from quiver.nock import zframe as _zf
@@ -1120,7 +1131,7 @@ def test_qvm(tmp):
     fa = str(tmp / "qvm_filt.nock")
     nkeep = qplan.pack(s2, str(src), fa, qvm, frame_bytes=16 << 10, npool=8,
                        predicate=pl.col("path").str.ends_with(".keep"))
-    fidx = _zf.read_index(fa)
+    fidx = _zf.read_index(fa).filter(pl.col("frame") >= 0)   # files (skip dir rows)
     assert nkeep == 2 and all(p.endswith(".keep") for p in fidx["path"])
     qplan.unpack(fa, str(tmp / "qvm_filt_x"), qvm, npool=8)
     assert (tmp / "qvm_filt_x" / "keep0.keep").read_bytes() == b"K" * 500
@@ -1133,7 +1144,7 @@ def test_qvm(tmp):
     seen = 0
     for sh in range(3):
         sp = str(tmp / f"qvm_sh.shard{sh}.tar.zstd")
-        si = _zf.read_index(sp)
+        si = _zf.read_index(sp).filter(pl.col("frame") >= 0)   # files (skip dirs)
         assert (si.with_columns(h=pl.col("path").hash() % 3)["h"] == sh).all()
         qplan.unpack(sp, str(tmp / f"qvm_ush{sh}"), qvm, npool=8)
         for pth in si["path"]:
