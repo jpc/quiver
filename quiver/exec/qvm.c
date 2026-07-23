@@ -97,7 +97,8 @@ typedef struct Task {
 } Task;
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
-       TK_MKDIR, TK_SETMETA, TK_INFLATE, TK_DEFLATE };
+       TK_MKDIR, TK_SETMETA, TK_INFLATE, TK_DEFLATE,
+       TK_BATCH_READY };   /* reader thread → scheduler: a CALL response arrived */
 
 #define QCAP 4096
 typedef struct {
@@ -340,6 +341,9 @@ typedef struct Thread {
 typedef struct { Thread *th; int nth, ndone; int wep, wtid, hasw;
                  void *pm, *ap, *ad, *raw; } Batch;
 
+/* a CALL awaiting its response (FIFO, scheduler-thread only) */
+typedef struct PW { int ep, tid; int64_t t0, cid; struct PW *next; } PW;
+
 typedef struct {
     Batch *bat; int nbat, batcap; int cur_epoch;   /* batch registry */
     BufSlot *pool; int npool;
@@ -352,8 +356,8 @@ typedef struct {
     int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
-    int pend_ep, pend_tid, has_pend;   /* a CALL waiting for its response batch */
-    int64_t pend_t0, pend_cid;
+    PW *pw_head, *pw_tail; int pw_count;   /* CALLs awaiting responses */
+    pthread_t reader_th; int has_reader;   /* off-thread CALL-response reader */
 #ifdef QVM_URING
     int use_uring, qd; TQ ring_tasks; pthread_t ring_th; struct io_uring ring;
 #endif
@@ -432,6 +436,20 @@ static Thread *ready_pop(Sched *S){
     Thread *t = S->ready_head;
     if (t) { S->ready_head = t->rnext; if (!S->ready_head) S->ready_tail = NULL; }
     return t;
+}
+
+/* pending-CALL FIFO (scheduler thread only): a CALL enqueues its waiter; the
+ * matching response (read in order by the reader thread) dequeues it. */
+static void pw_push(Sched *S, int ep, int tid, int64_t t0, int64_t cid){
+    PW *w = malloc(sizeof *w);
+    w->ep = ep; w->tid = tid; w->t0 = t0; w->cid = cid; w->next = NULL;
+    if (S->pw_tail) S->pw_tail->next = w; else S->pw_head = w;
+    S->pw_tail = w; S->pw_count++;
+}
+static PW *pw_pop(Sched *S){
+    PW *w = S->pw_head;
+    if (w) { S->pw_head = w->next; if (!S->pw_head) S->pw_tail = NULL; S->pw_count--; }
+    return w;
 }
 
 static int pool_alloc(Sched *S, Thread *t, int id, int64_t cap){
@@ -564,16 +582,16 @@ static void run_thread(Sched *S, Thread *t){
             t->join_lo = I->lo; t->join_hi = I->cap; t->st = T_WAIT_JOIN;
             return;
         case OP_CALL:
-            /* Call into Python: emit the call id and SUSPEND. The scheduler
-             * (run_sched) reads the response batch, adds its threads, and wakes
-             * us when it completes. We do NOT run it nested — so anything this
-             * fiber already spawned (a prefetch loader) keeps running
-             * CONCURRENTLY with the returned batch. pc advances on wake. */
-            S->pend_t0 = tr_now(); S->pend_cid = I->frame_id;
+            /* Call into Python: emit the call id and SUSPEND. The READER THREAD
+             * fetches the response (so the scheduler never blocks on the read)
+             * and delivers it as a TK_BATCH_READY event; run_sched then adds the
+             * returned batch's threads and wakes us when it completes. Meanwhile
+             * this batch's other work (a prefetch loader) AND any prior batch's
+             * compression keep running concurrently. pc advances on wake. */
             if (S->call_fd < 0 || write(S->call_fd, &I->frame_id, 8) != 8) {
                 S->failed = S->failed ? S->failed : -EIO; t->pc++; break;
             }
-            S->pend_ep = t->epoch; S->pend_tid = t->tid; S->has_pend = 1;
+            pw_push(S, t->epoch, t->tid, tr_now(), I->frame_id);
             t->st = T_WAIT_CALL;
             return;
         default: t->pc++; break;
@@ -619,6 +637,21 @@ static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl){
  * one batch survives into the next (the discovery→plan→execute feedback loop). */
 static pthread_t g_wt[64]; static int g_nworkers;
 
+/* reader thread: fetch framed CALL responses off stdin so the scheduler never
+ * blocks on the read. Each response (and a NULL sentinel at EOF) is delivered as
+ * a TK_BATCH_READY event on the same queue as task completions. */
+static void *reader_main(void *arg){
+    Sched *S = arg;
+    for (;;) {
+        size_t blen; uint8_t *b = read_framed(0, &blen);
+        Task *k = calloc(1, sizeof *k);
+        k->kind = TK_BATCH_READY; k->buf = b; k->len = b ? (int64_t)blen : 0;
+        tq_push(&S->comps, k);
+        if (!b) break;
+    }
+    return NULL;
+}
+
 static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
                      int npool, int nworkers, int call_fd){
     memset(S, 0, sizeof *S);
@@ -648,6 +681,10 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     static Worker w; w.in = &S->tasks; w.out = &S->comps;
     g_nworkers = nworkers;
     for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
+    if (call_fd >= 0) {                          /* CALL responses read off-thread */
+        S->has_reader = 1;
+        pthread_create(&S->reader_th, 0, reader_main, S);
+    }
 }
 
 /* THE scheduler loop — one loop over ALL batches' threads. Drain the ready
@@ -659,23 +696,27 @@ static void run_sched(Sched *S){
     for (;;) {
         Thread *t;
         while ((t = ready_pop(S))) run_thread(S, t);
-        if (S->has_pend) {                           /* fetch the CALL response */
-            size_t blen; uint8_t *b = read_framed(0, &blen);
-            S->cur_epoch = S->pend_ep;
-            tr_log(S, S->pend_t0, tr_now(), S->pend_tid, OP_CALL, S->pend_cid, 0);
-            S->has_pend = 0;
-            if (!b) { S->failed = S->failed ? S->failed : -EIO; break; }
+        if (S->inflight == 0 && S->pw_count == 0) break;  /* nothing left to do */
+        Task *k = tq_pop(&S->comps);         /* one event: completion OR response */
+        if (k->kind == TK_BATCH_READY) {     /* a CALL response the reader fetched */
+            uint8_t *raw = k->buf; size_t rawlen = (size_t)k->len; free(k);
+            PW *w = pw_pop(S);               /* matches the oldest pending CALL */
+            if (!raw || !w) {                /* reader EOF with a CALL outstanding */
+                if (w) { S->failed = S->failed ? S->failed : -EIO; free(w); }
+                free(raw); if (S->pw_count == 0 && S->inflight == 0) break; else continue;
+            }
+            S->cur_epoch = w->ep;
+            tr_log(S, w->t0, tr_now(), w->tid, OP_CALL, w->cid, 0);  /* Python span */
             int nn; char *nap, *nad;
-            Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
-            int ne = build_batch(S, nins, nn);        /* threads of the new batch */
+            Instr *nins = qvm_decode_arrow(raw, rawlen, &nn, &nap, &nad);
+            int ne = build_batch(S, nins, nn);
             Batch *B = &S->bat[ne];
-            B->wep = S->pend_ep; B->wtid = S->pend_tid; B->hasw = 1;
-            B->pm = nins; B->ap = nap; B->ad = nad; B->raw = b;   /* freed at retire */
+            B->wep = w->ep; B->wtid = w->tid; B->hasw = 1;
+            B->pm = nins; B->ap = nap; B->ad = nad; B->raw = raw;  /* freed at retire */
             ready_push(S, &B->th[0]);
+            free(w);
             continue;
         }
-        if (S->inflight == 0) break;
-        Task *k = tq_pop(&S->comps);                  /* block for a completion */
         S->inflight--;
         if (k->res < 0 && !S->failed) S->failed = k->res;
         if (k->kind == TK_DEFLATE && k->res == 0)
@@ -694,6 +735,17 @@ static void run_sched(Sched *S){
 }
 
 static void qvm_close(Sched *S){
+    if (S->has_reader) {                         /* close the request pipe → Python
+                                                  * closes stdin → reader hits EOF */
+        if (S->call_fd >= 0) { close(S->call_fd); S->call_fd = -1; }
+        pthread_join(S->reader_th, 0);
+        Task *k;                                 /* drain leftover response events */
+        while ((k = tq_trypop(&S->comps))) {
+            if (k->kind == TK_BATCH_READY) free(k->buf);
+            free(k);
+        }
+    }
+    while (S->pw_head) free(pw_pop(S));
 #ifdef QVM_URING
     if (S->use_uring) {
         S->ring_tasks.stop = 1; pthread_cond_broadcast(&S->ring_tasks.cv);

@@ -473,48 +473,26 @@ def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
         win_info.append((ws, we - ws, wdf))
     K = len(win_info)
 
-    if depth <= 1:
-        # sequential: one buffer, load then gather then free (no prefetch)
-        dr = []
-        for k, (ws, wlen, _w) in enumerate(win_info):
-            b = 4 * k
-            dr += [
-                {"tid": 0, "_sub": b, "op": OP_ALLOC, "buf_id": 0, "cap": wlen},
-                {"tid": 0, "_sub": b + 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
-                 "buf_id": 0, "buf_off": 0, "path": tar_path, "arch_off": ws,
-                 "len": wlen},
-                {"tid": 0, "_sub": b + 2, "op": OP_CALL, "frame_id": k},
-                {"tid": 0, "_sub": b + 3, "op": OP_FREE, "buf_id": 0}]
-        driver = _finalize([pl.DataFrame(dr)]) if dr else _empty_batch()
-    else:
-        # prefetch: a loader fiber per window (tid w+1) into buf[w%depth]; the
-        # driver spawns the NEXT loader before CALLing to gather the current, so
-        # the load overlaps Python planning + compression. `depth` buffers ring
-        # the pool; alloc backpressure keeps at most `depth` resident.
-        loaders = []
-        for w, (ws, wlen, _wdf) in enumerate(win_info):
-            loaders += [
-                {"tid": w + 1, "_sub": 0, "op": OP_ALLOC, "buf_id": w % depth,
-                 "cap": wlen},
-                {"tid": w + 1, "_sub": 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
-                 "buf_id": w % depth, "buf_off": 0, "path": tar_path,
-                 "arch_off": ws, "len": wlen}]
-        dr, sub = [], 0
-        if K:
-            dr += [{"tid": 0, "_sub": sub, "op": OP_SPAWN, "lo": 1, "cap": 1},
-                   {"tid": 0, "_sub": sub + 1, "op": OP_JOIN, "lo": 1, "cap": 1}]
-            sub += 2                                   # load window 0
-        for k in range(K):
-            if k + 1 < K:                              # prefetch window k+1 (async)
-                dr.append({"tid": 0, "_sub": sub, "op": OP_SPAWN,
-                           "lo": k + 2, "cap": k + 2}); sub += 1
-            dr.append({"tid": 0, "_sub": sub, "op": OP_CALL, "frame_id": k}); sub += 1
-            if k + 1 < K:
-                dr.append({"tid": 0, "_sub": sub, "op": OP_JOIN,
-                           "lo": k + 2, "cap": k + 2}); sub += 1
-            dr.append({"tid": 0, "_sub": sub, "op": OP_FREE,
-                       "buf_id": k % depth}); sub += 1
-        driver = _finalize([pl.DataFrame(dr + loaders)]) if dr else _empty_batch()
+    # One window-fiber per window (tid w+1): alloc a buffer, load the window,
+    # CALL Python to plan+gather it, free. The driver spawns them ALL at once; the
+    # pool's alloc backpressure admits at most `depth` at a time (buf[w%depth]).
+    # Because OP_CALL is async and its response is read OFF the scheduler thread,
+    # window w+1's load and its Python planning run concurrently with window w's
+    # compression — a genuine load ‖ plan ‖ compress pipeline. depth==1 degrades
+    # to sequential (all fibers contend for buf 0) with no deadlock.
+    fibers = []
+    for w, (ws, wlen, _w) in enumerate(win_info):
+        fibers += [
+            {"tid": w + 1, "_sub": 0, "op": OP_ALLOC, "buf_id": w % depth,
+             "cap": wlen},
+            {"tid": w + 1, "_sub": 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
+             "buf_id": w % depth, "buf_off": 0, "path": tar_path,
+             "arch_off": ws, "len": wlen},
+            {"tid": w + 1, "_sub": 2, "op": OP_CALL, "frame_id": w},
+            {"tid": w + 1, "_sub": 3, "op": OP_FREE, "buf_id": w % depth}]
+    drv = ([{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": K},
+            {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": K}] if K else [])
+    driver = _finalize([pl.DataFrame(drv + fibers)]) if fibers else _empty_batch()
 
     collected: list[pl.DataFrame] = []
     state = {"base": 0}
