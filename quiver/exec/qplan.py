@@ -69,6 +69,29 @@ def _ancestors(rel: str):
         yield "/".join(parts[:k])
 
 
+def _dir_phases(dirs_depth, base_tid):
+    """One MKDIR thread per directory (tids base_tid..), so mkdirs run in
+    PARALLEL. Ordering is by depth epochs: thread 0 spawns each depth's tid
+    range and joins before the next, so a parent always exists before its
+    children. Returns (mkdir_df, root_phase_rows, next_tid, next_sub)."""
+    dd = sorted(dirs_depth, key=lambda x: x[1])          # by depth
+    m = len(dd)
+    mkdir_rows = [{"tid": base_tid + i, "_sub": 0, "op": OP_MKDIR,
+                   "path": p, "mode": 0o755} for i, (p, _) in enumerate(dd)]
+    root_rows, sub, i = [], 0, 0
+    while i < m:                                          # a spawn/join per depth
+        depth, lo = dd[i][1], base_tid + i
+        while i < m and dd[i][1] == depth:
+            i += 1
+        hi = base_tid + i - 1
+        root_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN, "lo": lo, "cap": hi},
+                      {"tid": 0, "_sub": sub + 1, "op": OP_JOIN, "lo": lo, "cap": hi}]
+        sub += 2
+    mkdir_df = (pl.DataFrame(mkdir_rows) if mkdir_rows
+                else pl.DataFrame({"tid": [], "_sub": []}))
+    return mkdir_df, root_rows, base_tid + m, sub
+
+
 # --------------------------------------------------------------------- cp
 def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
     """fs -> fs: mkdir the ancestor set (depth order) in thread 0, then spawn a
@@ -76,23 +99,23 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
     files = scan.filter(~pl.col("is_dir")).sort("path")
     n = files.height
 
-    dirs, seen = [], set()                       # ancestor set, depth-sorted
+    dirs, seen = [], set()                       # ancestor set
     for p in files["path"]:
         for a in _ancestors(p):
             if a not in seen:
                 seen.add(a); dirs.append(a)
-    dirs.sort(key=lambda d: d.count("/"))
-
-    # dst_root itself first (mkdir -p), then each ancestor under it
-    paths = [dst_root] + [os.path.join(dst_root, d) for d in dirs]
-    root = [{"tid": 0, "_sub": i, "op": OP_MKDIR, "path": p, "mode": 0o755}
-            for i, p in enumerate(paths)]
-    root += [{"tid": 0, "_sub": len(paths), "op": OP_SPAWN, "lo": 1, "cap": n},
-             {"tid": 0, "_sub": len(paths) + 1, "op": OP_JOIN, "lo": 1, "cap": n}]
-    root_df = pl.DataFrame(root) if root else pl.DataFrame({"tid": [], "_sub": []})
+    # dst_root (depth 0), then each ancestor at its depth; mkdirs run in parallel
+    dd = [(dst_root, 0)] + [(os.path.join(dst_root, d), d.count("/") + 1)
+                            for d in dirs]
+    mkdir_df, phase_rows, fbase, sub = _dir_phases(dd, 1)
+    phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN,
+                    "lo": fbase, "cap": fbase + n - 1},
+                   {"tid": 0, "_sub": sub + 1, "op": OP_JOIN,
+                    "lo": fbase, "cap": fbase + n - 1}]
+    root_df = pl.DataFrame(phase_rows)
 
     f = files.with_row_index("k")
-    tid = pl.col("k") + 1
+    tid = pl.col("k") + fbase                    # a thread per file, after mkdirs
     srcp = pl.lit(src_root.rstrip("/") + "/") + pl.col("path")
     dstp = pl.lit(dst_root.rstrip("/") + "/") + pl.col("path")
     mov = f.select(tid=tid, _sub=pl.lit(0), op=pl.lit(OP_MOV),
@@ -102,7 +125,7 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
     meta = f.select(tid=tid, _sub=pl.lit(1), op=pl.lit(OP_SETMETA),
                     path=dstp, mode=pl.col("mode") & 0o7777,
                     mtime_ns=pl.col("mtime_ns"))
-    return _finalize([root_df, mov, meta])
+    return _finalize([root_df, mkdir_df, mov, meta])
 
 
 # -------------------------------------------------------------- pack (uncompressed)
@@ -226,27 +249,27 @@ def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
     frames = frames.with_columns(
         cap=((pl.col("dlen") + 511) // 512) * 512 + 2048,        # inflate headroom
         bufid=(pl.col("frank") % npool).cast(pl.Int32))
-    idx = idx.join(frames.select("frame", "frank", "bufid"), on="frame") \
-             .with_columns(tid=pl.col("frank") + 1,
-                           mrank=pl.int_range(pl.len()).over("frame"))
-
     dirs, seen = [], set()
     for p in idx["path"]:
         for a in _ancestors(p):
             if a not in seen:
                 seen.add(a); dirs.append(a)
-    dirs.sort(key=lambda d: d.count("/"))
-    paths = [dest] + [os.path.join(dest, d) for d in dirs]
-    root = [{"tid": 0, "_sub": i, "op": OP_MKDIR, "path": p, "mode": 0o755}
-            for i, p in enumerate(paths)]
-    root += [{"tid": 0, "_sub": len(paths), "op": OP_SPAWN, "lo": 1, "cap": nf},
-             {"tid": 0, "_sub": len(paths) + 1, "op": OP_JOIN, "lo": 1, "cap": nf}]
-    root_df = pl.DataFrame(root)
+    dd = [(dest, 0)] + [(os.path.join(dest, d), d.count("/") + 1) for d in dirs]
+    mkdir_df, phase_rows, fbase, sub = _dir_phases(dd, 1)
+    phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN,
+                    "lo": fbase, "cap": fbase + nf - 1},
+                   {"tid": 0, "_sub": sub + 1, "op": OP_JOIN,
+                    "lo": fbase, "cap": fbase + nf - 1}]
+    root_df = pl.DataFrame(phase_rows)
 
-    alloc = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(0),
+    idx = idx.join(frames.select("frame", "frank", "bufid"), on="frame") \
+             .with_columns(tid=pl.col("frank") + fbase,
+                           mrank=pl.int_range(pl.len()).over("frame"))
+    ftid = pl.col("frank") + fbase               # a thread per frame, after mkdirs
+    alloc = frames.select(tid=ftid, _sub=pl.lit(0),
                           op=pl.lit(OP_ALLOC), buf_id=pl.col("bufid"),
                           cap=pl.col("cap"))
-    inflate = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(1),
+    inflate = frames.select(tid=ftid, _sub=pl.lit(1),
                             op=pl.lit(OP_INFLATE), buf_id=pl.col("bufid"),
                             buf_off=pl.lit(0), arch_off=pl.col("coff"),
                             len=pl.col("clen"))
@@ -256,9 +279,9 @@ def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
                          len=pl.col("size"),
                          path=pl.lit(dest.rstrip("/") + "/") + pl.col("path"),
                          mode=pl.col("mode") & 0o7777)
-    free = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(_BIG),
+    free = frames.select(tid=ftid, _sub=pl.lit(_BIG),
                          op=pl.lit(OP_FREE), buf_id=pl.col("bufid"))
-    return _finalize([root_df, alloc, inflate, scatter, free])
+    return _finalize([root_df, mkdir_df, alloc, inflate, scatter, free])
 
 
 def unpack(archive: str, dest: str, qvm_exe: str, npool: int = 16,
