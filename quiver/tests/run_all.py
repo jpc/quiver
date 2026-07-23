@@ -1077,6 +1077,7 @@ def test_qvm(tmp):
     """The ISA v2 executor (docs/ISA2.md): fiber scheduler + planner. cp,
     uncompressed pack, and compressed pack->unpack, all byte-exact."""
     from quiver.exec import qplan
+    from quiver.nock import zframe as _zf
     qvm = str(tmp / "qvm"); qplan.build_qvm(qvm)
     src = tmp / "qvm_src"; make_tree(src, n=200)
     dir_mt = {"t0": 1_000_000_000, "t1/m1": 1_100_000_000,
@@ -1123,8 +1124,24 @@ def test_qvm(tmp):
     assert _dirs_ok(tmp / "qvm_up"), "unpack must restore dir mode+mtime from footer"
     ok("qvm pack/unpack: compressed nock round-trips byte-exact + dir mtimes")
 
+    # integrity: per-frame xxh64 stored at pack time, checked by re-inflate
+    fdf = _zf.read_index(nock_arc).filter(pl.col("frame") >= 0)
+    assert "frame_digest" in fdf.columns and (fdf["frame_digest"] != 0).any()
+    nvf, bad = qplan.verify(nock_arc, qvm, npool=8)
+    assert nvf > 0 and bad == [], (nvf, bad)       # intact
+    f0 = fdf.sort("frame").row(0, named=True)       # corrupt frame 0's mid byte
+    at = int(f0["frame_coff"]) + int(f0["frame_clen"]) // 2
+    cp = str(tmp / "qvm_corrupt.nock.tar.zstd"); shutil.copy(nock_arc, cp)
+    with open(cp, "r+b") as f:
+        f.seek(at); b = f.read(1); f.seek(at); f.write(bytes([b[0] ^ 0xFF]))
+    try:
+        _, bad2 = qplan.verify(cp, qvm, npool=8); detected = bool(bad2)
+    except RuntimeError:
+        detected = True                             # decode failure = corruption
+    assert detected, "verify must flag a corrupted frame"
+    ok("qvm verify: per-frame xxh64 stored + integrity check detects corruption")
+
     # filter: predicate keeps a subset (planning fewer members)
-    from quiver.nock import zframe as _zf
     (src / "keep0.keep").write_bytes(b"K" * 500)
     (src / "keep1.keep").write_bytes(b"K" * 700)
     s2 = wire.scan(str(src), "uring", 4)

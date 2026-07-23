@@ -85,6 +85,51 @@ typedef struct { int fd; int64_t cursor; int is_pipe; pthread_mutex_t mu; } Sink
 /* A Task is a unit of async work handed to the worker pool; buffer operands are
  * resolved to raw pointers at submit time so workers never touch scheduler
  * state. The worker fills res (0 or -errno) and posts the tid back. */
+/* xxHash64 (Yann Collet, BSD) — frame content digest for integrity. Streaming
+ * (reset/update/digest) so a multi-run gather hashes its runs in place; the
+ * one-shot result over the concatenation equals inflate's one-shot over the
+ * decoded output, so pack and unpack digests match. */
+#define XXH_P1 0x9E3779B185EBCA87ULL
+#define XXH_P2 0xC2B2AE3D27D4EB4FULL
+#define XXH_P3 0x165667B19E3779F9ULL
+#define XXH_P4 0x85EBCA77C2B2AE63ULL
+#define XXH_P5 0x27D4EB2F165667C5ULL
+static inline uint64_t xxr(uint64_t x, int r){ return (x<<r)|(x>>(64-r)); }
+static inline uint64_t xxround(uint64_t a, uint64_t in){ a += in*XXH_P2; a = xxr(a,31); return a*XXH_P1; }
+static inline uint64_t xxmerge(uint64_t a, uint64_t v){ v = xxround(0,v); a ^= v; return a*XXH_P1 + XXH_P4; }
+typedef struct { uint64_t v[4], total; uint8_t mem[32]; int msz; uint64_t seed; } XXH;
+static void xxh_reset(XXH *s){ s->v[0]=XXH_P1+XXH_P2; s->v[1]=XXH_P2; s->v[2]=0;
+    s->v[3]=0-XXH_P1; s->total=0; s->msz=0; s->seed=0; }
+static void xxh_update(XXH *s, const uint8_t *p, size_t len){
+    const uint8_t *end = p+len; s->total += len;
+    if (s->msz + len < 32){ memcpy(s->mem+s->msz, p, len); s->msz += (int)len; return; }
+    if (s->msz){ memcpy(s->mem+s->msz, p, 32-s->msz); uint64_t k;
+        memcpy(&k,s->mem,8);    s->v[0]=xxround(s->v[0],k);
+        memcpy(&k,s->mem+8,8);  s->v[1]=xxround(s->v[1],k);
+        memcpy(&k,s->mem+16,8); s->v[2]=xxround(s->v[2],k);
+        memcpy(&k,s->mem+24,8); s->v[3]=xxround(s->v[3],k);
+        p += 32-s->msz; s->msz=0; }
+    if (p+32<=end){ const uint8_t *lim=end-32;
+        do { uint64_t k;
+            memcpy(&k,p,8);  s->v[0]=xxround(s->v[0],k); p+=8;
+            memcpy(&k,p,8);  s->v[1]=xxround(s->v[1],k); p+=8;
+            memcpy(&k,p,8);  s->v[2]=xxround(s->v[2],k); p+=8;
+            memcpy(&k,p,8);  s->v[3]=xxround(s->v[3],k); p+=8;
+        } while (p<=lim); }
+    if (p<end){ memcpy(s->mem, p, (size_t)(end-p)); s->msz=(int)(end-p); }
+}
+static uint64_t xxh_digest(XXH *s){
+    const uint8_t *p=s->mem, *end=s->mem+s->msz; uint64_t h;
+    if (s->total>=32){ h=xxr(s->v[0],1)+xxr(s->v[1],7)+xxr(s->v[2],12)+xxr(s->v[3],18);
+        h=xxmerge(h,s->v[0]); h=xxmerge(h,s->v[1]); h=xxmerge(h,s->v[2]); h=xxmerge(h,s->v[3]);
+    } else h = XXH_P5;
+    h += s->total;
+    while (p+8<=end){ uint64_t k; memcpy(&k,p,8); h ^= xxround(0,k); h=xxr(h,27)*XXH_P1+XXH_P4; p+=8; }
+    if (p+4<=end){ uint32_t k; memcpy(&k,p,4); h ^= (uint64_t)k*XXH_P1; h=xxr(h,23)*XXH_P2+XXH_P3; p+=4; }
+    while (p<end){ h ^= (*p)*XXH_P5; h=xxr(h,11)*XXH_P1; p++; }
+    h^=h>>33; h*=XXH_P2; h^=h>>29; h*=XXH_P3; h^=h>>32; return h;
+}
+
 typedef struct Task {
     uint32_t tid;
     uint8_t  kind;               /* mirrors the mov case / namespace op */
@@ -94,6 +139,7 @@ typedef struct Task {
     const uint8_t *payload; int64_t payload_len;
     int32_t mode; int64_t mtime_ns;
     Sink    *sink; int level; int64_t frame_id, coff, clen;  /* codec/sink */
+    int      digest_on; int64_t digest;   /* xxh64 of the frame's decoded content */
     int      res;
     int      op; int64_t buf_log, detail; int64_t wt0, wt1;   /* trace */
     int      epoch;              /* owning batch */
@@ -257,12 +303,15 @@ static void run_task(Task *t){
             ZSTD_CCtx_setParameter(cc, ZSTD_c_compressionLevel, t->level);
             ZSTD_CCtx_setPledgedSrcSize(cc, (unsigned long long)total);
             ZSTD_outBuffer out = {cb, bound, 0}; int err = 0;
+            XXH xh; if (t->digest_on) xxh_reset(&xh);
             for (int i = 0; i < nruns && !err; i++) {
                 ZSTD_inBuffer in = {t->buf + rn[i*2], (size_t)rn[i*2 + 1], 0};
+                if (t->digest_on) xxh_update(&xh, t->buf + rn[i*2], (size_t)rn[i*2+1]);
                 while (in.pos < in.size)
                     if (ZSTD_isError(ZSTD_compressStream2(cc,&out,&in,ZSTD_e_continue)))
                         { err = 1; break; }
             }
+            if (t->digest_on) t->digest = (int64_t)xxh_digest(&xh);
             size_t rem;
             do { ZSTD_inBuffer e = {NULL,0,0};
                  rem = ZSTD_compressStream2(cc, &out, &e, ZSTD_e_end);
@@ -277,6 +326,9 @@ static void run_task(Task *t){
             cl = ZSTD_compress(cb, bound, t->buf + t->buf_off,
                                (size_t)t->len, t->level);
             if (ZSTD_isError(cl)) { t->res = -EIO; free(cb); break; }
+            if (t->digest_on) { XXH xh; xxh_reset(&xh);
+                xxh_update(&xh, t->buf + t->buf_off, (size_t)t->len);
+                t->digest = (int64_t)xxh_digest(&xh); }
         }
         Sink *s = t->sink;
         if (s->is_pipe) {                        /* no pwrite: hold through write */
@@ -313,6 +365,9 @@ static void run_task(Task *t){
         }
         size_t z = ZSTD_decompress(t->buf + t->buf_off, dsz, cb, (size_t)t->len);
         if (ZSTD_isError(z)) t->res = -EIO;
+        else if (t->digest_on) { XXH xh; xxh_reset(&xh);   /* verify: hash decoded */
+            xxh_update(&xh, t->buf + t->buf_off, z);
+            t->digest = (int64_t)xxh_digest(&xh); }
         free(cb); break;
     }
     }
@@ -371,7 +426,7 @@ typedef struct {
     int inflight;
     Thread *ready_head, *ready_tail;
     int failed;                  /* first -errno seen */
-    int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
+    int64_t *cf, *cc, *cl, *cd; int ncomp, ccap;  /* completions: frame,coff,clen,digest */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
     PW *pw_head, *pw_tail; int pw_count;   /* CALLs awaiting responses */
@@ -590,6 +645,7 @@ static void run_thread(Sched *S, Thread *t){
             k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
             k->level = I->level; k->frame_id = I->frame_id;
             k->payload = I->payload; k->payload_len = I->payload_len;  /* runs */
+            k->digest_on = I->mode > 0;    /* DIGEST flag: hash decoded content */
             if (I->op == OP_DEFLATE) { k->kind = TK_DEFLATE;
                 k->sink = &S->sinks[I->sink]; }
             else k->kind = TK_INFLATE;
@@ -652,11 +708,12 @@ static int build_batch(Sched *S, Instr *ins, int n){
 
 /* deflate completions accumulate here for the footer; qvm_run returns them so
  * the caller can write {frame_id, coff, clen} back to the planner. */
-static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl){
+static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl, int64_t dg){
     if (S->ncomp == S->ccap) { S->ccap = S->ccap ? S->ccap*2 : 64;
         S->cf = realloc(S->cf, S->ccap*8); S->cc = realloc(S->cc, S->ccap*8);
-        S->cl = realloc(S->cl, S->ccap*8); }
-    S->cf[S->ncomp] = f; S->cc[S->ncomp] = co; S->cl[S->ncomp] = cl; S->ncomp++;
+        S->cl = realloc(S->cl, S->ccap*8); S->cd = realloc(S->cd, S->ccap*8); }
+    S->cf[S->ncomp] = f; S->cc[S->ncomp] = co; S->cl[S->ncomp] = cl;
+    S->cd[S->ncomp] = dg; S->ncomp++;
 }
 
 /* Persistent scheduler: the pool, worker pool, sinks, completions and trace
@@ -746,8 +803,10 @@ static void run_sched(Sched *S){
         }
         S->inflight--;
         if (k->res < 0 && !S->failed) S->failed = k->res;
-        if (k->kind == TK_DEFLATE && k->res == 0)
-            comp_add(S, k->frame_id, k->coff, k->clen);
+        if (k->res == 0 && k->kind == TK_DEFLATE)
+            comp_add(S, k->frame_id, k->coff, k->clen, k->digest);
+        else if (k->res == 0 && k->kind == TK_INFLATE && k->digest_on)
+            comp_add(S, k->frame_id, -1, -1, k->digest);   /* verify: report digest */
         S->cur_epoch = k->epoch;
         {   /* op params for the viz: mov→(arch_off, endpoint-kind), */
             int64_t off = k->arch_off, aux = 0;   /* deflate→(frame_id, in_len) */
@@ -822,7 +881,7 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
     qvm_close(&S);
     int rc = S.failed;
     if (out) *out = S;
-    else { free(S.cf); free(S.cc); free(S.cl); }
+    else { free(S.cf); free(S.cc); free(S.cl); free(S.cd); }
     return rc;
 }
 
@@ -1013,7 +1072,7 @@ static void emit_completions(int fd, Sched *S){
     emit_schema(fd, QCOMP_SCHEMA_META, QCOMP_SCHEMA_LEN);
     struct WBuf b[QCOMP_N_BUFS] = {
         {NULL,0},{S->cf, 8*(int64_t)S->ncomp}, {NULL,0},{S->cc, 8*(int64_t)S->ncomp},
-        {NULL,0},{S->cl, 8*(int64_t)S->ncomp}};
+        {NULL,0},{S->cl, 8*(int64_t)S->ncomp}, {NULL,0},{S->cd, 8*(int64_t)S->ncomp}};
     emit_batch(fd, QCOMP_BATCH_TMPL, QCOMP_TMPL_LEN, QCOMP_OFF_BODYLEN,
                QCOMP_OFF_RBLEN, QCOMP_NODE_OFF, QCOMP_N_NODES,
                QCOMP_BUF_OFF, QCOMP_N_BUFS, S->ncomp, b);
@@ -1080,7 +1139,7 @@ int main(int argc, char **argv){
         int cfd = open(comp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (cfd >= 0) { emit_completions(cfd, &out); close(cfd); }
     }
-    free(out.cf); free(out.cc); free(out.cl);
+    free(out.cf); free(out.cc); free(out.cl); free(out.cd);
     if (arch_fd >= 0) close(arch_fd);
     for (int i = 0; i < nsinks; i++) close(sink_fds[i]);
     free(sink_fds);
@@ -1208,7 +1267,7 @@ static void test_codec(void){
     assert(rc == 0);
     assert(out.ncomp==1 && out.cf[0]==7 && out.cc[0]==0);
     int64_t clen = out.cl[0];
-    free(out.cf); free(out.cc); free(out.cl);
+    free(out.cf); free(out.cc); free(out.cl); free(out.cd);
     static char comp[8192], dcomp[8192];
     int cfd=open("/tmp/qvm_sink0",O_RDONLY);
     if (pread(cfd,comp,8192,0) < clen) abort(); close(cfd);

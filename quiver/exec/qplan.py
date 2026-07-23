@@ -310,7 +310,7 @@ def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
     deflate = frames.select(tid=ftid, _sub=pl.lit(_BIG), op=pl.lit(OP_DEFLATE),
                             buf_id=pl.col("bufid"), buf_off=pl.lit(0),
                             len=pl.col("dl"), sink=pl.col("sink"),
-                            level=pl.lit(level),
+                            level=pl.lit(level), mode=pl.lit(1),   # digest on
                             frame_id=pl.col("frame") + frame_base)  # global id
     free = frames.select(tid=ftid, _sub=pl.lit(_BIG + 1), op=pl.lit(OP_FREE),
                          buf_id=pl.col("bufid"))
@@ -452,7 +452,7 @@ def plan_recompress(members: pl.DataFrame, tar_path: str,
         payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
         tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
         buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
-        sink=pl.lit(0), level=pl.lit(level), frame_id=pl.col("frame"),
+        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1), frame_id=pl.col("frame"),
         payload=pl.col("payload"))
     instr = _finalize([root_df, deflate])
     members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
@@ -508,7 +508,7 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
         payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
         tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
         buf_id=pl.lit(buf_id), buf_off=pl.lit(0), len=pl.col("clen"),
-        sink=pl.lit(0), level=pl.lit(level),
+        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1),   # digest on
         frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
     instr = _finalize([root_df, deflate])
     members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
@@ -567,7 +567,7 @@ def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
         payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
         tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
         buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
-        sink=pl.lit(0), level=pl.lit(level),
+        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1),   # digest on
         frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
     instr = _finalize([root, deflate])
     members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
@@ -771,9 +771,17 @@ def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
     _pl = {"large_string": pl.Utf8, "i64": pl.Int64, "i32": pl.Int32}
     fs = {c: _pl[t] for c, t in _zf._FOOTER_IPC}
     fcols = [c for c, _ in _zf._FOOTER_IPC]
+    # carry a per-frame content digest (xxh64) when the completions have one — an
+    # extra footer column for integrity; readers without it just ignore it.
+    has_dg = comp is not None and comp.height and "digest" in comp.columns
+    if has_dg:
+        fcols = fcols + ["frame_digest"]; fs["frame_digest"] = pl.Int64
     if comp is not None and comp.height:
-        comp = comp.select(frame=pl.col("frame").cast(pl.Int64),
-                           frame_coff="frame_coff", frame_clen="frame_clen")
+        sel = dict(frame=pl.col("frame").cast(pl.Int64),
+                   frame_coff="frame_coff", frame_clen="frame_clen")
+        if has_dg:
+            sel["frame_digest"] = pl.col("digest")
+        comp = comp.select(**sel)
     ftmp = tempfile.TemporaryFile()
     total = 0
     for part in parts:
@@ -789,12 +797,14 @@ def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
             ipc.write_batch(ftmp, j)          # columnar batch, streamed
             total += j.height
     if dirs is not None and dirs.height:          # directory rows: frame=-1, no data
-        d = dirs.select(
+        cols = dict(
             path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns",
             uid="uid", gid="gid", frame=pl.lit(-1, pl.Int32),
             frame_coff=pl.lit(-1, pl.Int64), frame_clen=pl.lit(-1, pl.Int64),
-            in_off=pl.lit(-1, pl.Int64)).select(
-            [pl.col(c).cast(fs[c]) for c in fcols])
+            in_off=pl.lit(-1, pl.Int64))
+        if has_dg:
+            cols["frame_digest"] = pl.lit(-1, pl.Int64)
+        d = dirs.select(**cols).select([pl.col(c).cast(fs[c]) for c in fcols])
         ipc.write_batch(ftmp, d)
     ipc.write_eos(ftmp)
     _zf._write_footer(out_path, ftmp, force_sidecar)
@@ -918,6 +928,42 @@ def unpack(archive: str, dest: str, qvm_exe: str, npool: int = 16,
     os.makedirs(dest, exist_ok=True)
     instr = plan_unpack(archive, dest, npool)
     run(instr, qvm_exe, archive, npool=npool, nworkers=nworkers)
+
+
+def verify(archive: str, qvm_exe: str, npool: int = 16, nworkers: int = 8
+           ) -> tuple[int, list[int]]:
+    """Integrity check: re-inflate every frame with the xxh64 DIGEST flag and
+    compare each against the frame_digest the packer stored in the footer. Only
+    decodes (no scatter) so it is cheap. Returns (frames_checked, mismatched
+    frame ids) — an empty list means the archive is intact."""
+    idx = _zf.read_index(archive)
+    if "frame_digest" not in idx.columns:
+        raise ValueError("archive carries no digests (packed without integrity)")
+    frames = (idx.filter(pl.col("frame") >= 0).group_by("frame").agg(
+                  coff=pl.col("frame_coff").first(), clen=pl.col("frame_clen").first(),
+                  dg=pl.col("frame_digest").first(),
+                  dlen=(pl.col("in_off") + pl.col("size")).max())
+                .sort("frame").with_row_index("frank"))
+    nf = frames.height
+    frames = frames.with_columns(cap=((pl.col("dlen") + 511) // 512) * 512 + 2048,
+                                 bufid=(pl.col("frank") % npool).cast(pl.Int32))
+    ftid = pl.col("frank") + 1
+    root = pl.DataFrame([{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
+                         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
+    alloc = frames.select(tid=ftid, _sub=pl.lit(0), op=pl.lit(OP_ALLOC),
+                          buf_id=pl.col("bufid"), cap=pl.col("cap"))
+    inflate = frames.select(tid=ftid, _sub=pl.lit(1), op=pl.lit(OP_INFLATE),
+                            buf_id=pl.col("bufid"), buf_off=pl.lit(0),
+                            arch_off=pl.col("coff"), len=pl.col("clen"),
+                            mode=pl.lit(1), frame_id=pl.col("frame"))  # digest+report
+    free = frames.select(tid=ftid, _sub=pl.lit(_BIG), op=pl.lit(OP_FREE),
+                         buf_id=pl.col("bufid"))
+    instr = _finalize([root, alloc, inflate, free])
+    comp = run(instr, qvm_exe, archive, npool=npool, nworkers=nworkers, want_comp=True)
+    got = {int(f): int(d) for f, d in zip(comp["frame"], comp["digest"])}
+    exp = {int(f): int(d) for f, d in zip(frames["frame"], frames["dg"])}
+    bad = [f for f in exp if got.get(f) != exp[f]]
+    return nf, sorted(bad)
 
 
 # ------------------------------------------------------------------- encoding
