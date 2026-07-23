@@ -483,10 +483,11 @@ static void run_thread(Sched *S, Thread *t){
              * fiber's own batch to be quiescent here (no other in-flight ops),
              * which the single-fiber window driver satisfies. */
             int64_t cid = I->frame_id;
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_CALL, cid, 0);
+            int64_t ct0 = tr_now();                      /* qvm blocks in Python… */
             if (S->call_fd >= 0 && write(S->call_fd, &cid, 8) != 8)
                 { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
             size_t blen; uint8_t *b = read_framed(0, &blen);
+            tr_log(S, ct0, tr_now(), t->tid, OP_CALL, cid, 0);  /* …span = Python time */
             if (!b) { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
             int nn; char *nap, *nad;
             Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
