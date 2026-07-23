@@ -1073,6 +1073,46 @@ def test_p1_barrier(tmp):
     assert comp["res"][0] == 0
     ok("FBARRIER on a path fsyncs cleanly (archive-fd form covered by pack)")
 
+def test_qvm(tmp):
+    """The ISA v2 executor (docs/ISA2.md): fiber scheduler + planner. cp,
+    uncompressed pack, and compressed pack->unpack, all byte-exact."""
+    from quiver.exec import qplan
+    qvm = str(tmp / "qvm"); qplan.build_qvm(qvm)
+    src = tmp / "qvm_src"; make_tree(src, n=200)
+    s = wire.scan(str(src), "uring", 4)
+
+    # cp: fs -> fs (copy_file_range), spawn/join per file, buffer-pool backpressure
+    qplan.run(qplan.plan_cp(s, str(src), str(tmp / "qvm_cp")), qvm, "-")
+    for p in src.rglob("*"):
+        if p.is_file():
+            assert (tmp / "qvm_cp" / p.relative_to(src)).read_bytes() == p.read_bytes()
+    ok("qvm cp: fiber scheduler fs->fs copy_file_range, spawn-range + join")
+
+    # uncompressed pack: inline PAX header + copy_file_range body, GNU-tar valid
+    instr, footer, total = qplan.plan_pack_unc(s, str(src))
+    arc = str(tmp / "qvm_u.tar"); qplan.run(instr, qvm, arc)
+    with open(arc, "r+b") as f: f.seek(total); f.write(b"\0" * 1024)
+    assert subprocess.run(["tar", "tf", arc], capture_output=True).returncode == 0
+    d = tmp / "qvm_ux"; d.mkdir()
+    with tarfile.open(arc) as tf: tf.extractall(d)
+    for p in src.rglob("*"):
+        if p.is_file():
+            assert (d / p.relative_to(src)).read_bytes() == p.read_bytes()
+    ok("qvm pack-unc: zero-CPU uncompressed tar (GNU tar + PAX + copy_file_range)")
+
+    # compressed pack -> unpack: deflate to sink, footer from completions, inflate+scatter
+    nock_arc = str(tmp / "qvm_c.nock.tar.zstd")
+    nmem = qplan.pack(s, str(src), nock_arc, qvm, frame_bytes=32 << 10, npool=8)
+    qplan.unpack(nock_arc, str(tmp / "qvm_up"), qvm, npool=8)
+    nf = 0
+    for p in src.rglob("*"):
+        if p.is_file():
+            assert (tmp / "qvm_up" / p.relative_to(src)).read_bytes() == p.read_bytes()
+            nf += 1
+    assert nmem == nf
+    ok("qvm pack/unpack: compressed nock round-trips byte-exact (codec + sink)")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp())
     for t in (test_scan, test_pack, test_tools, test_retrofit,
@@ -1083,7 +1123,7 @@ def main():
               test_zframe_merge, test_zframe_unpack, test_zframe_unpack_dist,
               test_zframe_zstream, test_zframe_packfs, test_zframe_wal,
               test_cksum_parallel,
-              test_p1_barrier):
+              test_p1_barrier, test_qvm):
         t(tmp)
     shutil.rmtree(tmp)
     print(f"\n{len(PASS)} test groups passed")

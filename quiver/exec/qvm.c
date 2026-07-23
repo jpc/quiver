@@ -30,8 +30,20 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+
+/* ----------------------------------------------------------------- tracing  */
+/* When QVM_TRACE=<path> is set, every op is logged with monotonic start/end so
+ * the visualizer can draw the fiber timeline + buffer-pool occupancy. Events
+ * are appended only from the scheduler thread (worker times are carried back on
+ * the Task), so no locking. Dump: [i64 t_base][u32 n][n × 6×i64]. */
+static int64_t tr_now(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+typedef struct { int64_t t0, t1, tid, op, buf, detail; } TraceEv;
 
 /* ------------------------------------------------------------------ opcodes */
 enum {
@@ -74,6 +86,7 @@ typedef struct {
     int32_t mode; int64_t mtime_ns;
     Sink    *sink; int level; int64_t frame_id, coff, clen;  /* codec/sink */
     int      res;
+    int      op; int64_t buf_log, detail; int64_t wt0, wt1;   /* trace */
 } Task;
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
@@ -234,7 +247,7 @@ static void *worker_main(void *a){
     for (;;) {
         Task *t = tq_pop(w->in);
         if (!t) break;
-        run_task(t);
+        t->wt0 = tr_now(); run_task(t); t->wt1 = tr_now();
         tq_push(w->out, t);
     }
     return NULL;
@@ -269,7 +282,17 @@ typedef struct {
     Thread *ready_head, *ready_tail;
     int failed;                  /* first -errno seen */
     int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
+    TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
 } Sched;
+
+static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
+                   int64_t buf, int64_t detail){
+    if (!S->t_base) return;                       /* tracing off */
+    if (S->ntr == S->trcap) { S->trcap = S->trcap ? S->trcap*2 : 1024;
+        S->tr = realloc(S->tr, S->trcap * sizeof(TraceEv)); }
+    S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
+                                 tid, op, buf, detail };
+}
 
 static void ready_push(Sched *S, Thread *t){
     t->st = T_READY; t->rnext = NULL;
@@ -318,12 +341,16 @@ static void thread_done(Sched *S, Thread *t){
 static void submit_mov(Sched *S, Thread *t, Instr *I){
     /* INLINE -> BUF is pure memory: do it synchronously, no task. */
     if (I->src == E_INLINE && I->dst == E_BUF) {
+        int64_t tt = tr_now();
         memcpy(S->pool[I->buf_id].mem + I->buf_off, I->payload,
                (size_t)I->payload_len);
+        tr_log(S, tt, tr_now(), t->tid, OP_MOV, I->buf_id, I->payload_len);
         t->pc++; return;
     }
     Task *k = calloc(1, sizeof *k);
     k->tid = t->tid; k->arch_fd = S->arch_fd;
+    k->op = I->op; k->buf_log = I->buf_id;
+    k->detail = I->len ? I->len : (int64_t)I->payload_len;
     k->path = I->path; k->dpath = I->dpath;
     k->payload = I->payload; k->payload_len = I->payload_len;
     k->buf_off = I->buf_off; k->arch_off = I->arch_off; k->len = I->len;
@@ -345,10 +372,14 @@ static void run_thread(Sched *S, Thread *t){
     while (t->pc < t->nprog) {
         Instr *I = &t->prog[t->pc];
         switch (I->op) {
-        case OP_ALLOC:
+        case OP_ALLOC: {
+            int64_t tt = tr_now();
             if (!pool_alloc(S, t, I->buf_id, I->cap)) return;   /* parked */
+            tr_log(S, tt, tr_now(), t->tid, OP_ALLOC, I->buf_id, I->cap);
             t->pc++; break;
+        }
         case OP_FREE:
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_FREE, I->buf_id, 0);
             pool_free(S, I->buf_id); t->pc++; break;
         case OP_MOV:
             submit_mov(S, t, I);
@@ -356,7 +387,7 @@ static void run_thread(Sched *S, Thread *t){
             break;                              /* sync (inline->buf): continue */
         case OP_MKDIR: case OP_SETMETA: {
             Task *k = calloc(1, sizeof *k);
-            k->tid = t->tid; k->path = I->path;
+            k->tid = t->tid; k->path = I->path; k->op = I->op; k->buf_log = -1;
             k->mode = I->mode; k->mtime_ns = I->mtime_ns;
             k->kind = I->op==OP_MKDIR ? TK_MKDIR : TK_SETMETA;
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
@@ -365,6 +396,7 @@ static void run_thread(Sched *S, Thread *t){
         case OP_INFLATE: case OP_DEFLATE: {
             Task *k = calloc(1, sizeof *k);
             k->tid = t->tid; k->arch_fd = S->arch_fd;
+            k->op = I->op; k->buf_log = I->buf_id; k->detail = I->len;
             k->buf = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
             k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
             k->level = I->level; k->frame_id = I->frame_id;
@@ -375,11 +407,13 @@ static void run_thread(Sched *S, Thread *t){
             return;
         }
         case OP_SPAWN:
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_SPAWN, I->lo, I->cap);
             for (int64_t i = I->lo; i <= I->cap; i++)
                 if (S->th[i].st == T_INERT) ready_push(S, &S->th[i]);
             t->pc++; break;
         case OP_JOIN:
             if (range_done(S, I->lo, I->cap)) { t->pc++; break; }
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_JOIN, I->lo, I->cap);
             t->join_lo = I->lo; t->join_hi = I->cap; t->st = T_WAIT_JOIN;
             return;
         default: t->pc++; break;
@@ -426,6 +460,8 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
     }
     tq_init(&S.tasks); tq_init(&S.comps);
     build_threads(&S, ins, n);
+    const char *trp = getenv("QVM_TRACE");
+    if (trp) S.t_base = tr_now();
 
     pthread_t wt[64]; Worker w = { &S.tasks, &S.comps };
     for (int k = 0; k < nworkers; k++) pthread_create(&wt[k], 0, worker_main, &w);
@@ -440,6 +476,8 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
         if (k->res < 0 && !S.failed) S.failed = k->res;
         if (k->kind == TK_DEFLATE && k->res == 0)
             comp_add(&S, k->frame_id, k->coff, k->clen);
+        tr_log(&S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
+               k->kind == TK_DEFLATE ? k->clen : k->detail);
         Thread *ct = &S.th[k->tid];
         if (ct->st == T_WAIT_IO) {                     /* resume at pc */
             ct->st = T_READY;   /* clear WAIT before running: a following sync
@@ -450,6 +488,19 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
     }
     S.tasks.stop = 1; pthread_cond_broadcast(&S.tasks.cv);
     for (int k = 0; k < nworkers; k++) pthread_join(wt[k], 0);
+    if (trp) {                                   /* dump the trace */
+        int tf = open(trp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (tf >= 0) {
+            int64_t span = tr_now() - S.t_base; uint32_t nt = (uint32_t)S.ntr;
+            if (write(tf, &span, 8) != 8) S.failed = S.failed ? S.failed : -EIO;
+            if (write(tf, &nt, 4) != 4) S.failed = S.failed ? S.failed : -EIO;
+            if (S.ntr && write(tf, S.tr, (size_t)S.ntr * sizeof(TraceEv))
+                != (ssize_t)(S.ntr * sizeof(TraceEv)))
+                S.failed = S.failed ? S.failed : -EIO;
+            close(tf);
+        }
+    }
+    free(S.tr);
     int rc = S.failed;
     for (int i = 0; i < npool; i++) free(S.pool[i].mem);
     for (int i = 0; i < nsinks; i++) pthread_mutex_destroy(&S.sinks[i].mu);

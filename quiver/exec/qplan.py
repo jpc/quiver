@@ -279,6 +279,20 @@ def encode_stream(instr: pl.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def build_qvm(dest: str, src: str | None = None) -> str:
+    """Compile the qvm executor (links libzstd). Prefers the static libzstd.a
+    from the conda pkgs dir; falls back to a dynamic -lzstd."""
+    src = src or os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvm.c")
+    zp = "/mnt/weka/jpc/miniconda3/pkgs/zstd-1.5.6-hc292b87_0"
+    if os.path.exists(f"{zp}/lib/libzstd.a"):
+        cmd = ["cc", "-O2", "-pthread", f"-I{zp}/include", "-o", dest, src,
+               f"{zp}/lib/libzstd.a"]
+    else:
+        cmd = ["cc", "-O2", "-pthread", "-o", dest, src, "-lzstd"]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return dest
+
+
 def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
         sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
         want_comp: bool = False):
