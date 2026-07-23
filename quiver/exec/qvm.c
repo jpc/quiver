@@ -9,11 +9,16 @@
  * contiguous range; `join lo,hi` waits for it. Same tid = sequential; different
  * tids = parallel, bounded by the buffer pool (alloc blocks when full).
  *
- * This slice covers CODEC=NONE: alloc/free, mov (inline/fs/buf/arch), mkdir,
- * setmeta, spawn, join — enough for cp and uncompressed pack. inflate/deflate
- * and the sink lock land next.
+ * Ops: alloc/free, mov (inline/fs/buf/arch, fs->fs = copy_file_range), mkdir,
+ * setmeta, spawn, join, and the codecs inflate/deflate. deflate appends to a
+ * Sink (an fd + cursor guarded by a mutex; the reservation is the only critical
+ * section) and reports {frame_id, coff, clen} for the footer. Enough for cp,
+ * uncompressed pack, and the compressed pack/unpack byte paths; the planner
+ * modes (plan_pack/plan_unpack) wire them end-to-end next.
  *
- * Build/test:  cc -O2 -pthread -DQVM_TEST -o /tmp/qvm quiver/exec/qvm.c && /tmp/qvm
+ * Build/test (libzstd required):
+ *   cc -O2 -pthread -DQVM_TEST -I<zstd>/include -o /tmp/qvm quiver/exec/qvm.c \
+ *      <zstd>/lib/libzstd.a && /tmp/qvm
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -26,11 +31,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <zstd.h>
 
 /* ------------------------------------------------------------------ opcodes */
 enum {
     OP_ALLOC = 1, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA,
-    OP_SPAWN, OP_JOIN,
+    OP_SPAWN, OP_JOIN, OP_INFLATE, OP_DEFLATE,
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -48,7 +54,11 @@ typedef struct {
     const char *path, *dpath;    /* fs path(s): src / cp-dst */
     const uint8_t *payload; int64_t payload_len;   /* inline bytes */
     int32_t  mode; int64_t mtime_ns;
+    int32_t  sink; int32_t level; int64_t frame_id;  /* deflate: sink/level/tag */
 } Instr;
+
+/* an append sink: fd + cursor guarded by a mutex (deflate reserves under it) */
+typedef struct { int fd; int64_t cursor; pthread_mutex_t mu; } Sink;
 
 /* --------------------------------------------------------------- task queue */
 /* A Task is a unit of async work handed to the worker pool; buffer operands are
@@ -62,11 +72,12 @@ typedef struct {
     const char *path, *dpath;
     const uint8_t *payload; int64_t payload_len;
     int32_t mode; int64_t mtime_ns;
+    Sink    *sink; int level; int64_t frame_id, coff, clen;  /* codec/sink */
     int      res;
 } Task;
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
-       TK_MKDIR, TK_SETMETA };
+       TK_MKDIR, TK_SETMETA, TK_INFLATE, TK_DEFLATE };
 
 #define QCAP 4096
 typedef struct {
@@ -180,6 +191,40 @@ static void run_task(Task *t){
         }
         break;
     }
+    case TK_DEFLATE: {
+        /* compress buf[buf_off, len] and append to the sink; the reservation
+         * (cursor bump) is the only critical section — the write is a positioned
+         * pwrite off-lock. Reports (coff, clen) for the footer. */
+        size_t bound = ZSTD_compressBound((size_t)t->len);
+        uint8_t *cb = malloc(bound);
+        if (!cb) { t->res = -ENOMEM; break; }
+        size_t cl = ZSTD_compress(cb, bound, t->buf + t->buf_off,
+                                  (size_t)t->len, t->level);
+        if (ZSTD_isError(cl)) { t->res = -EIO; free(cb); break; }
+        Sink *s = t->sink;
+        pthread_mutex_lock(&s->mu);
+        int64_t coff = s->cursor; s->cursor += (int64_t)cl;   /* reserve */
+        pthread_mutex_unlock(&s->mu);
+        if (pwrite(s->fd, cb, cl, coff) != (ssize_t)cl) t->res = -errno;
+        t->coff = coff; t->clen = (int64_t)cl;
+        free(cb); break;
+    }
+    case TK_INFLATE: {
+        /* read the compressed frame from arch[arch_off, len] and decompress it
+         * into buf[buf_off]; the frame header carries the content size. */
+        uint8_t *cb = malloc((size_t)t->len);
+        if (!cb) { t->res = -ENOMEM; break; }
+        if (pread(t->arch_fd, cb, (size_t)t->len, t->arch_off) != t->len) {
+            t->res = -errno; free(cb); break;
+        }
+        unsigned long long dsz = ZSTD_getFrameContentSize(cb, (size_t)t->len);
+        if (dsz == ZSTD_CONTENTSIZE_ERROR || dsz == ZSTD_CONTENTSIZE_UNKNOWN) {
+            t->res = -EIO; free(cb); break;
+        }
+        size_t z = ZSTD_decompress(t->buf + t->buf_off, dsz, cb, (size_t)t->len);
+        if (ZSTD_isError(z)) t->res = -EIO;
+        free(cb); break;
+    }
     }
 }
 
@@ -218,10 +263,12 @@ typedef struct {
     Thread *th; int nth;         /* threads indexed by tid */
     BufSlot *pool; int npool;
     int arch_fd;
+    Sink *sinks; int nsinks;
     TQ tasks, comps;
     int inflight;
     Thread *ready_head, *ready_tail;
     int failed;                  /* first -errno seen */
+    int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
 } Sched;
 
 static void ready_push(Sched *S, Thread *t){
@@ -314,6 +361,18 @@ static void run_thread(Sched *S, Thread *t){
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
             return;
         }
+        case OP_INFLATE: case OP_DEFLATE: {
+            Task *k = calloc(1, sizeof *k);
+            k->tid = t->tid; k->arch_fd = S->arch_fd;
+            k->buf = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
+            k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
+            k->level = I->level; k->frame_id = I->frame_id;
+            if (I->op == OP_DEFLATE) { k->kind = TK_DEFLATE;
+                k->sink = &S->sinks[I->sink]; }
+            else k->kind = TK_INFLATE;
+            t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
+            return;
+        }
         case OP_SPAWN:
             for (int64_t i = I->lo; i <= I->cap; i++)
                 if (S->th[i].st == T_INERT) ready_push(S, &S->th[i]);
@@ -344,10 +403,26 @@ static void build_threads(Sched *S, Instr *ins, int n){
     }
 }
 
-static int qvm_run(Instr *ins, int n, int arch_fd, int npool, int nworkers){
+/* deflate completions accumulate here for the footer; qvm_run returns them so
+ * the caller can write {frame_id, coff, clen} back to the planner. */
+static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl){
+    if (S->ncomp == S->ccap) { S->ccap = S->ccap ? S->ccap*2 : 64;
+        S->cf = realloc(S->cf, S->ccap*8); S->cc = realloc(S->cc, S->ccap*8);
+        S->cl = realloc(S->cl, S->ccap*8); }
+    S->cf[S->ncomp] = f; S->cc[S->ncomp] = co; S->cl[S->ncomp] = cl; S->ncomp++;
+}
+
+static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
+                   int npool, int nworkers, Sched *out){
     Sched S; memset(&S, 0, sizeof S);
     S.arch_fd = arch_fd; S.npool = npool; S.failed = 0;
     S.pool = calloc(npool, sizeof(BufSlot));
+    S.nsinks = nsinks;
+    S.sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
+    for (int i = 0; i < nsinks; i++) {
+        S.sinks[i].fd = sink_fds[i]; S.sinks[i].cursor = 0;
+        pthread_mutex_init(&S.sinks[i].mu, NULL);
+    }
     tq_init(&S.tasks); tq_init(&S.comps);
     build_threads(&S, ins, n);
 
@@ -362,6 +437,8 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int npool, int nworkers){
         Task *k = tq_pop(&S.comps);      /* block for a completion */
         S.inflight--;
         if (k->res < 0 && !S.failed) S.failed = k->res;
+        if (k->kind == TK_DEFLATE && k->res == 0)
+            comp_add(&S, k->frame_id, k->coff, k->clen);
         Thread *ct = &S.th[k->tid];
         if (ct->st == T_WAIT_IO) run_thread(&S, ct);   /* resume at pc */
         free(k);
@@ -370,7 +447,10 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int npool, int nworkers){
     for (int k = 0; k < nworkers; k++) pthread_join(wt[k], 0);
     int rc = S.failed;
     for (int i = 0; i < npool; i++) free(S.pool[i].mem);
-    free(S.pool); free(S.th);
+    for (int i = 0; i < nsinks; i++) pthread_mutex_destroy(&S.sinks[i].mu);
+    free(S.pool); free(S.sinks); free(S.th);
+    if (out) *out = S;                   /* hand completions to the caller */
+    else { free(S.cf); free(S.cc); free(S.cl); }
     return rc;
 }
 
@@ -498,28 +578,50 @@ static uint8_t *read_all_fd(int fd, size_t *out){
 }
 
 #ifndef QVM_TEST
-/* qvm <arch|-> <npool> <nworkers> : read an encoded instruction stream on
- * stdin and execute it. `arch` is the output archive fd for E_ARCH movs. */
+/* qvm <arch|-> <npool> <nworkers> <compfd|-1> [sink ...] : read an Arrow
+ * instruction stream on stdin and execute it. `arch` is the archive fd
+ * (E_ARCH movs / inflate source; O_RDWR|CREAT); each `sink` is a deflate output
+ * (O_RDWR|CREAT|TRUNC). Deflate completions {frame_id, coff, clen} are written
+ * to `compfd` as [u32 n][n×3 i64] if compfd >= 0. */
 int main(int argc, char **argv){
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
-        fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers]\n", argv[0]);
+        fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [compfd] "
+                        "[sink ...]\n", argv[0]);
         return 2;
     }
     const char *arch = argc > 2 ? argv[2] : "-";
     int npool = argc > 3 ? atoi(argv[3]) : 16;
     int nworkers = argc > 4 ? atoi(argv[4]) : 8;
+    int compfd = argc > 5 ? atoi(argv[5]) : -1;
+    int nsinks = argc > 6 ? argc - 6 : 0;
+    int *sink_fds = nsinks ? calloc(nsinks, sizeof(int)) : NULL;
+    for (int i = 0; i < nsinks; i++) {
+        sink_fds[i] = open(argv[6 + i], O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (sink_fds[i] < 0) { perror("open sink"); return 2; }
+    }
     int arch_fd = -1;
     if (strcmp(arch, "-") != 0) {
-        arch_fd = open(arch, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        arch_fd = open(arch, O_RDWR | O_CREAT, 0644);
         if (arch_fd < 0) { perror("open arch"); return 2; }
     }
     size_t sz; uint8_t *data = read_all_fd(0, &sz);
     if (!data) { perror("read stdin"); return 2; }
     int n; char *ap, *ad;
     Instr *ins = qvm_decode_arrow(data, sz, &n, &ap, &ad);
-    int rc = qvm_run(ins, n, arch_fd, npool, nworkers);
+    Sched out;
+    int rc = qvm_run(ins, n, arch_fd, sink_fds, nsinks, npool, nworkers, &out);
+    if (compfd >= 0) {                          /* footer completions back */
+        uint32_t nc = (uint32_t)out.ncomp;
+        write(compfd, &nc, 4);
+        for (int i = 0; i < out.ncomp; i++) {
+            int64_t row[3] = { out.cf[i], out.cc[i], out.cl[i] };
+            write(compfd, row, 24);
+        }
+    }
+    free(out.cf); free(out.cc); free(out.cl);
     if (arch_fd >= 0) close(arch_fd);
-    free(ins); free(ap); free(ad); free(data);
+    for (int i = 0; i < nsinks; i++) close(sink_fds[i]);
+    free(sink_fds); free(ins); free(ap); free(ad); free(data);
     if (rc < 0) { fprintf(stderr, "qvm: op failed: %d\n", rc); return 1; }
     return 0;
 }
@@ -561,7 +663,7 @@ static void test_cp(void){
     Instr *n3=emit(); n3->tid=2; n3->op=OP_MKDIR; n3->path="/tmp/qvm_dst/a/b"; n3->mode=0755;
     Instr *c2=emit(); c2->tid=2; c2->op=OP_MOV; c2->src=E_FS; c2->dst=E_FS;
         c2->path="/tmp/qvm_src/a/b/f2"; c2->dpath="/tmp/qvm_dst/a/b/f2"; c2->len=16; c2->mode=0644;
-    int rc = qvm_run(IB, IN, -1, 8, 8);
+    int rc = qvm_run(IB, IN, -1, NULL, 0, 8, 8, NULL);
     assert(rc == 0);
     char b[64];
     assert(strcmp(rd("/tmp/qvm_dst/a/f1",b,64), "hello-one")==0);
@@ -585,7 +687,7 @@ static void test_buffer_path(void){
     Instr *o=emit(); o->tid=1; o->op=OP_MOV; o->src=E_BUF; o->dst=E_FS;
         o->buf_id=0; o->buf_off=0; o->len=15; o->path="/tmp/qvm_out"; o->mode=0644;
     Instr *f=emit(); f->tid=1; f->op=OP_FREE; f->buf_id=0;
-    int rc = qvm_run(IB, IN, -1, 8, 8);
+    int rc = qvm_run(IB, IN, -1, NULL, 0, 8, 8, NULL);
     assert(rc == 0);
     char bb[64];
     assert(strcmp(rd("/tmp/qvm_out",bb,64), "HDR:: BODYBYTES")==0);
@@ -612,19 +714,72 @@ static void test_fanout_backpressure(void){
             w->buf_id=slot; w->buf_off=0; w->len=14; w->path=op[i]; w->mode=0644;
         Instr *f=emit(); f->tid=tid; f->op=OP_FREE; f->buf_id=slot;
     }
-    int rc = qvm_run(IB, IN, -1, 4, 8);
+    int rc = qvm_run(IB, IN, -1, NULL, 0, 4, 8, NULL);
     assert(rc == 0);
     for (int i=0;i<32;i++){ char b[64],want[32]; sprintf(want,"payload-%02d-xyz",i);
         assert(strcmp(rd(op[i],b,64),want)==0); }
     printf("  ok fan-out: 32 threads / 4 buffer slots, alloc backpressure holds\n");
 }
 
+static void test_codec(void){
+    /* deflate a buffer to a sink (reserve+write), decompress the sink to verify,
+     * then inflate the sink-frame back through a buffer to a file. */
+    system("rm -f /tmp/qvm_cdata /tmp/qvm_sink0 /tmp/qvm_decoded");
+    static char data[4000];
+    for (int i = 0; i < 4000; i++) data[i] = 'A' + (i % 16);
+    { int fd=open("/tmp/qvm_cdata",O_WRONLY|O_CREAT|O_TRUNC,0644);
+      if (write(fd,data,4000)!=4000) abort(); close(fd); }
+    int sfd = open("/tmp/qvm_sink0", O_RDWR|O_CREAT|O_TRUNC, 0644);
+
+    reset();
+    Instr *s=emit(); s->tid=0; s->op=OP_SPAWN; s->lo=1; s->cap=1;
+    Instr *j=emit(); j->tid=0; j->op=OP_JOIN;  j->lo=1; j->cap=1;
+    Instr *a=emit(); a->tid=1; a->op=OP_ALLOC; a->buf_id=0; a->cap=8192;
+    Instr *r=emit(); r->tid=1; r->op=OP_MOV; r->src=E_FS; r->dst=E_BUF;
+        r->buf_id=0; r->buf_off=0; r->path="/tmp/qvm_cdata"; r->len=4000;
+    Instr *df=emit(); df->tid=1; df->op=OP_DEFLATE; df->buf_id=0; df->buf_off=0;
+        df->len=4000; df->sink=0; df->level=3; df->frame_id=7;
+    Instr *f=emit(); f->tid=1; f->op=OP_FREE; f->buf_id=0;
+    int sinks[1] = { sfd };
+    Sched out;
+    int rc = qvm_run(IB, IN, -1, sinks, 1, 8, 8, &out);
+    assert(rc == 0);
+    assert(out.ncomp==1 && out.cf[0]==7 && out.cc[0]==0);
+    int64_t clen = out.cl[0];
+    free(out.cf); free(out.cc); free(out.cl);
+    static char comp[8192], dcomp[8192];
+    int cfd=open("/tmp/qvm_sink0",O_RDONLY);
+    if (pread(cfd,comp,8192,0) < clen) abort(); close(cfd);
+    size_t z = ZSTD_decompress(dcomp, 8192, comp, (size_t)clen);
+    assert(!ZSTD_isError(z) && z==4000 && memcmp(dcomp,data,4000)==0);
+    printf("  ok codec: deflate buf->sink (reserve+write), comp {7,0,%ld}; "
+           "frame decompresses byte-exact\n", (long)clen);
+
+    int afd = open("/tmp/qvm_sink0", O_RDONLY);
+    reset();
+    Instr *s2=emit(); s2->tid=0; s2->op=OP_SPAWN; s2->lo=1; s2->cap=1;
+    Instr *j2=emit(); j2->tid=0; j2->op=OP_JOIN;  j2->lo=1; j2->cap=1;
+    Instr *a2=emit(); a2->tid=1; a2->op=OP_ALLOC; a2->buf_id=0; a2->cap=8192;
+    Instr *in=emit(); in->tid=1; in->op=OP_INFLATE; in->buf_id=0; in->buf_off=0;
+        in->arch_off=0; in->len=clen;
+    Instr *w=emit(); w->tid=1; w->op=OP_MOV; w->src=E_BUF; w->dst=E_FS;
+        w->buf_id=0; w->buf_off=0; w->len=4000; w->path="/tmp/qvm_decoded"; w->mode=0644;
+    Instr *f2=emit(); f2->tid=1; f2->op=OP_FREE; f2->buf_id=0;
+    rc = qvm_run(IB, IN, afd, NULL, 0, 8, 8, NULL);
+    assert(rc == 0); close(afd);
+    static char got[8192];
+    int gfd=open("/tmp/qvm_decoded",O_RDONLY); int gn=pread(gfd,got,8192,0); close(gfd);
+    assert(gn==4000 && memcmp(got,data,4000)==0);
+    printf("  ok codec: inflate sink-frame -> buf -> fs, byte-exact round-trip\n");
+}
+
 int main(void){
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("qvm v1 (CODEC=NONE) tests:\n");
+    printf("qvm v1 tests:\n");
     test_cp();
     test_buffer_path();
     test_fanout_backpressure();
+    test_codec();
     printf("all qvm tests passed\n");
     return 0;
 }
