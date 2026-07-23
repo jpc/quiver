@@ -803,14 +803,13 @@ int main(int argc, char **argv){
     }
     Sched out;
     qvm_open(&out, arch_fd, sink_fds, nsinks, npool, nworkers, call_fd);
-    size_t bsz; uint8_t *batch;                 /* incremental: one batch at a time */
-    while ((batch = read_framed(0, &bsz))) {
-        int n; char *ap, *ad;
-        Instr *ins = qvm_decode_arrow(batch, bsz, &n, &ap, &ad);
-        qvm_batch(&out, ins, n);
-        free(ins); free(ap); free(ad); free(batch);
-        if (out.failed) break;
-    }
+    /* CALL is the sole entry point: the whole program is a single bootstrap
+     * CALL that fetches the entry batch from Python (call id -1). That batch may
+     * itself CALL (drivers loop; windows fetch per-window gathers). */
+    Instr boot; memset(&boot, 0, sizeof boot);
+    boot.op = OP_CALL; boot.frame_id = -1; boot.buf_id = -1;
+    boot.path = ""; boot.dpath = "";
+    qvm_batch(&out, &boot, 1);
     qvm_close(&out);
     int rc = out.failed;
     if (strcmp(comp, "-") != 0) {               /* footer completions back */

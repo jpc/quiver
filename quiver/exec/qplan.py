@@ -243,21 +243,25 @@ def pack_stream(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
     batch k. The generator plans lazily, so discovery/planning overlaps
     execution. Completions accumulate; one footer at the end. Member count."""
     files = scan.filter(~pl.col("is_dir")).sort("path")
+    chunks = [files.slice(i, chunk_rows)
+              for i in range(0, files.height, chunk_rows)]
     collected: list[pl.DataFrame] = []
+    state = {"base": 0}
 
-    def batches():
-        base = 0
-        for i in range(0, files.height, chunk_rows):
-            sub = files.slice(i, chunk_rows)
-            instr, members, _ = plan_pack(sub, root, frame_bytes, level, npool,
-                                          frame_base=base)
-            collected.append(members)
-            base = int(members["frame"].max()) + 1 if members.height else base
-            yield instr
+    def handler(cid):
+        if cid == -1:                             # entry: a driver of K CALLs
+            rows = [{"tid": 0, "_sub": k, "op": OP_CALL, "frame_id": k}
+                    for k in range(len(chunks))]
+            return _finalize([pl.DataFrame(rows)]) if rows else _empty_batch()
+        instr, members, _ = plan_pack(chunks[cid], root, frame_bytes, level,
+                                      npool, frame_base=state["base"])
+        collected.append(members)
+        state["base"] += members["frame"].n_unique() if members.height else 0
+        return instr
 
     open(out_path, "wb").close()
-    comp = run_stream(batches(), qvm_exe, "-", sinks=(out_path,), npool=npool,
-                      nworkers=nworkers, want_comp=True)
+    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
+                     nworkers=nworkers, want_comp=True)
     members = (pl.concat(collected) if collected
                else pl.DataFrame(schema={"frame": pl.Int64}))
     footer = (members.join(comp, on="frame", how="left")
@@ -477,29 +481,23 @@ def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
             {"tid": 0, "_sub": b + 2, "op": OP_CALL, "frame_id": k},
             {"tid": 0, "_sub": b + 3, "op": OP_FREE, "buf_id": 0}]
     driver = _finalize([pl.DataFrame(driver_rows)]) if driver_rows \
-        else _finalize([pl.DataFrame({"tid": [], "_sub": []})])
+        else _empty_batch()
 
-    cr_r, cr_w = os.pipe()
     collected: list[pl.DataFrame] = []
+    state = {"base": 0}
 
-    def batches():
-        yield driver                                 # bootstrap: the driver program
-        base = 0
-        for k in range(len(win_info)):
-            if len(os.read(cr_r, 8)) < 8:             # OP_CALL request (blocks)
-                break
-            ws, wlen, wdf = win_info[k]
-            g, wmem = plan_window_gather(wdf, ws, 0, frame_bytes, level, base)
-            collected.append(wmem)
-            base += wmem["frame"].n_unique() if wmem.height else 0
-            yield g
+    def handler(cid):
+        if cid == -1:                                # entry: the window driver
+            return driver
+        ws, wlen, wdf = win_info[cid]
+        g, wmem = plan_window_gather(wdf, ws, 0, frame_bytes, level, state["base"])
+        collected.append(wmem)
+        state["base"] += wmem["frame"].n_unique() if wmem.height else 0
+        return g
 
     open(out_path, "wb").close()
-    try:
-        comp = run_stream(batches(), qvm_exe, "-", sinks=(out_path,), npool=1,
-                          nworkers=nworkers, want_comp=True, call_arg=str(cr_w))
-    finally:
-        os.close(cr_r); os.close(cr_w)
+    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=1,
+                     nworkers=nworkers, want_comp=True)
     members_all = (pl.concat(collected) if collected
                    else pl.DataFrame(schema={"frame": pl.Int64}))
     footer = (members_all.join(comp, on="frame", how="left")
@@ -656,35 +654,42 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
     """Encode and drive the C `qvm` executor. `sinks` are deflate output files;
     `want_comp` collects the {frame, coff, clen} completions (via a temp fd) and
     returns them as a DataFrame."""
-    return run_stream([instr], qvm_exe, arch_path, sinks, npool, nworkers,
-                      want_comp)
+    return run_calls(lambda cid: instr, qvm_exe, arch_path, sinks, npool,
+                     nworkers, want_comp)
 
 
-def run_stream(batches, qvm_exe: str, arch_path: str = "-",
-               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-               want_comp: bool = False, call_arg: str = "-"):
-    """Drive qvm with an INCREMENTAL stream of instruction batches (each a
-    length-framed Arrow batch: [u32 len][bytes]). qvm's scheduler is persistent
-    — buffers a batch allocates survive into later batches — so `batches` may be
-    a lazy generator that plans the next batch while qvm runs the current one
-    (the Python-feedback loop). `call_arg` is the fd qvm writes OP_CALL requests
-    to (the generator can read the paired fd to respond). Completions accumulate."""
+def run_calls(handler, qvm_exe: str, arch_path: str = "-",
+              sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
+              want_comp: bool = False):
+    """CALL is qvm's SOLE entry point: qvm boots with one CALL(-1) and pulls
+    every instruction batch by CALLing into Python. `handler(call_id)` answers
+    each CALL — id -1 is the entry program; a driver's own CALLs pass their
+    frame_id. Because a returned batch runs nested in the caller's scope, buffers
+    the caller holds are available to it (bounded, lexical resource management).
+    Completions accumulate across every (nested) batch."""
     comp_path = "-"
     if want_comp:
         fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
+    cr_r, cr_w = os.pipe()                        # qvm -> Python OP_CALL requests
     argv = [qvm_exe, "qvm", arch_path, str(npool), str(nworkers), comp_path,
-            call_arg, *sinks]
-    pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # inherited pipes
-    if call_arg != "-":
-        pass_fds.append(int(call_arg))
+            str(cr_w), *sinks]
+    pass_fds = [cr_w] + [int(s[3:]) for s in sinks if s.startswith("fd:")]
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds)
+    os.close(cr_w)                                # qvm holds its own copy
     try:
-        for instr in batches:
-            data = encode_stream(instr)
-            p.stdin.write(struct.pack("<I", len(data)) + data)
-            p.stdin.flush()
+        while True:
+            req = os.read(cr_r, 8)               # a CALL request (blocks)
+            if len(req) < 8:
+                break                            # qvm closed the call fd → done
+            (cid,) = struct.unpack("<q", req)
+            data = encode_stream(handler(cid))
+            p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
     finally:
-        p.stdin.close()
+        try:
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+        os.close(cr_r)
     rc = p.wait()
     if rc != 0:
         if want_comp:
@@ -699,3 +704,7 @@ def run_stream(batches, qvm_exe: str, arch_path: str = "-",
     a = np.frombuffer(raw, dtype="<i8", offset=4, count=3 * n).reshape(n, 3)
     return pl.DataFrame({"frame": a[:, 0], "frame_coff": a[:, 1],
                          "frame_clen": a[:, 2]})
+
+
+def _empty_batch() -> pl.DataFrame:
+    return _finalize([pl.DataFrame({"tid": [], "_sub": []})])
