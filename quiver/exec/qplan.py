@@ -29,7 +29,7 @@ from ..nock import zframe as _zf
 
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
- OP_INFLATE, OP_DEFLATE) = range(1, 10)
+ OP_INFLATE, OP_DEFLATE, OP_CALL) = range(1, 11)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
@@ -400,6 +400,116 @@ def recompress(tar_path: str, out_path: str, qvm_exe: str,
     return footer.height
 
 
+def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
+                       frame_bytes: int, level: int, frame_base: int
+                       ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """The gather batch a window's OP_CALL returns: thread 0 spawns a child per
+    frame, each multi-run `deflate`s its members' WINDOW-RELATIVE ranges from the
+    window buffer `buf_id` (the driver holds it). No alloc/free here — the driver
+    owns the buffer. Returns (instr_df, members_df)."""
+    df = wdf.sort("offset").with_columns(rel=pl.col("offset") - win_start)
+    df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
+    df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
+    df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
+    df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
+    df = df.with_columns(_pe=(pl.col("rel") + pl.col("range")).shift(1),
+                         _pf=pl.col("frame").shift(1))
+    df = df.with_columns(_new=((pl.col("rel") != pl.col("_pe"))
+                               | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
+    df = df.with_columns(run=pl.col("_new").cum_sum())
+    runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
+                                   off=pl.col("rel").min(),
+                                   rlen=pl.col("range").sum()).sort("off"))
+    frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
+    nf = frames.height
+    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
+    payloads = {}
+    for r in rbf.iter_rows(named=True):
+        a = np.empty(2 * len(r["off"]), dtype="<i8")
+        a[0::2] = r["off"]; a[1::2] = r["rlen"]
+        payloads[int(r["frame"])] = a.tobytes()
+    root_df = pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
+        {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
+    deflate = frames.with_columns(
+        payload=pl.col("frame").map_elements(lambda f: payloads[int(f)],
+                                             return_dtype=pl.Binary)).select(
+        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
+        buf_id=pl.lit(buf_id), buf_off=pl.lit(0), len=pl.col("clen"),
+        sink=pl.lit(0), level=pl.lit(level),
+        frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
+    instr = _finalize([root_df, deflate])
+    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
+                        frame=pl.col("frame") + frame_base, in_off="in_off")
+    return instr, members
+
+
+def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
+                        window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
+                        level: int = 6, nworkers: int = 8,
+                        predicate: pl.Expr | None = None) -> int:
+    """Windowed streaming recompress via OP_CALL — BOUNDED memory. The whole
+    program is a driver fiber that, per window: allocs one window buffer, loads
+    that byte-range of the tar, CALLs into Python (which plans the window's
+    gather and returns it as a nested batch that deflates from the held buffer),
+    then frees the buffer. Only one window is ever resident; the buffer's
+    lifetime is exactly the driver's per-window scope."""
+    members = tar_scan(tar_path)
+    if predicate is not None:
+        members = members.filter(predicate)
+    members = members.sort("offset").with_columns(
+        _c=pl.col("range").cum_sum() - pl.col("range"))
+    members = members.with_columns(win=(pl.col("_c") // window_bytes))
+    windows = members.partition_by("win", maintain_order=True)
+
+    driver_rows = []
+    win_info = []
+    for k, wdf in enumerate(windows):
+        ws = int(wdf["offset"].min())
+        we = int((wdf["offset"] + wdf["range"]).max())
+        win_info.append((ws, we - ws, wdf))
+        b = 4 * k
+        driver_rows += [
+            {"tid": 0, "_sub": b, "op": OP_ALLOC, "buf_id": 0, "cap": we - ws},
+            {"tid": 0, "_sub": b + 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
+             "buf_id": 0, "buf_off": 0, "path": tar_path, "arch_off": ws,
+             "len": we - ws},
+            {"tid": 0, "_sub": b + 2, "op": OP_CALL, "frame_id": k},
+            {"tid": 0, "_sub": b + 3, "op": OP_FREE, "buf_id": 0}]
+    driver = _finalize([pl.DataFrame(driver_rows)]) if driver_rows \
+        else _finalize([pl.DataFrame({"tid": [], "_sub": []})])
+
+    cr_r, cr_w = os.pipe()
+    collected: list[pl.DataFrame] = []
+
+    def batches():
+        yield driver                                 # bootstrap: the driver program
+        base = 0
+        for k in range(len(win_info)):
+            if len(os.read(cr_r, 8)) < 8:             # OP_CALL request (blocks)
+                break
+            ws, wlen, wdf = win_info[k]
+            g, wmem = plan_window_gather(wdf, ws, 0, frame_bytes, level, base)
+            collected.append(wmem)
+            base += wmem["frame"].n_unique() if wmem.height else 0
+            yield g
+
+    open(out_path, "wb").close()
+    try:
+        comp = run_stream(batches(), qvm_exe, "-", sinks=(out_path,), npool=1,
+                          nworkers=nworkers, want_comp=True, call_arg=str(cr_w))
+    finally:
+        os.close(cr_r); os.close(cr_w)
+    members_all = (pl.concat(collected) if collected
+                   else pl.DataFrame(schema={"frame": pl.Int64}))
+    footer = (members_all.join(comp, on="frame", how="left")
+                         .select([c for c, _ in _zf._FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    ipc.write_all(ftmp, footer)
+    _zf._write_footer(out_path, ftmp, False); ftmp.close()
+    return footer.height
+
+
 def recompress_zst(src_path: str, out_path: str, qvm_exe: str,
                    frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
                    nworkers: int = 8, predicate: pl.Expr | None = None) -> int:
@@ -552,18 +662,21 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
 
 def run_stream(batches, qvm_exe: str, arch_path: str = "-",
                sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-               want_comp: bool = False):
+               want_comp: bool = False, call_arg: str = "-"):
     """Drive qvm with an INCREMENTAL stream of instruction batches (each a
     length-framed Arrow batch: [u32 len][bytes]). qvm's scheduler is persistent
     — buffers a batch allocates survive into later batches — so `batches` may be
     a lazy generator that plans the next batch while qvm runs the current one
-    (the Python-feedback loop). Completions accumulate across batches."""
+    (the Python-feedback loop). `call_arg` is the fd qvm writes OP_CALL requests
+    to (the generator can read the paired fd to respond). Completions accumulate."""
     comp_path = "-"
     if want_comp:
         fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
     argv = [qvm_exe, "qvm", arch_path, str(npool), str(nworkers), comp_path,
-            *sinks]
+            call_arg, *sinks]
     pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # inherited pipes
+    if call_arg != "-":
+        pass_fds.append(int(call_arg))
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds)
     try:
         for instr in batches:

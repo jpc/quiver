@@ -48,7 +48,7 @@ typedef struct { int64_t t0, t1, tid, op, buf, detail; } TraceEv;
 /* ------------------------------------------------------------------ opcodes */
 enum {
     OP_ALLOC = 1, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA,
-    OP_SPAWN, OP_JOIN, OP_INFLATE, OP_DEFLATE,
+    OP_SPAWN, OP_JOIN, OP_INFLATE, OP_DEFLATE, OP_CALL,
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -148,10 +148,10 @@ static void run_task(Task *t){
     case TK_FS_TO_BUF: {
         int fd = open(t->path, O_RDONLY);
         if (fd < 0) { t->res = -errno; return; }
-        int64_t got = 0;
+        int64_t got = 0;                         /* arch_off = source file offset */
         while (got < t->len) {
             ssize_t r = pread(fd, t->buf + t->buf_off + got,
-                              (size_t)(t->len-got), got);
+                              (size_t)(t->len-got), t->arch_off + got);
             if (r < 0) { t->res = -errno; break; }
             if (r == 0) break;
             got += r;
@@ -330,6 +330,7 @@ typedef struct {
     int failed;                  /* first -errno seen */
     int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
+    int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
 } Sched;
 
 static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
@@ -340,6 +341,13 @@ static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
     S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
                                  tid, op, buf, detail };
 }
+
+/* forward decls: OP_CALL runs a returned batch nested (see run_thread) */
+static void run_batch_loop(Sched *S);
+static void build_threads(Sched *S, Instr *ins, int n);
+static uint8_t *read_framed(int fd, size_t *out);
+static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
+                               char **ap, char **ad);
 
 static void ready_push(Sched *S, Thread *t){
     t->st = T_READY; t->rnext = NULL;
@@ -464,6 +472,34 @@ static void run_thread(Sched *S, Thread *t){
             tr_log(S, tr_now(), tr_now(), t->tid, OP_JOIN, I->lo, I->cap);
             t->join_lo = I->lo; t->join_hi = I->cap; t->st = T_WAIT_JOIN;
             return;
+        case OP_CALL: {
+            /* call into Python (emit frame_id as the call id), read the returned
+             * instruction batch, and run it NESTED — its threads share the pool,
+             * so they use whatever buffers THIS fiber holds (e.g. a decode
+             * window). When the nested batch joins, we resume and free them: the
+             * window's lifetime is exactly this fiber's scope. Requires the
+             * fiber's own batch to be quiescent here (no other in-flight ops),
+             * which the single-fiber window driver satisfies. */
+            int64_t cid = I->frame_id;
+            if (S->call_fd >= 0 && write(S->call_fd, &cid, 8) != 8)
+                { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
+            size_t blen; uint8_t *b = read_framed(0, &blen);
+            if (!b) { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
+            int nn; char *nap, *nad;
+            Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
+            Thread *sth = S->th; int snth = S->nth;      /* save caller's batch */
+            Thread *srh = S->ready_head, *srt = S->ready_tail; int sinf = S->inflight;
+            S->th = NULL; S->nth = 0;
+            S->ready_head = S->ready_tail = NULL; S->inflight = 0;
+            build_threads(S, nins, nn);
+            ready_push(S, &S->th[0]);
+            run_batch_loop(S);                           /* run to completion */
+            free(S->th);
+            S->th = sth; S->nth = snth;                  /* restore */
+            S->ready_head = srh; S->ready_tail = srt; S->inflight = sinf;
+            free(nins); free(nap); free(nad); free(b);
+            t->pc++; break;
+        }
         default: t->pc++; break;
         }
     }
@@ -501,9 +537,9 @@ static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl){
 static pthread_t g_wt[64]; static int g_nworkers;
 
 static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
-                     int npool, int nworkers){
+                     int npool, int nworkers, int call_fd){
     memset(S, 0, sizeof *S);
-    S->arch_fd = arch_fd; S->npool = npool;
+    S->arch_fd = arch_fd; S->npool = npool; S->call_fd = call_fd;
     S->pool = calloc(npool, sizeof(BufSlot));
     S->nsinks = nsinks;
     S->sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
@@ -521,12 +557,8 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
 }
 
-/* Run one batch's fiber tree to completion. The buffer pool persists, so this
- * batch may reference buffers a prior batch allocated and left live. */
-static void qvm_batch(Sched *S, Instr *ins, int n){
-    build_threads(S, ins, n);            /* threads (tids) are per-batch */
-    S->ready_head = S->ready_tail = NULL; S->inflight = 0;
-    ready_push(S, &S->th[0]);            /* only thread 0 starts */
+/* drive the current thread set (S->th) until it is fully drained */
+static void run_batch_loop(Sched *S){
     for (;;) {
         Thread *t;
         while ((t = ready_pop(S))) run_thread(S, t);
@@ -546,6 +578,15 @@ static void qvm_batch(Sched *S, Instr *ins, int n){
         }
         free(k);
     }
+}
+
+/* Run one batch's fiber tree to completion. The buffer pool persists, so this
+ * batch may reference buffers a prior batch allocated and left live. */
+static void qvm_batch(Sched *S, Instr *ins, int n){
+    build_threads(S, ins, n);            /* threads (tids) are per-batch */
+    S->ready_head = S->ready_tail = NULL; S->inflight = 0;
+    ready_push(S, &S->th[0]);            /* only thread 0 starts */
+    run_batch_loop(S);
     free(S->th); S->th = NULL; S->nth = 0;
 }
 
@@ -575,7 +616,7 @@ static void qvm_close(Sched *S){
 static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
                    int npool, int nworkers, Sched *out){
     Sched S;
-    qvm_open(&S, arch_fd, sink_fds, nsinks, npool, nworkers);
+    qvm_open(&S, arch_fd, sink_fds, nsinks, npool, nworkers, -1);
     qvm_batch(&S, ins, n);
     qvm_close(&S);
     int rc = S.failed;
@@ -738,17 +779,19 @@ static uint8_t *read_all_fd(int fd, size_t *out){
 int main(int argc, char **argv){
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
         fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [comp|-] "
-                        "[sink ...]\n", argv[0]);
+                        "[callfd|-] [sink ...]\n", argv[0]);
         return 2;
     }
     const char *arch = argc > 2 ? argv[2] : "-";
     int npool = argc > 3 ? atoi(argv[3]) : 16;
     int nworkers = argc > 4 ? atoi(argv[4]) : 8;
     const char *comp = argc > 5 ? argv[5] : "-";
-    int nsinks = argc > 6 ? argc - 6 : 0;
+    const char *callarg = argc > 6 ? argv[6] : "-";   /* OP_CALL request fd */
+    int call_fd = strcmp(callarg, "-") ? atoi(callarg) : -1;
+    int nsinks = argc > 7 ? argc - 7 : 0;
     int *sink_fds = nsinks ? calloc(nsinks, sizeof(int)) : NULL;
     for (int i = 0; i < nsinks; i++) {
-        const char *sa = argv[6 + i];
+        const char *sa = argv[7 + i];
         if (strncmp(sa, "fd:", 3) == 0) sink_fds[i] = atoi(sa + 3);  /* inherited pipe */
         else sink_fds[i] = open(sa, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (sink_fds[i] < 0) { perror("open sink"); return 2; }
@@ -759,7 +802,7 @@ int main(int argc, char **argv){
         if (arch_fd < 0) { perror("open arch"); return 2; }
     }
     Sched out;
-    qvm_open(&out, arch_fd, sink_fds, nsinks, npool, nworkers);
+    qvm_open(&out, arch_fd, sink_fds, nsinks, npool, nworkers, call_fd);
     size_t bsz; uint8_t *batch;                 /* incremental: one batch at a time */
     while ((batch = read_framed(0, &bsz))) {
         int n; char *ap, *ad;

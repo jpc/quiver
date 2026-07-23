@@ -1183,6 +1183,19 @@ def test_qvm(tmp):
         assert (tmp / "qvm_stream_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm streaming: incremental instruction batches, persistent scheduler")
 
+    # OP_CALL: windowed streaming recompress — bounded to ONE window buffer; the
+    # driver CALLs into Python per window, running the returned gather nested
+    wa = str(tmp / "qvm_win.nock")
+    nw = qplan.recompress_windowed(tarp, wa, qvm, window_bytes=32 << 10,
+                                   frame_bytes=8 << 10,
+                                   predicate=pl.col("path").str.ends_with(".keep"))
+    widx = _zf.read_index(wa)
+    assert nw == 2 and all(pth.endswith(".keep") for pth in widx["path"])
+    qplan.unpack(wa, str(tmp / "qvm_win_x"), qvm, npool=8)
+    for pth in widx["path"]:
+        assert (tmp / "qvm_win_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm OP_CALL: windowed streaming recompress, bounded memory, byte-exact")
+
     # compressed-source recompress: foreign .tar.zstd -> nock (decode-scan)
     import zstandard as _zstd
     tzst = str(tmp / "qvm_re.tar.zstd")
