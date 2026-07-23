@@ -16,30 +16,38 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 import subprocess
+import tempfile
 
+import numpy as np
 import polars as pl
 
 from .. import ipc
 from ..nock.format import TarFormat, plan_layout
+from ..nock import zframe as _zf
 
 # opcodes — mirror qvm.c
-OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN = range(1, 8)
+(OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
+ OP_INFLATE, OP_DEFLATE) = range(1, 10)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
+_BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
 
-# the instruction word (one row = one instruction)
+# the instruction word (one row = one instruction). Codec cols (sink/level/
+# frame_id) are appended so the C buffer-index map for the first 15 is stable.
 INSTR_COLS = {
     "tid": pl.Int64, "op": pl.UInt8, "src": pl.UInt8, "dst": pl.UInt8,
     "buf_id": pl.Int32, "buf_off": pl.Int64, "len": pl.Int64,
     "cap": pl.Int64, "lo": pl.Int64, "arch_off": pl.Int64,
     "path": pl.String, "dpath": pl.String, "payload": pl.Binary,
     "mode": pl.Int32, "mtime_ns": pl.Int64,
+    "sink": pl.Int32, "level": pl.Int32, "frame_id": pl.Int64,
 }
 _DEFAULTS = {
     "src": 0, "dst": 0, "buf_id": -1, "buf_off": 0, "len": 0, "cap": 0,
     "lo": 0, "arch_off": 0, "path": "", "dpath": "", "payload": b"",
-    "mode": -1, "mtime_ns": -1,
+    "mode": -1, "mtime_ns": -1, "sink": 0, "level": 0, "frame_id": 0,
 }
 
 
@@ -129,6 +137,137 @@ def plan_pack_unc(scan: pl.DataFrame, root: str
     return instr, footer, total
 
 
+# -------------------------------------------------------------- pack (compressed)
+def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
+              level: int = 6, npool: int = 16) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """fs -> compressed nock: group members into ~frame_bytes frames; each frame
+    is a thread that assembles [header|body] per member into a zeroed buffer and
+    deflates it to sink 0. Returns (instr_df, members_df); members_df joins the
+    {frame,coff,clen} completions to build the footer. Buffer ids ring over
+    `npool` (must match the runner) so at most npool frames pack concurrently."""
+    df = (TarFormat().with_header_cols(
+              scan.lazy().filter(~pl.col("is_dir")).sort("path"))
+          .with_columns(payload_len=((pl.col("size") + 511) // 512) * 512)
+          .with_columns(block_len=pl.col("header_len") + pl.col("payload_len"))
+          .collect())
+    df = df.with_columns(_eo=pl.col("block_len").cum_sum() - pl.col("block_len"))
+    df = df.with_columns(frame=(pl.col("_eo") // frame_bytes).cast(pl.Int64))
+    df = df.with_columns(_fs=pl.col("_eo").min().over("frame"))
+    df = df.with_columns(
+        local=pl.col("_eo") - pl.col("_fs"),
+        in_off=pl.col("_eo") - pl.col("_fs") + pl.col("header_len"),
+        mrank=pl.int_range(pl.len()).over("frame"))
+    frames = (df.group_by("frame").agg(clen=pl.col("block_len").sum())
+                .sort("frame").with_row_index("frank"))
+    nf = frames.height
+    frames = frames.with_columns(
+        dl=pl.col("clen") + pl.when(pl.col("frank") == nf - 1)
+                              .then(1024).otherwise(0),          # tar EOF in last
+        bufid=(pl.col("frank") % npool).cast(pl.Int32))
+    df = df.join(frames.select("frame", "frank", "bufid"), on="frame") \
+           .with_columns(tid=pl.col("frank") + 1)
+
+    root_df = pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
+        {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
+    alloc = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(0),
+                          op=pl.lit(OP_ALLOC), buf_id=pl.col("bufid"),
+                          cap=pl.col("dl"))
+    hdr = df.select(tid=pl.col("tid"), _sub=1 + 2 * pl.col("mrank"),
+                    op=pl.lit(OP_MOV), src=pl.lit(E_INLINE), dst=pl.lit(E_BUF),
+                    buf_id=pl.col("bufid"), buf_off=pl.col("local"),
+                    payload=pl.col("header"))
+    body = df.select(tid=pl.col("tid"), _sub=2 + 2 * pl.col("mrank"),
+                     op=pl.lit(OP_MOV), src=pl.lit(E_FS), dst=pl.lit(E_BUF),
+                     buf_id=pl.col("bufid"), buf_off=pl.col("in_off"),
+                     path=pl.lit(root.rstrip("/") + "/") + pl.col("path"),
+                     len=pl.col("size"))
+    deflate = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(_BIG),
+                            op=pl.lit(OP_DEFLATE), buf_id=pl.col("bufid"),
+                            buf_off=pl.lit(0), len=pl.col("dl"), sink=pl.lit(0),
+                            level=pl.lit(level), frame_id=pl.col("frame"))
+    free = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(_BIG + 1),
+                         op=pl.lit(OP_FREE), buf_id=pl.col("bufid"))
+    instr = _finalize([root_df, alloc, hdr, body, deflate, free])
+    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
+                        "frame", "in_off")
+    return instr, members
+
+
+def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
+         frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
+         nworkers: int = 8) -> int:
+    """Plan + run a compressed nock pack, then write the footer from the frame
+    completions. Returns the member count."""
+    instr, members = plan_pack(scan, root, frame_bytes, level, npool)
+    open(out_path, "wb").close()
+    comp = run(instr, qvm_exe, "-", sinks=(out_path,), npool=npool,
+               nworkers=nworkers, want_comp=True)
+    footer = (members.join(comp, on="frame", how="left")
+                     .select([c for c, _ in _zf._FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    ipc.write_all(ftmp, footer)
+    _zf._write_footer(out_path, ftmp, False); ftmp.close()
+    return footer.height
+
+
+# --------------------------------------------------------------------- unpack
+def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
+    """compressed nock -> fs: one thread per frame — alloc, inflate the frame
+    from the archive, scatter its members to files, free. mkdir preamble in
+    thread 0. Reads the footer via the shared nock reader."""
+    idx = _zf.read_index(archive).sort(["frame", "in_off"])
+    frames = (idx.group_by("frame").agg(
+                  coff=pl.col("frame_coff").first(),
+                  clen=pl.col("frame_clen").first(),
+                  dlen=(pl.col("in_off") + pl.col("size")).max())
+                .sort("frame").with_row_index("frank"))
+    nf = frames.height
+    frames = frames.with_columns(
+        cap=((pl.col("dlen") + 511) // 512) * 512 + 2048,        # inflate headroom
+        bufid=(pl.col("frank") % npool).cast(pl.Int32))
+    idx = idx.join(frames.select("frame", "frank", "bufid"), on="frame") \
+             .with_columns(tid=pl.col("frank") + 1,
+                           mrank=pl.int_range(pl.len()).over("frame"))
+
+    dirs, seen = [], set()
+    for p in idx["path"]:
+        for a in _ancestors(p):
+            if a not in seen:
+                seen.add(a); dirs.append(a)
+    dirs.sort(key=lambda d: d.count("/"))
+    paths = [dest] + [os.path.join(dest, d) for d in dirs]
+    root = [{"tid": 0, "_sub": i, "op": OP_MKDIR, "path": p, "mode": 0o755}
+            for i, p in enumerate(paths)]
+    root += [{"tid": 0, "_sub": len(paths), "op": OP_SPAWN, "lo": 1, "cap": nf},
+             {"tid": 0, "_sub": len(paths) + 1, "op": OP_JOIN, "lo": 1, "cap": nf}]
+    root_df = pl.DataFrame(root)
+
+    alloc = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(0),
+                          op=pl.lit(OP_ALLOC), buf_id=pl.col("bufid"),
+                          cap=pl.col("cap"))
+    inflate = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(1),
+                            op=pl.lit(OP_INFLATE), buf_id=pl.col("bufid"),
+                            buf_off=pl.lit(0), arch_off=pl.col("coff"),
+                            len=pl.col("clen"))
+    scatter = idx.select(tid=pl.col("tid"), _sub=2 + pl.col("mrank"),
+                         op=pl.lit(OP_MOV), src=pl.lit(E_BUF), dst=pl.lit(E_FS),
+                         buf_id=pl.col("bufid"), buf_off=pl.col("in_off"),
+                         len=pl.col("size"),
+                         path=pl.lit(dest.rstrip("/") + "/") + pl.col("path"),
+                         mode=pl.col("mode") & 0o7777)
+    free = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(_BIG),
+                         op=pl.lit(OP_FREE), buf_id=pl.col("bufid"))
+    return _finalize([root_df, alloc, inflate, scatter, free])
+
+
+def unpack(archive: str, dest: str, qvm_exe: str, npool: int = 16,
+           nworkers: int = 8) -> None:
+    os.makedirs(dest, exist_ok=True)
+    instr = plan_unpack(archive, dest, npool)
+    run(instr, qvm_exe, archive, npool=npool, nworkers=nworkers)
+
+
 # ------------------------------------------------------------------- encoding
 def encode_stream(instr: pl.DataFrame) -> bytes:
     """The instruction stream IS an Arrow-IPC batch — one serialization path
@@ -141,12 +280,30 @@ def encode_stream(instr: pl.DataFrame) -> bytes:
 
 
 def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
-        npool: int = 16, nworkers: int = 8) -> None:
-    """Encode and drive the C `qvm` executor over a pipe."""
+        sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
+        want_comp: bool = False):
+    """Encode and drive the C `qvm` executor. `sinks` are deflate output files;
+    `want_comp` collects the {frame, coff, clen} completions (via a temp fd) and
+    returns them as a DataFrame."""
     data = encode_stream(instr)
-    p = subprocess.Popen([qvm_exe, "qvm", arch_path, str(npool), str(nworkers)],
-                         stdin=subprocess.PIPE)
+    comp_path = "-"
+    if want_comp:
+        fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
+    argv = [qvm_exe, "qvm", arch_path, str(npool), str(nworkers), comp_path,
+            *sinks]
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE)
     p.stdin.write(data); p.stdin.close()
     rc = p.wait()
     if rc != 0:
+        if want_comp:
+            os.unlink(comp_path)
         raise RuntimeError(f"qvm exited {rc}")
+    if not want_comp:
+        return None
+    with open(comp_path, "rb") as cf:
+        raw = cf.read()
+    os.unlink(comp_path)
+    (n,) = struct.unpack_from("<I", raw, 0)
+    a = np.frombuffer(raw, dtype="<i8", offset=4, count=3 * n).reshape(n, 3)
+    return pl.DataFrame({"frame": a[:, 0], "frame_coff": a[:, 1],
+                         "frame_clen": a[:, 2]})

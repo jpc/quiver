@@ -289,6 +289,7 @@ static int pool_alloc(Sched *S, Thread *t, int id, int64_t cap){
         return 0;
     }
     if (b->cap < (size_t)cap) { b->mem = realloc(b->mem, cap); b->cap = cap; }
+    if (cap > 0) memset(b->mem, 0, (size_t)cap);   /* clean tar body padding */
     b->in_use = 1;
     return 1;
 }
@@ -440,7 +441,11 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
         if (k->kind == TK_DEFLATE && k->res == 0)
             comp_add(&S, k->frame_id, k->coff, k->clen);
         Thread *ct = &S.th[k->tid];
-        if (ct->st == T_WAIT_IO) run_thread(&S, ct);   /* resume at pc */
+        if (ct->st == T_WAIT_IO) {                     /* resume at pc */
+            ct->st = T_READY;   /* clear WAIT before running: a following sync
+                                 * op (inline->buf) must not see stale WAIT_IO */
+            run_thread(&S, ct);
+        }
         free(k);
     }
     S.tasks.stop = 1; pthread_cond_broadcast(&S.tasks.cv);
@@ -483,7 +488,7 @@ enum {
     B_TID=1, B_OP=3, B_SRC=5, B_DST=7, B_BUFID=9, B_BUFOFF=11, B_LEN=13,
     B_CAP=15, B_LO=17, B_AOFF=19,
     B_PATH_O=21, B_PATH_D=22, B_DPATH_O=24, B_DPATH_D=25, B_PAY_O=27, B_PAY_D=28,
-    B_MODE=30, B_MTIME=32,
+    B_MODE=30, B_MTIME=32, B_SINK=34, B_LEVEL=36, B_FRAMEID=38,
 };
 static const uint8_t *abuf(const uint8_t *meta, int64_t bufs,
                           const uint8_t *body, int k){
@@ -535,7 +540,10 @@ static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
     const uint8_t *op =abuf(meta,bufs,body,B_OP), *src=abuf(meta,bufs,body,B_SRC),
                   *dst=abuf(meta,bufs,body,B_DST);
     const int32_t *bufid=(const int32_t*)abuf(meta,bufs,body,B_BUFID),
-                  *mode =(const int32_t*)abuf(meta,bufs,body,B_MODE);
+                  *mode =(const int32_t*)abuf(meta,bufs,body,B_MODE),
+                  *sink =(const int32_t*)abuf(meta,bufs,body,B_SINK),
+                  *lvl  =(const int32_t*)abuf(meta,bufs,body,B_LEVEL);
+    const int64_t *fid  =(const int64_t*)abuf(meta,bufs,body,B_FRAMEID);
     const int64_t *boff=(const int64_t*)abuf(meta,bufs,body,B_BUFOFF),
                   *len =(const int64_t*)abuf(meta,bufs,body,B_LEN),
                   *cap =(const int64_t*)abuf(meta,bufs,body,B_CAP),
@@ -558,6 +566,7 @@ static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
         I->buf_id=bufid[i]; I->mode=mode[i];
         I->buf_off=boff[i]; I->len=len[i]; I->cap=cap[i]; I->lo=lo[i];
         I->arch_off=aoff[i]; I->mtime_ns=mt[i];
+        I->sink=sink[i]; I->level=lvl[i]; I->frame_id=fid[i];
         I->path=pp[i]; I->dpath=pd[i];
         I->payload = pd_y + po_y[i]; I->payload_len = po_y[i+1]-po_y[i];
     }
@@ -578,21 +587,21 @@ static uint8_t *read_all_fd(int fd, size_t *out){
 }
 
 #ifndef QVM_TEST
-/* qvm <arch|-> <npool> <nworkers> <compfd|-1> [sink ...] : read an Arrow
+/* qvm <arch|-> <npool> <nworkers> <comp|-> [sink ...] : read an Arrow
  * instruction stream on stdin and execute it. `arch` is the archive fd
  * (E_ARCH movs / inflate source; O_RDWR|CREAT); each `sink` is a deflate output
  * (O_RDWR|CREAT|TRUNC). Deflate completions {frame_id, coff, clen} are written
- * to `compfd` as [u32 n][n×3 i64] if compfd >= 0. */
+ * to the `comp` file path as [u32 n][n×3 i64] unless it is "-". */
 int main(int argc, char **argv){
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
-        fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [compfd] "
+        fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [comp|-] "
                         "[sink ...]\n", argv[0]);
         return 2;
     }
     const char *arch = argc > 2 ? argv[2] : "-";
     int npool = argc > 3 ? atoi(argv[3]) : 16;
     int nworkers = argc > 4 ? atoi(argv[4]) : 8;
-    int compfd = argc > 5 ? atoi(argv[5]) : -1;
+    const char *comp = argc > 5 ? argv[5] : "-";
     int nsinks = argc > 6 ? argc - 6 : 0;
     int *sink_fds = nsinks ? calloc(nsinks, sizeof(int)) : NULL;
     for (int i = 0; i < nsinks; i++) {
@@ -610,12 +619,16 @@ int main(int argc, char **argv){
     Instr *ins = qvm_decode_arrow(data, sz, &n, &ap, &ad);
     Sched out;
     int rc = qvm_run(ins, n, arch_fd, sink_fds, nsinks, npool, nworkers, &out);
-    if (compfd >= 0) {                          /* footer completions back */
-        uint32_t nc = (uint32_t)out.ncomp;
-        write(compfd, &nc, 4);
-        for (int i = 0; i < out.ncomp; i++) {
-            int64_t row[3] = { out.cf[i], out.cc[i], out.cl[i] };
-            write(compfd, row, 24);
+    if (strcmp(comp, "-") != 0) {               /* footer completions back */
+        int cfd = open(comp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (cfd >= 0) {
+            uint32_t nc = (uint32_t)out.ncomp;
+            if (write(cfd, &nc, 4) != 4) rc = rc ? rc : -EIO;
+            for (int i = 0; i < out.ncomp; i++) {
+                int64_t row[3] = { out.cf[i], out.cc[i], out.cl[i] };
+                if (write(cfd, row, 24) != 24) rc = rc ? rc : -EIO;
+            }
+            close(cfd);
         }
     }
     free(out.cf); free(out.cc); free(out.cl);
