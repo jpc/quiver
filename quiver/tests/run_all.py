@@ -1189,6 +1189,21 @@ def test_qvm(tmp):
         assert (tmp / "qvm_merged_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm merge: zero-copy reduce of N shards → one index, unpacks byte-exact")
 
+    # distributed unpack: partition frames across N executor processes, no reduce
+    aidx = _zf.read_index(nock_arc)
+    nd = qplan.unpack_distributed(nock_arc, str(tmp / "qvm_dist_x"), qvm,
+                                  executors=4, npool=4)
+    for pth in aidx.filter(pl.col("frame") >= 0)["path"]:
+        assert (tmp / "qvm_dist_x" / pth).read_bytes() == (src / pth).read_bytes()
+    for pth in aidx.filter(pl.col("frame") < 0)["path"]:      # dirs materialized
+        assert (tmp / "qvm_dist_x" / pth).is_dir()
+    assert nd == nmem
+    # and over a merged manifest (round-robin whole shards)
+    ndm = qplan.unpack_distributed(man, str(tmp / "qvm_distm_x"), qvm, executors=3)
+    for pth in midx.filter(pl.col("frame") >= 0)["path"]:
+        assert (tmp / "qvm_distm_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm unpack distributed: N executors partition frames/shards, no reduce")
+
     # pipe sink: frames streamed through a pipe (the S3/TCP shape, hold-through-write)
     sp = wire.scan(str(src), "uring", 4)          # rescan (keep* were added above)
     pp = str(tmp / "qvm_pipe.nock")

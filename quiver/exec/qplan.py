@@ -866,12 +866,15 @@ def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
 
 
 # --------------------------------------------------------------------- unpack
-def plan_unpack(archive: str, dest: str, npool: int = 16) -> pl.DataFrame:
+def plan_unpack(archive: str, dest: str, npool: int = 16,
+                idx: pl.DataFrame | None = None) -> pl.DataFrame:
     """compressed nock -> fs: one thread per frame — alloc, inflate the frame
     from the archive, scatter its members to files, free. mkdir preamble in
     thread 0, then a FINISH phase restoring dir mode+mtime from the footer's
-    directory rows (frame=-1). Reads the footer via the shared nock reader."""
-    full = _zf.read_index(archive)
+    directory rows (frame=-1). Reads the footer via the shared nock reader, or
+    uses a caller-supplied `idx` subset (a frame partition, for distributed
+    unpack — must include the dir rows the subset needs)."""
+    full = idx if idx is not None else _zf.read_index(archive)
     dmeta = full.filter(pl.col("frame") < 0).sort("path")   # dir rows (metadata)
     idx = full.filter(pl.col("frame") >= 0).sort(["frame", "in_off"])   # files
     frames = (idx.group_by("frame").agg(
@@ -988,6 +991,49 @@ def unpack_merged(manifest: str, dest: str, qvm_exe: str, npool: int = 16,
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(lambda sh: unpack(sh, dest, qvm_exe, npool, nworkers), shards))
     return len(shards)
+
+
+def unpack_distributed(path: str, dest: str, qvm_exe: str, executors: int = 4,
+                       npool: int = 16, nworkers: int = 8,
+                       predicate: pl.Expr | None = None) -> int:
+    """Distributed unpack — partition the FRAME set across `executors` and decode
+    in parallel with NO reduce, since each member scatters to its own dest file
+    (disjoint outputs on shared storage). Frames are the unit (a decode group
+    can't split). A merged manifest round-robins whole SHARDS; a single archive
+    round-robins its frames, each executor a separate qvm process over its subset
+    (+ all dir rows, so every executor materializes the tree). Executors here are
+    local processes; prefixing their argv with ["ssh", host] would place them on
+    nodes. Returns the file-member count decoded."""
+    import concurrent.futures
+    if path.endswith(".nockm"):                   # merged: distribute whole shards
+        shards, _ = read_merged(path)
+        os.makedirs(dest, exist_ok=True)
+        groups = [shards[i::executors] for i in range(executors)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=executors) as ex:
+            list(ex.map(lambda g: [unpack(s, dest, qvm_exe, npool, nworkers)
+                                   for s in g], groups))
+        return sum(_zf.read_index(s).filter(pl.col("frame") >= 0).height
+                   for s in shards)
+    idx = _zf.read_index(path)
+    if predicate is not None:
+        idx = idx.filter(predicate)
+    dirs = idx.filter(pl.col("frame") < 0)
+    files = idx.filter(pl.col("frame") >= 0)
+    os.makedirs(dest, exist_ok=True)
+    fids = sorted(files["frame"].unique().to_list())
+    node = {f: i % executors for i, f in enumerate(fids)}   # round-robin frames
+
+    def run_one(i):
+        keep = [f for f in fids if node[f] == i]
+        if not keep:
+            return
+        sub = pl.concat([files.filter(pl.col("frame").is_in(keep)), dirs])
+        run(plan_unpack(path, dest, npool, idx=sub), qvm_exe, path,
+            npool=npool, nworkers=nworkers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=executors) as ex:
+        list(ex.map(run_one, range(executors)))
+    return files.height
 
 
 def verify(archive: str, qvm_exe: str, npool: int = 16, nworkers: int = 8
