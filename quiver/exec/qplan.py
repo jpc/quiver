@@ -1072,6 +1072,67 @@ def verify(archive: str, qvm_exe: str, npool: int = 16, nworkers: int = 8
     return nf, sorted(bad)
 
 
+# ------------------------------------------------------------------------ S3
+def s3_etags(paths: list[str], qvm_exe: str, part_size: int = 8 << 20,
+             threads: int = 8) -> pl.DataFrame:
+    """Local S3-compatible ETags (+ CRC64NVME) computed by qvm: single PutObject
+    (<= part_size) → MD5(file); multipart → MD5(concat of per-part MD5s)+"-N".
+    Returns {path, etag, cksum} — the basis for content-addressed S3 sync."""
+    p = subprocess.run([qvm_exe, "etag", str(part_size), str(threads)],
+                       input="\n".join(paths).encode(), stdout=subprocess.PIPE,
+                       check=True)
+    return ipc.read_all(p.stdout)
+
+
+def _s3_put(client, bucket, key, local, size, part_size):
+    if size <= part_size:
+        with open(local, "rb") as f:
+            client.put_object(Bucket=bucket, Key=key, Body=f)
+        return
+    mp = client.create_multipart_upload(Bucket=bucket, Key=key); parts = []
+    with open(local, "rb") as f:
+        pn = 1
+        while (chunk := f.read(part_size)):
+            r = client.upload_part(Bucket=bucket, Key=key, UploadId=mp["UploadId"],
+                                   PartNumber=pn, Body=chunk)
+            parts.append({"PartNumber": pn, "ETag": r["ETag"]}); pn += 1
+    client.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=mp["UploadId"],
+                                     MultipartUpload={"Parts": parts})
+
+
+def rsync_to_s3(src_root: str, client, bucket: str, qvm_exe: str, prefix: str = "",
+                delete: bool = True, part_size: int = 8 << 20, threads: int = 8
+                ) -> dict:
+    """Content-addressed sync of a local tree → S3, driven entirely by qvm: scan
+    the tree, compute expected ETags, and upload ONLY files whose listed ETag
+    differs (zero HEADs, no mtime heuristics; multipart above part_size). Deletes
+    remote objects absent locally when `delete`. Requires ETag=MD5 semantics
+    (no SSE-KMS/SSE-C). Returns {"put": n, "delete": m}."""
+    src = scan(src_root, qvm_exe, threads).filter(~pl.col("is_dir"))
+    paths = src["path"].to_list()
+    local = s3_etags([os.path.join(src_root, p) for p in paths], qvm_exe,
+                     part_size, threads).with_columns(path=pl.Series("path", paths))
+    dst_rows = []
+    for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=prefix):
+        for o in page.get("Contents", []):
+            dst_rows.append((o["Key"][len(prefix):], o["ETag"].strip('"')))
+    dst = (pl.DataFrame({"path": [r[0] for r in dst_rows],
+                         "etag_d": [r[1] for r in dst_rows]}) if dst_rows
+           else pl.DataFrame(schema={"path": pl.String, "etag_d": pl.String}))
+    j = (local.join(src.select("path", "size"), on="path")
+              .join(dst, on="path", how="full", coalesce=True))
+    ups = j.filter(pl.col("etag").is_not_null()
+                   & (pl.col("etag_d").is_null() | (pl.col("etag") != pl.col("etag_d"))))
+    dels = j.filter(pl.col("etag").is_null()) if delete else j.clear()
+    for r in ups.to_dicts():
+        _s3_put(client, bucket, prefix + r["path"],
+                os.path.join(src_root, r["path"]), r["size"], part_size)
+    for r in dels.to_dicts():
+        client.delete_object(Bucket=bucket, Key=prefix + r["path"])
+    return {"put": ups.height, "delete": dels.height}
+
+
 # ------------------------------------------------------------------- encoding
 def encode_stream(instr: pl.DataFrame) -> bytes:
     """The instruction stream IS an Arrow-IPC batch — one serialization path
@@ -1099,9 +1160,11 @@ def build_qvm(dest: str, src: str | None = None, uring: bool = False):
     from the conda pkgs dir; falls back to a dynamic -lzstd. With uring=True,
     compiles the optional io_uring backend (-DQVM_URING + liburing) — returns
     None if liburing can't be found so callers can skip."""
-    src = src or os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvm.c")
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = src or os.path.join(here, "qvm.c")
+    md5 = os.path.join(here, "md5.c")             # vendored MD5 for the etag mode
     zp = "/mnt/weka/jpc/miniconda3/pkgs/zstd-1.5.6-hc292b87_0"
-    cmd = ["cc", "-O2", "-pthread", "-o", dest, src]
+    cmd = ["cc", "-O2", "-pthread", "-o", dest, src, md5]
     cmd += [f"-I{zp}/include", f"{zp}/lib/libzstd.a"] \
         if os.path.exists(f"{zp}/lib/libzstd.a") else ["-lzstd"]
     if uring:

@@ -1311,6 +1311,33 @@ def test_qvm(tmp):
     qplan.run(qplan.plan_fbarrier([str(mr / "keep"), str(mr)]), qvm, "-")   # fsync
     ok("qvm teardown+durability: unlink/rmdir deepest-first + fbarrier fsync")
 
+    # S3 content-addressed sync: qvm-computed ETags (put_object + multipart),
+    # upload only what differs, re-sync a no-op. Exercised against moto.
+    try:
+        from moto import mock_aws
+        import boto3
+    except ImportError:
+        mock_aws = None
+    if mock_aws is not None:
+        s3src = tmp / "qvm_s3src"
+        for i in range(6):                          # one file forces multipart
+            p = s3src / f"g{i % 2}" / f"f{i}.bin"; p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(bytes([i]) * ((10 << 20) if i == 0 else 500))
+        with mock_aws():
+            cl = boto3.client("s3", region_name="us-east-1")
+            cl.create_bucket(Bucket="qvm-test")
+            assert qplan.rsync_to_s3(str(s3src), cl, "qvm-test", qvm)["put"] == 6
+            for p in s3src.rglob("*"):              # byte-exact in the bucket
+                if p.is_file():
+                    body = cl.get_object(Bucket="qvm-test",
+                                         Key=str(p.relative_to(s3src)))["Body"].read()
+                    assert body == p.read_bytes()
+            again = qplan.rsync_to_s3(str(s3src), cl, "qvm-test", qvm)
+            assert again == {"put": 0, "delete": 0}     # content-addressed no-op
+        ok("qvm S3: content-addressed sync (etags + multipart), re-sync a no-op")
+    else:
+        ok("qvm S3: skipped (moto not installed)")
+
 
 def main():
     tmp = Path(tempfile.mkdtemp())

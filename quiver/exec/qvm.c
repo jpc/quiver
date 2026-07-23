@@ -36,6 +36,8 @@
 #include <zstd.h>
 #include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
 #include "qvm_scan.h"           /* Arrow-emit template for the fs-scan schema */
+#include "qvm_etag.h"           /* Arrow-emit template for the S3-etag schema */
+#include "md5.h"                /* vendored MD5 (shared with quiver-exec.c) */
 #ifdef QVM_URING
 #include <liburing.h>           /* optional io_uring backend for per-file read/write */
 #endif
@@ -1190,6 +1192,109 @@ static int qvm_scan(const char *root, int nthreads, int outfd){
     return 0;
 }
 
+/* ------------------------------------------ S3 ETag + CRC64NVME (content sync) */
+/* Compute each file's S3-compatible ETag locally: single PutObject (size <=
+ * part_size) → MD5(file), no suffix; multipart → MD5(concat of per-part MD5s) +
+ * "-<nparts>". Plus the full-object CRC64NVME. Parallel ACROSS files. Lets S3
+ * sync be content-addressed — upload only files whose listed ETag differs. */
+static uint64_t g_crc64[256]; static pthread_once_t g_crc64_once = PTHREAD_ONCE_INIT;
+static void crc64_setup(void){
+    for (int i = 0; i < 256; i++) { uint64_t c = (uint64_t)i;
+        for (int k = 0; k < 8; k++) c = (c>>1) ^ ((c&1) ? 0x9a6c9329ac4bc9b5ULL : 0);
+        g_crc64[i] = c; }
+}
+static uint64_t crc64_upd(uint64_t crc, const uint8_t *p, size_t n){
+    while (n--) crc = g_crc64[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+    return crc;
+}
+static int etag_of(const char *path, int64_t part_size, char *etag, uint64_t *crc_out){
+    struct stat st;
+    if (stat(path, &st) < 0) return -errno;
+    int64_t size = st.st_size;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    int64_t nparts = size <= part_size ? 1 : (size + part_size - 1) / part_size;
+    uint8_t (*dig)[16] = malloc((size_t)nparts * 16);
+    uint8_t *buf = malloc(1<<20);
+    uint64_t crc = ~0ULL; int err = 0;
+    for (int64_t p = 0; p < nparts; p++) {
+        int64_t off = p*part_size, len = size - off; if (len > part_size) len = part_size;
+        MD5_CTX md; MD5_Init(&md); int64_t done = 0;
+        while (done < len) { int64_t want = len - done; if (want > (1<<20)) want = 1<<20;
+            ssize_t r = pread(fd, buf, (size_t)want, off + done);
+            if (r <= 0) { err = r < 0 ? -errno : -EIO; goto out; }
+            MD5_Update(&md, buf, (unsigned long)r);
+            crc = crc64_upd(crc, buf, (size_t)r); done += r; }
+        MD5_Final(dig[p], &md);
+    }
+    uint8_t fmd[16];
+    if (size <= part_size) memcpy(fmd, dig[0], 16);      /* PutObject: MD5(file) */
+    else { MD5_CTX md; MD5_Init(&md);                    /* multipart: MD5(concat) */
+        MD5_Update(&md, dig, 16*(unsigned long)nparts); MD5_Final(fmd, &md); }
+    for (int i = 0; i < 16; i++) sprintf(etag + i*2, "%02x", fmd[i]);
+    if (size > part_size) sprintf(etag + 32, "-%lld", (long long)nparts);
+    *crc_out = ~crc;
+out: free(dig); free(buf); close(fd);
+    return err;
+}
+
+typedef struct { char **paths; int n; char **etags; uint64_t *crc; int *err;
+                 int next; pthread_mutex_t mu; int64_t part_size; } EtagJob;
+static void *etag_worker(void *arg){
+    EtagJob *j = arg; char buf[48];
+    for (;;) {
+        pthread_mutex_lock(&j->mu); int i = j->next < j->n ? j->next++ : -1;
+        pthread_mutex_unlock(&j->mu);
+        if (i < 0) break;
+        buf[0] = 0; j->err[i] = etag_of(j->paths[i], j->part_size, buf, &j->crc[i]);
+        j->etags[i] = strdup(buf);
+    }
+    return NULL;
+}
+static int qvm_etag(int64_t part_size, int nthreads, int outfd){
+    pthread_once(&g_crc64_once, crc64_setup);
+    /* read newline-separated paths from stdin */
+    size_t cap = 1<<16, len = 0; char *in = malloc(cap);
+    ssize_t r; while ((r = read(0, in+len, cap-len)) > 0) { len += r;
+        if (len == cap) { cap *= 2; in = realloc(in, cap); } }
+    char **paths = NULL; int n = 0, pc = 0;
+    for (size_t i = 0, s = 0; i <= len; i++) {
+        if (i == len || in[i] == '\n') { if (i > s) {
+            if (n == pc) { pc = pc ? pc*2 : 256; paths = realloc(paths, pc*sizeof(char*)); }
+            paths[n] = malloc(i-s+1); memcpy(paths[n], in+s, i-s); paths[n][i-s]=0; n++; }
+            s = i+1; } }
+    EtagJob j = { paths, n, calloc(n?n:1,sizeof(char*)), calloc(n?n:1,8),
+                  calloc(n?n:1,4), 0, PTHREAD_MUTEX_INITIALIZER, part_size };
+    if (nthreads < 1) nthreads = 1;
+    pthread_t *th = malloc(nthreads*sizeof *th);
+    for (int i=0;i<nthreads;i++) pthread_create(&th[i],0,etag_worker,&j);
+    for (int i=0;i<nthreads;i++) pthread_join(th[i],0);
+    /* build large_utf8 (path, etag) + i64 cksum, emit QETAG */
+    int64_t *poff = malloc((n+1)*8), *eoff = malloc((n+1)*8);
+    int64_t pl=0, el=0; poff[0]=eoff[0]=0;
+    for (int i=0;i<n;i++){ pl += strlen(paths[i]); poff[i+1]=pl;
+        el += strlen(j.etags[i]?j.etags[i]:""); eoff[i+1]=el; }
+    char *pd = malloc(pl?pl:1), *ed = malloc(el?el:1);
+    int64_t po=0, eo=0;
+    for (int i=0;i<n;i++){ size_t a=strlen(paths[i]); memcpy(pd+po,paths[i],a); po+=a;
+        const char *e=j.etags[i]?j.etags[i]:""; size_t b=strlen(e); memcpy(ed+eo,e,b); eo+=b; }
+    int64_t *cks = malloc((n?n:1)*8);
+    for (int i=0;i<n;i++) cks[i] = (int64_t)j.crc[i];
+    emit_schema(outfd, QETAG_SCHEMA_META, QETAG_SCHEMA_LEN);
+    struct WBuf b[QETAG_N_BUFS] = {
+        {NULL,0},{poff,8*(n+1)},{pd,pl}, {NULL,0},{eoff,8*(n+1)},{ed,el},
+        {NULL,0},{cks,8*n}};
+    if (n==0){ b[1]=(struct WBuf){NULL,0}; b[4]=(struct WBuf){NULL,0}; }
+    emit_batch(outfd, QETAG_BATCH_TMPL, QETAG_TMPL_LEN, QETAG_OFF_BODYLEN,
+               QETAG_OFF_RBLEN, QETAG_NODE_OFF, QETAG_N_NODES,
+               QETAG_BUF_OFF, QETAG_N_BUFS, n, b);
+    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
+    for (int i=0;i<n;i++){ free(paths[i]); free(j.etags[i]); }
+    free(paths); free(j.etags); free(j.crc); free(j.err); free(th);
+    free(poff); free(eoff); free(pd); free(ed); free(cks); free(in);
+    return 0;
+}
+
 static uint8_t *read_all_fd(int fd, size_t *out){
     size_t cap = 1<<20, len = 0; uint8_t *b = malloc(cap);
     for (;;) {
@@ -1211,6 +1316,8 @@ static uint8_t *read_all_fd(int fd, size_t *out){
 int main(int argc, char **argv){
     if (argc >= 3 && strcmp(argv[1], "scan") == 0)   /* qvm scan <root> [threads] */
         return qvm_scan(argv[2], argc > 3 ? atoi(argv[3]) : 8, 1);
+    if (argc >= 3 && strcmp(argv[1], "etag") == 0)   /* qvm etag <part_size> [threads] <stdin paths */
+        return qvm_etag(atoll(argv[2]), argc > 3 ? atoi(argv[3]) : 8, 1);
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
         fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [comp|-] "
                         "[callfd|-] [sink ...]\n  or:  %s scan <root> [threads]\n",
