@@ -1143,6 +1143,33 @@ def test_qvm(tmp):
     assert seen == nt
     ok("qvm reshard: N self-contained shards, correct routing, byte-exact")
 
+    # pipe sink: frames streamed through a pipe (the S3/TCP shape, hold-through-write)
+    sp = wire.scan(str(src), "uring", 4)          # rescan (keep* were added above)
+    pp = str(tmp / "qvm_pipe.nock")
+    npipe = qplan.pack_pipe(sp, str(src), pp, qvm, frame_bytes=16 << 10, npool=8)
+    qplan.unpack(pp, str(tmp / "qvm_pipe_x"), qvm, npool=8)
+    for pth in sp.filter(~pl.col("is_dir"))["path"]:
+        assert (tmp / "qvm_pipe_x" / pth).read_bytes() == (src / pth).read_bytes()
+    assert npipe > 0
+    ok("qvm pipe sink: frames streamed through a pipe (S3/TCP shape), byte-exact")
+
+    # recompress: (uncompressed) tar -> nock via multi-run gather from a shared
+    # window; filter drops members, so kept members form non-contiguous runs
+    tarp = str(tmp / "qvm_re.tar")
+    with tarfile.open(tarp, "w") as tf:
+        for p in sorted(src.rglob("*")):
+            if p.is_file():
+                tf.add(str(p), arcname=str(p.relative_to(src)))
+    ra = str(tmp / "qvm_re.nock")
+    nre = qplan.recompress(tarp, ra, qvm, frame_bytes=16 << 10,
+                           predicate=pl.col("path").str.ends_with(".keep"))
+    ridx = _zf.read_index(ra)
+    assert nre == 2 and all(pth.endswith(".keep") for pth in ridx["path"])
+    qplan.unpack(ra, str(tmp / "qvm_re_x"), qvm, npool=8)
+    for pth in ridx["path"]:
+        assert (tmp / "qvm_re_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm recompress: tar->nock multi-run gather from shared window (filter)")
+
 
 def main():
     tmp = Path(tempfile.mkdtemp())

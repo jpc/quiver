@@ -231,6 +231,128 @@ def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
     return instr, members, (shards if shard_by is not None else 1)
 
 
+def pack_pipe(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
+              frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
+              nworkers: int = 8) -> int:
+    """Compressed pack to a PIPE sink — the S3/TCP shape. Frames stream out a
+    pipe (deflate holds the sink lock through each write, since a pipe has no
+    pwrite); a reader thread forwards the bytes (here into `out_path`). The
+    footer (from the completions) is written after, as it would be a sidecar /
+    trailing object part. Returns the member count."""
+    import threading
+    instr, members, _ = plan_pack(scan, root, frame_bytes, level, npool)
+    r, w = os.pipe()
+    chunks: list[bytes] = []
+
+    def reader():
+        while True:
+            c = os.read(r, 1 << 20)
+            if not c:
+                break
+            chunks.append(c)                     # a real sink would upload here
+
+    th = threading.Thread(target=reader); th.start()
+    comp = run(instr, qvm_exe, "-", sinks=(f"fd:{w}",), npool=npool,
+               nworkers=nworkers, want_comp=True)
+    os.close(w)                                  # parent's copy → reader hits EOF
+    th.join(); os.close(r)
+
+    with open(out_path, "wb") as f:
+        f.write(b"".join(chunks))                # streamed frame bytes, in order
+    footer = (members.join(comp, on="frame", how="left")
+                     .select([c for c, _ in _zf._FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    ipc.write_all(ftmp, footer)
+    _zf._write_footer(out_path, ftmp, False); ftmp.close()
+    return footer.height
+
+
+def plan_recompress(tar_path: str, frame_bytes: int = 1 << 20, level: int = 6,
+                    predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """(uncompressed) tar -> compressed nock. Thread 0 loads the whole tar into a
+    shared window (buf 0), then spawns a child per output frame; each child
+    multi-run `deflate`s its members' byte RANGES straight from the window (no
+    re-copy), so a filter that drops members just yields non-contiguous runs.
+    The window is freed after the join (shared read-only, lifetime = the scope).
+    Returns (instr_df, members_df)."""
+    import tarfile
+    rows = []
+    with tarfile.open(tar_path, "r:") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            hl = m.offset_data - m.offset
+            rng = hl + ((m.size + 511) // 512) * 512      # header + padded body
+            rows.append({"path": m.name, "offset": m.offset, "header_len": hl,
+                         "size": m.size, "range": rng, "mode": m.mode,
+                         "mtime_ns": int(m.mtime) * 1_000_000_000,
+                         "uid": m.uid, "gid": m.gid})
+    tarsize = os.path.getsize(tar_path)
+    df = pl.DataFrame(rows)
+    if predicate is not None:
+        df = df.filter(predicate)
+    df = df.sort("offset")
+    df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
+    df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
+    df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
+    df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
+    # runs: a new run whenever the frame changes or the tar is non-contiguous
+    df = df.with_columns(_pe=(pl.col("offset") + pl.col("range")).shift(1),
+                         _pf=pl.col("frame").shift(1))
+    df = df.with_columns(_new=((pl.col("offset") != pl.col("_pe"))
+                               | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
+    df = df.with_columns(run=pl.col("_new").cum_sum())
+    runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
+                                   off=pl.col("offset").min(),
+                                   rlen=pl.col("range").sum())
+              .sort("off"))                       # gather order = tar order
+    frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
+    nf = frames.height
+    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"),
+                                                          pl.col("rlen"))
+    payloads = {}
+    for r in rbf.iter_rows(named=True):
+        a = np.empty(2 * len(r["off"]), dtype="<i8")
+        a[0::2] = r["off"]; a[1::2] = r["rlen"]
+        payloads[int(r["frame"])] = a.tobytes()
+
+    root_df = pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": tarsize},
+        {"tid": 0, "_sub": 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
+         "buf_id": 0, "buf_off": 0, "path": tar_path, "len": tarsize},
+        {"tid": 0, "_sub": 2, "op": OP_SPAWN, "lo": 1, "cap": nf},
+        {"tid": 0, "_sub": 3, "op": OP_JOIN, "lo": 1, "cap": nf},
+        {"tid": 0, "_sub": _BIG, "op": OP_FREE, "buf_id": 0}])
+    deflate = frames.with_columns(
+        payload=pl.col("frame").map_elements(lambda f: payloads[int(f)],
+                                             return_dtype=pl.Binary)).select(
+        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
+        buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
+        sink=pl.lit(0), level=pl.lit(level), frame_id=pl.col("frame"),
+        payload=pl.col("payload"))
+    instr = _finalize([root_df, deflate])
+    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
+                        "frame", "in_off")
+    return instr, members
+
+
+def recompress(tar_path: str, out_path: str, qvm_exe: str,
+               frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
+               nworkers: int = 8, predicate: pl.Expr | None = None) -> int:
+    """Plan + run a tar->nock recompress (multi-run gather), then write the
+    footer from the completions. Returns the member count."""
+    instr, members = plan_recompress(tar_path, frame_bytes, level, predicate)
+    open(out_path, "wb").close()
+    comp = run(instr, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
+               nworkers=nworkers, want_comp=True)
+    footer = (members.join(comp, on="frame", how="left")
+                     .select([c for c, _ in _zf._FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    ipc.write_all(ftmp, footer)
+    _zf._write_footer(out_path, ftmp, False); ftmp.close()
+    return footer.height
+
+
 def _shard_paths(out_path: str, n: int) -> list[str]:
     if n == 1:
         return [out_path]
@@ -360,7 +482,8 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
         fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
     argv = [qvm_exe, "qvm", arch_path, str(npool), str(nworkers), comp_path,
             *sinks]
-    p = subprocess.Popen(argv, stdin=subprocess.PIPE)
+    pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # inherited pipes
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds)
     p.stdin.write(data); p.stdin.close()
     rc = p.wait()
     if rc != 0:

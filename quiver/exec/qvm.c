@@ -69,8 +69,10 @@ typedef struct {
     int32_t  sink; int32_t level; int64_t frame_id;  /* deflate: sink/level/tag */
 } Instr;
 
-/* an append sink: fd + cursor guarded by a mutex (deflate reserves under it) */
-typedef struct { int fd; int64_t cursor; pthread_mutex_t mu; } Sink;
+/* an append sink: fd + cursor guarded by a mutex. A seekable file releases the
+ * lock after reserving (writes concurrent via pwrite); a pipe/socket has no
+ * positioned write, so the lock is held THROUGH the sequential write. */
+typedef struct { int fd; int64_t cursor; int is_pipe; pthread_mutex_t mu; } Sink;
 
 /* --------------------------------------------------------------- task queue */
 /* A Task is a unit of async work handed to the worker pool; buffer operands are
@@ -205,21 +207,66 @@ static void run_task(Task *t){
         break;
     }
     case TK_DEFLATE: {
-        /* compress buf[buf_off, len] and append to the sink; the reservation
-         * (cursor bump) is the only critical section — the write is a positioned
-         * pwrite off-lock. Reports (coff, clen) for the footer. */
-        size_t bound = ZSTD_compressBound((size_t)t->len);
-        uint8_t *cb = malloc(bound);
-        if (!cb) { t->res = -ENOMEM; break; }
-        size_t cl = ZSTD_compress(cb, bound, t->buf + t->buf_off,
-                                  (size_t)t->len, t->level);
-        if (ZSTD_isError(cl)) { t->res = -EIO; free(cb); break; }
+        /* compress and append to the sink. payload (if present) is a packed list
+         * of (off,len) i64 runs to GATHER from the buffer in place (filter /
+         * reshard from a decoded window — no coalescing copy); otherwise the one
+         * contiguous run [buf_off,len]. The reservation (cursor bump) is the only
+         * critical section; a seekable file writes off-lock. Reports (coff,clen). */
+        static __thread ZSTD_CCtx *cc = NULL;
+        uint8_t *cb; size_t cl;
+        if (t->payload_len > 0) {                /* multi-run gather */
+            int nruns = (int)(t->payload_len / 16);
+            const int64_t *rn = (const int64_t *)t->payload;
+            int64_t total = 0;
+            for (int i = 0; i < nruns; i++) total += rn[i*2 + 1];
+            size_t bound = ZSTD_compressBound((size_t)total);
+            cb = malloc(bound ? bound : 1);
+            if (!cb) { t->res = -ENOMEM; break; }
+            if (!cc) cc = ZSTD_createCCtx();
+            ZSTD_CCtx_reset(cc, ZSTD_reset_session_only);
+            ZSTD_CCtx_setParameter(cc, ZSTD_c_compressionLevel, t->level);
+            ZSTD_CCtx_setPledgedSrcSize(cc, (unsigned long long)total);
+            ZSTD_outBuffer out = {cb, bound, 0}; int err = 0;
+            for (int i = 0; i < nruns && !err; i++) {
+                ZSTD_inBuffer in = {t->buf + rn[i*2], (size_t)rn[i*2 + 1], 0};
+                while (in.pos < in.size)
+                    if (ZSTD_isError(ZSTD_compressStream2(cc,&out,&in,ZSTD_e_continue)))
+                        { err = 1; break; }
+            }
+            size_t rem;
+            do { ZSTD_inBuffer e = {NULL,0,0};
+                 rem = ZSTD_compressStream2(cc, &out, &e, ZSTD_e_end);
+                 if (ZSTD_isError(rem)) { err = 1; break; }
+            } while (rem);
+            if (err) { t->res = -EIO; free(cb); break; }
+            cl = out.pos;
+        } else {                                 /* single contiguous run */
+            size_t bound = ZSTD_compressBound((size_t)t->len);
+            cb = malloc(bound ? bound : 1);
+            if (!cb) { t->res = -ENOMEM; break; }
+            cl = ZSTD_compress(cb, bound, t->buf + t->buf_off,
+                               (size_t)t->len, t->level);
+            if (ZSTD_isError(cl)) { t->res = -EIO; free(cb); break; }
+        }
         Sink *s = t->sink;
-        pthread_mutex_lock(&s->mu);
-        int64_t coff = s->cursor; s->cursor += (int64_t)cl;   /* reserve */
-        pthread_mutex_unlock(&s->mu);
-        if (pwrite(s->fd, cb, cl, coff) != (ssize_t)cl) t->res = -errno;
-        t->coff = coff; t->clen = (int64_t)cl;
+        if (s->is_pipe) {                        /* no pwrite: hold through write */
+            pthread_mutex_lock(&s->mu);
+            int64_t coff = s->cursor; size_t off = 0;
+            while (off < cl) {
+                ssize_t w = write(s->fd, cb + off, cl - off);
+                if (w <= 0) { t->res = -errno; break; }
+                off += (size_t)w;
+            }
+            s->cursor += (int64_t)cl;
+            pthread_mutex_unlock(&s->mu);
+            t->coff = coff; t->clen = (int64_t)cl;
+        } else {                                 /* seekable: reserve, write off-lock */
+            pthread_mutex_lock(&s->mu);
+            int64_t coff = s->cursor; s->cursor += (int64_t)cl;
+            pthread_mutex_unlock(&s->mu);
+            if (pwrite(s->fd, cb, cl, coff) != (ssize_t)cl) t->res = -errno;
+            t->coff = coff; t->clen = (int64_t)cl;
+        }
         free(cb); break;
     }
     case TK_INFLATE: {
@@ -400,6 +447,7 @@ static void run_thread(Sched *S, Thread *t){
             k->buf = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
             k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
             k->level = I->level; k->frame_id = I->frame_id;
+            k->payload = I->payload; k->payload_len = I->payload_len;  /* runs */
             if (I->op == OP_DEFLATE) { k->kind = TK_DEFLATE;
                 k->sink = &S->sinks[I->sink]; }
             else k->kind = TK_INFLATE;
@@ -456,6 +504,9 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
     S.sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
     for (int i = 0; i < nsinks; i++) {
         S.sinks[i].fd = sink_fds[i]; S.sinks[i].cursor = 0;
+        struct stat st;                          /* pipe/socket → hold-through-write */
+        S.sinks[i].is_pipe = (fstat(sink_fds[i], &st) == 0
+                              && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)));
         pthread_mutex_init(&S.sinks[i].mu, NULL);
     }
     tq_init(&S.tasks); tq_init(&S.comps);
@@ -656,7 +707,9 @@ int main(int argc, char **argv){
     int nsinks = argc > 6 ? argc - 6 : 0;
     int *sink_fds = nsinks ? calloc(nsinks, sizeof(int)) : NULL;
     for (int i = 0; i < nsinks; i++) {
-        sink_fds[i] = open(argv[6 + i], O_RDWR | O_CREAT | O_TRUNC, 0644);
+        const char *sa = argv[6 + i];
+        if (strncmp(sa, "fd:", 3) == 0) sink_fds[i] = atoi(sa + 3);  /* inherited pipe */
+        else sink_fds[i] = open(sa, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (sink_fds[i] < 0) { perror("open sink"); return 2; }
     }
     int arch_fd = -1;
