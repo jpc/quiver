@@ -1086,6 +1086,12 @@ def test_qvm(tmp):
         os.utime(src / d0, (ts, ts))              # distinctive dir mtimes
     s = wire.scan(str(src), "uring", 4)
 
+    # qvm's own parallel scanner == the old C scanner (self-sufficient discovery)
+    _c7 = ["path", "is_dir", "size", "mode", "mtime_ns", "uid", "gid"]
+    _qs = qplan.scan(str(src), qvm, 4).select(_c7).sort("path")
+    assert _qs.equals(s.select(_c7).sort("path")), "qvm scan must match wire.scan"
+    ok("qvm scan: parallel fs walk == wire.scan (self-sufficient discovery)")
+
     def _dirs_ok(root):                            # dir mode+mtime restored?
         return all((root / d0).is_dir()
                    and (root / d0).stat().st_mtime_ns == ts * 1_000_000_000

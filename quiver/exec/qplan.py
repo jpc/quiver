@@ -154,6 +154,18 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
     return _finalize([root_df, mkdir_df, mov, meta, dir_meta])
 
 
+# ------------------------------------------------------------------------ scan
+def scan(root: str, qvm_exe: str, threads: int = 8) -> pl.DataFrame:
+    """Parallel filesystem scan by qvm itself (no dependency on the old scanner):
+    `qvm scan <root>` walks the tree with a worker pool and emits one Arrow batch
+    — relative path, is_dir, size, mode, mtime_ns, uid, gid (root excluded, dirs +
+    files incl. empty). Drop-in for wire.scan for the columns the planner uses."""
+    p = subprocess.run([qvm_exe, "scan", os.path.abspath(root), str(threads)],
+                       stdout=subprocess.PIPE, check=True)
+    df = ipc.read_all(p.stdout)
+    return df.with_columns(pl.col("is_dir").cast(pl.Boolean))
+
+
 # ------------------------------------------------------------- teardown / durability
 def plan_rm(files: list[str], dirs: list[str], root: str) -> pl.DataFrame:
     """Remove a set of entries under `root`: unlink files (one thread each, all

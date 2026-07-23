@@ -21,6 +21,7 @@
  *      <zstd>/lib/libzstd.a && /tmp/qvm
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -34,6 +35,7 @@
 #include <unistd.h>
 #include <zstd.h>
 #include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
+#include "qvm_scan.h"           /* Arrow-emit template for the fs-scan schema */
 #ifdef QVM_URING
 #include <liburing.h>           /* optional io_uring backend for per-file read/write */
 #endif
@@ -1079,6 +1081,115 @@ static void emit_completions(int fd, Sched *S){
     uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(fd, eos, 8);
 }
 
+/* --------------------------------------------------------- filesystem scan */
+/* A parallel directory walk (a dir queue drained by N worker threads; each dir
+ * is opened relative to its parent's fd, so no path re-walk and no PATH_MAX
+ * limit). Emits ONE Arrow batch — relative path, is_dir, size, mode, mtime_ns,
+ * uid, gid — the same rows the planner consumes from wire.scan (root excluded,
+ * dirs + files, incl. empty dirs). Makes qvm self-sufficient for discovery. */
+typedef struct SDir { int dfd; char *rel; struct SDir *next; } SDir;
+typedef struct {
+    pthread_mutex_t qmu; pthread_cond_t qcv;
+    SDir *qh, *qt; int64_t pending; int done;
+    pthread_mutex_t amu;                          /* shared row accumulator */
+    char *pdata; int64_t plen, pcap;              /* large_utf8 path data */
+    int64_t *poff; uint8_t *isdir; int64_t *size, *mtime;
+    int32_t *mode, *uid, *gid; int64_t n, cap;
+} Scan;
+
+static void sacc_add(Scan *s, const char *rel, size_t rl, int isdir, int64_t sz,
+                     int32_t md, int64_t mt, int32_t uid, int32_t gid){
+    pthread_mutex_lock(&s->amu);
+    if (s->n == s->cap) { s->cap = s->cap ? s->cap*2 : 4096;
+        s->poff  = realloc(s->poff, (s->cap+1)*8);
+        s->isdir = realloc(s->isdir, s->cap);
+        s->size  = realloc(s->size, s->cap*8); s->mtime = realloc(s->mtime, s->cap*8);
+        s->mode  = realloc(s->mode, s->cap*4); s->uid = realloc(s->uid, s->cap*4);
+        s->gid   = realloc(s->gid, s->cap*4);
+        if (s->n == 0) s->poff[0] = 0; }
+    if (s->plen + (int64_t)rl > s->pcap) {
+        s->pcap = s->pcap ? s->pcap : 1<<16;
+        while (s->plen + (int64_t)rl > s->pcap) s->pcap *= 2;
+        s->pdata = realloc(s->pdata, s->pcap); }
+    memcpy(s->pdata + s->plen, rel, rl); s->plen += rl;
+    s->poff[s->n+1] = s->plen;
+    s->isdir[s->n]=(uint8_t)isdir; s->size[s->n]=sz; s->mode[s->n]=md;
+    s->mtime[s->n]=mt; s->uid[s->n]=uid; s->gid[s->n]=gid; s->n++;
+    pthread_mutex_unlock(&s->amu);
+}
+static void sq_push(Scan *s, int dfd, char *rel){   /* takes ownership of rel */
+    SDir *d = malloc(sizeof *d); d->dfd = dfd; d->rel = rel; d->next = NULL;
+    pthread_mutex_lock(&s->qmu);
+    if (s->qt) s->qt->next = d; else s->qh = d; s->qt = d; s->pending++;
+    pthread_cond_signal(&s->qcv); pthread_mutex_unlock(&s->qmu);
+}
+static void *scan_worker(void *arg){
+    Scan *s = arg;
+    for (;;) {
+        pthread_mutex_lock(&s->qmu);
+        while (!s->qh && !s->done) pthread_cond_wait(&s->qcv, &s->qmu);
+        if (!s->qh) { pthread_mutex_unlock(&s->qmu); break; }   /* done && empty */
+        SDir *d = s->qh; s->qh = d->next; if (!s->qh) s->qt = NULL;
+        pthread_mutex_unlock(&s->qmu);
+
+        DIR *dp = fdopendir(d->dfd);                /* takes ownership of dfd */
+        if (dp) { struct dirent *e; size_t pl = strlen(d->rel);
+            while ((e = readdir(dp))) {
+                const char *nm = e->d_name;
+                if (nm[0]=='.' && (!nm[1] || (nm[1]=='.' && !nm[2]))) continue;
+                size_t nl = strlen(nm);
+                char *cr = malloc(pl + 1 + nl + 1);  /* child relative path */
+                if (pl) { memcpy(cr, d->rel, pl); cr[pl]='/'; memcpy(cr+pl+1, nm, nl+1); }
+                else memcpy(cr, nm, nl+1);
+                size_t crl = pl ? pl+1+nl : nl;
+                struct stat st;
+                if (fstatat(dirfd(dp), nm, &st, AT_SYMLINK_NOFOLLOW) < 0) { free(cr); continue; }
+                int isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+                sacc_add(s, cr, crl, isdir, (int64_t)st.st_size, (int32_t)st.st_mode,
+                         (int64_t)st.st_mtim.tv_sec*1000000000 + st.st_mtim.tv_nsec,
+                         (int32_t)st.st_uid, (int32_t)st.st_gid);
+                if (isdir) { int cfd = openat(dirfd(dp), nm,
+                                 O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+                    if (cfd >= 0) sq_push(s, cfd, cr); else free(cr); }
+                else free(cr);
+            }
+            closedir(dp);
+        }
+        free(d->rel); free(d);
+        pthread_mutex_lock(&s->qmu);
+        if (--s->pending == 0) { s->done = 1; pthread_cond_broadcast(&s->qcv); }
+        pthread_mutex_unlock(&s->qmu);
+    }
+    return NULL;
+}
+static int qvm_scan(const char *root, int nthreads, int outfd){
+    int rfd = open(root, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (rfd < 0) { fprintf(stderr, "qvm scan: open %s: %s\n", root, strerror(errno)); return 1; }
+    Scan s; memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.qmu,0); pthread_cond_init(&s.qcv,0); pthread_mutex_init(&s.amu,0);
+    if (nthreads < 1) nthreads = 1;
+    sq_push(&s, rfd, strdup(""));                   /* seed: root, rel "" */
+    pthread_t *th = malloc(nthreads*sizeof *th);
+    for (int i=0;i<nthreads;i++) pthread_create(&th[i],0,scan_worker,&s);
+    for (int i=0;i<nthreads;i++) pthread_join(th[i],0);
+
+    emit_schema(outfd, QSCAN_SCHEMA_META, QSCAN_SCHEMA_LEN);
+    int64_t n = s.n;
+    struct WBuf b[QSCAN_N_BUFS] = {
+        {NULL,0},{s.poff, 8*(n+1)},{s.pdata, s.plen},
+        {NULL,0},{s.isdir, n},   {NULL,0},{s.size, 8*n},
+        {NULL,0},{s.mode, 4*n},  {NULL,0},{s.mtime, 8*n},
+        {NULL,0},{s.uid, 4*n},   {NULL,0},{s.gid, 4*n}};
+    if (n == 0) b[1] = (struct WBuf){NULL,0};       /* no offsets when empty */
+    emit_batch(outfd, QSCAN_BATCH_TMPL, QSCAN_TMPL_LEN, QSCAN_OFF_BODYLEN,
+               QSCAN_OFF_RBLEN, QSCAN_NODE_OFF, QSCAN_N_NODES,
+               QSCAN_BUF_OFF, QSCAN_N_BUFS, n, b);
+    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
+    free(s.poff); free(s.pdata); free(s.isdir); free(s.size); free(s.mtime);
+    free(s.mode); free(s.uid); free(s.gid); free(th);
+    return 0;
+}
+
 static uint8_t *read_all_fd(int fd, size_t *out){
     size_t cap = 1<<20, len = 0; uint8_t *b = malloc(cap);
     for (;;) {
@@ -1098,9 +1209,12 @@ static uint8_t *read_all_fd(int fd, size_t *out){
  * (O_RDWR|CREAT|TRUNC). Deflate completions {frame_id, coff, clen} are written
  * to the `comp` file path as [u32 n][n×3 i64] unless it is "-". */
 int main(int argc, char **argv){
+    if (argc >= 3 && strcmp(argv[1], "scan") == 0)   /* qvm scan <root> [threads] */
+        return qvm_scan(argv[2], argc > 3 ? atoi(argv[3]) : 8, 1);
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
         fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [comp|-] "
-                        "[callfd|-] [sink ...]\n", argv[0]);
+                        "[callfd|-] [sink ...]\n  or:  %s scan <root> [threads]\n",
+                argv[0], argv[0]);
         return 2;
     }
     const char *arch = argc > 2 ? argv[2] : "-";
