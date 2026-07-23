@@ -44,7 +44,7 @@ static int64_t tr_now(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-typedef struct { int64_t t0, t1, tid, op, buf, detail; } TraceEv;
+typedef struct { int64_t t0, t1, tid, op, buf, detail, epoch; } TraceEv;
 
 /* ------------------------------------------------------------------ opcodes */
 enum {
@@ -332,6 +332,7 @@ typedef struct {
     int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
+    int batch_epoch, epoch_next; /* per-batch id (nested CALL batches distinct) */
 } Sched;
 
 static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
@@ -340,7 +341,7 @@ static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
     if (S->ntr == S->trcap) { S->trcap = S->trcap ? S->trcap*2 : 1024;
         S->tr = realloc(S->tr, S->trcap * sizeof(TraceEv)); }
     S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
-                                 tid, op, buf, detail };
+                                 tid, op, buf, detail, S->batch_epoch };
 }
 
 /* forward decls: OP_CALL runs a returned batch nested (see run_thread) */
@@ -482,6 +483,7 @@ static void run_thread(Sched *S, Thread *t){
              * fiber's own batch to be quiescent here (no other in-flight ops),
              * which the single-fiber window driver satisfies. */
             int64_t cid = I->frame_id;
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_CALL, cid, 0);
             if (S->call_fd >= 0 && write(S->call_fd, &cid, 8) != 8)
                 { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
             size_t blen; uint8_t *b = read_framed(0, &blen);
@@ -490,6 +492,7 @@ static void run_thread(Sched *S, Thread *t){
             Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
             Thread *sth = S->th; int snth = S->nth;      /* save caller's batch */
             Thread *srh = S->ready_head, *srt = S->ready_tail; int sinf = S->inflight;
+            int sepoch = S->batch_epoch;
             S->th = NULL; S->nth = 0;
             S->ready_head = S->ready_tail = NULL; S->inflight = 0;
             build_threads(S, nins, nn);
@@ -498,6 +501,7 @@ static void run_thread(Sched *S, Thread *t){
             free(S->th);
             S->th = sth; S->nth = snth;                  /* restore */
             S->ready_head = srh; S->ready_tail = srt; S->inflight = sinf;
+            S->batch_epoch = sepoch;
             free(nins); free(nap); free(nad); free(b);
             t->pc++; break;
         }
@@ -509,6 +513,7 @@ static void run_thread(Sched *S, Thread *t){
 
 /* group a flat, tid-sorted Instr array into per-thread programs */
 static void build_threads(Sched *S, Instr *ins, int n){
+    S->batch_epoch = S->epoch_next++;            /* a fresh id for this batch */
     int maxtid = 0;
     for (int i = 0; i < n; i++) if ((int)ins[i].tid > maxtid) maxtid = ins[i].tid;
     S->nth = maxtid + 1;

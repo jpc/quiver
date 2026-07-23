@@ -374,8 +374,7 @@ def plan_recompress(members: pl.DataFrame, tar_path: str,
         {"tid": 0, "_sub": 3, "op": OP_JOIN, "lo": 1, "cap": nf},
         {"tid": 0, "_sub": _BIG, "op": OP_FREE, "buf_id": 0}])
     deflate = frames.with_columns(
-        payload=pl.col("frame").map_elements(lambda f: payloads[int(f)],
-                                             return_dtype=pl.Binary)).select(
+        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
         tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
         buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
         sink=pl.lit(0), level=pl.lit(level), frame_id=pl.col("frame"),
@@ -436,8 +435,7 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
         {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
     deflate = frames.with_columns(
-        payload=pl.col("frame").map_elements(lambda f: payloads[int(f)],
-                                             return_dtype=pl.Binary)).select(
+        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
         tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
         buf_id=pl.lit(buf_id), buf_off=pl.lit(0), len=pl.col("clen"),
         sink=pl.lit(0), level=pl.lit(level),
