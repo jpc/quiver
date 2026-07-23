@@ -34,6 +34,9 @@
 #include <unistd.h>
 #include <zstd.h>
 #include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
+#ifdef QVM_URING
+#include <liburing.h>           /* optional io_uring backend for per-file read/write */
+#endif
 
 /* ----------------------------------------------------------------- tracing  */
 /* When QVM_TRACE=<path> is set, every op is logged with monotonic start/end so
@@ -113,6 +116,12 @@ static Task *tq_pop(TQ *q){          /* blocks; NULL when stopped and drained */
     while (q->head==q->tail && !q->stop) pthread_cond_wait(&q->cv,&q->mu);
     Task *t = NULL;
     if (q->head!=q->tail) t = q->q[q->head++ % QCAP];
+    pthread_mutex_unlock(&q->mu);
+    return t;
+}
+static Task *tq_trypop(TQ *q){       /* non-blocking; NULL if empty */
+    pthread_mutex_lock(&q->mu);
+    Task *t = (q->head!=q->tail) ? q->q[q->head++ % QCAP] : NULL;
     pthread_mutex_unlock(&q->mu);
     return t;
 }
@@ -333,7 +342,60 @@ typedef struct {
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
     int batch_epoch, epoch_next; /* per-batch id (nested CALL batches distinct) */
+#ifdef QVM_URING
+    int use_uring, qd; TQ ring_tasks; pthread_t ring_th; struct io_uring ring;
+#endif
 } Sched;
+
+#ifdef QVM_URING
+/* io_uring backend: per-file reads (fs->buf) and writes (buf->fs) become a READ
+ * or WRITE SQE against a freshly opened fd, kept deep in the ring so many files
+ * are in flight at once. Everything else (copy_file_range — no io_uring op — and
+ * the codecs) stays on the worker pool. The ring worker posts completions to the
+ * SAME queue the scheduler reaps, so the two backends are indistinguishable. */
+typedef struct { Task *t; int fd; } RingOp;
+static int ring_submit(Sched *S, Task *k){
+    int rd = (k->kind == TK_FS_TO_BUF);
+    int fd = open(k->path, rd ? O_RDONLY : (O_WRONLY|O_CREAT|O_TRUNC),
+                  k->mode >= 0 ? (mode_t)k->mode : 0644);
+    if (fd < 0) { k->res = -errno; tq_push(&S->comps, k); return 0; }
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&S->ring);
+    RingOp *ro = malloc(sizeof *ro); ro->t = k; ro->fd = fd;
+    if (rd) io_uring_prep_read(sqe, fd, k->buf + k->buf_off, (unsigned)k->len,
+                              (__u64)k->arch_off);
+    else    io_uring_prep_write(sqe, fd, k->buf + k->buf_off, (unsigned)k->len, 0);
+    io_uring_sqe_set_data(sqe, ro);
+    return 1;
+}
+static void ring_reap(Sched *S, struct io_uring_cqe *cqe){
+    RingOp *ro = io_uring_cqe_get_data(cqe);
+    Task *k = ro->t; int res = cqe->res;
+    io_uring_cqe_seen(&S->ring, cqe);
+    close(ro->fd); free(ro);
+    k->res = res < 0 ? res : (res != (int)k->len ? -EIO : 0);
+    tq_push(&S->comps, k);
+}
+static void *ring_worker(void *arg){
+    Sched *S = arg; int inflight = 0;
+    for (;;) {
+        Task *k;
+        while (inflight < S->qd && (k = tq_trypop(&S->ring_tasks)))
+            inflight += ring_submit(S, k);
+        if (inflight) io_uring_submit(&S->ring);
+        if (inflight == 0) {                       /* idle: block for work */
+            k = tq_pop(&S->ring_tasks);
+            if (!k) break;                         /* stopped and drained */
+            inflight += ring_submit(S, k);
+            if (inflight) io_uring_submit(&S->ring);
+            if (inflight == 0) continue;
+        }
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&S->ring, &cqe) == 0) { ring_reap(S, cqe); inflight--; }
+        while (io_uring_peek_cqe(&S->ring, &cqe) == 0) { ring_reap(S, cqe); inflight--; }
+    }
+    return NULL;
+}
+#endif
 
 static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
                    int64_t buf, int64_t detail){
@@ -420,7 +482,13 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
     else if (I->src==E_FS && I->dst==E_FS   ) k->kind = TK_CFR_FS_TO_FS;
     else if (I->src==E_FS && I->dst==E_ARCH ) k->kind = TK_CFR_FS_TO_ARCH;
     t->pc++;                              /* advance BEFORE suspend */
-    S->inflight++; tq_push(&S->tasks, k);
+    S->inflight++;
+#ifdef QVM_URING
+    if (S->use_uring && (k->kind == TK_FS_TO_BUF || k->kind == TK_BUF_TO_FS))
+        tq_push(&S->ring_tasks, k);      /* per-file read/write → the ring */
+    else
+#endif
+        tq_push(&S->tasks, k);
     t->st = T_WAIT_IO;
 }
 
@@ -559,6 +627,16 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     }
     tq_init(&S->tasks); tq_init(&S->comps);
     if (getenv("QVM_TRACE")) S->t_base = tr_now();
+#ifdef QVM_URING
+    const char *ur = getenv("QVM_URING");        /* opt-in per-file ring backend */
+    S->use_uring = ur ? atoi(ur) : 0;
+    if (S->use_uring) {
+        S->qd = S->use_uring > 1 ? S->use_uring : 128;
+        if (io_uring_queue_init(S->qd, &S->ring, 0) < 0) S->use_uring = 0;
+        else { tq_init(&S->ring_tasks);
+               pthread_create(&S->ring_th, 0, ring_worker, S); }
+    }
+#endif
     static Worker w; w.in = &S->tasks; w.out = &S->comps;
     g_nworkers = nworkers;
     for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
@@ -598,6 +676,13 @@ static void qvm_batch(Sched *S, Instr *ins, int n){
 }
 
 static void qvm_close(Sched *S){
+#ifdef QVM_URING
+    if (S->use_uring) {
+        S->ring_tasks.stop = 1; pthread_cond_broadcast(&S->ring_tasks.cv);
+        pthread_join(S->ring_th, 0);
+        io_uring_queue_exit(&S->ring);
+    }
+#endif
     S->tasks.stop = 1; pthread_cond_broadcast(&S->tasks.cv);
     for (int k = 0; k < g_nworkers; k++) pthread_join(g_wt[k], 0);
     const char *trp = getenv("QVM_TRACE");

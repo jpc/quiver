@@ -632,16 +632,33 @@ def encode_stream(instr: pl.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-def build_qvm(dest: str, src: str | None = None) -> str:
+def _find_liburing():
+    """Locate a built liburing (header + static lib) — the optional io_uring
+    backend. Returns (include_dir, lib_a) or None."""
+    import glob
+    for h in glob.glob("/tmp/claude-*/**/liburing.h", recursive=True):
+        for a in glob.glob(os.path.join(os.path.dirname(h), "..", "**",
+                                        "liburing.a"), recursive=True):
+            return os.path.dirname(h), os.path.abspath(a)
+    return None
+
+
+def build_qvm(dest: str, src: str | None = None, uring: bool = False):
     """Compile the qvm executor (links libzstd). Prefers the static libzstd.a
-    from the conda pkgs dir; falls back to a dynamic -lzstd."""
+    from the conda pkgs dir; falls back to a dynamic -lzstd. With uring=True,
+    compiles the optional io_uring backend (-DQVM_URING + liburing) — returns
+    None if liburing can't be found so callers can skip."""
     src = src or os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvm.c")
     zp = "/mnt/weka/jpc/miniconda3/pkgs/zstd-1.5.6-hc292b87_0"
-    if os.path.exists(f"{zp}/lib/libzstd.a"):
-        cmd = ["cc", "-O2", "-pthread", f"-I{zp}/include", "-o", dest, src,
-               f"{zp}/lib/libzstd.a"]
-    else:
-        cmd = ["cc", "-O2", "-pthread", "-o", dest, src, "-lzstd"]
+    cmd = ["cc", "-O2", "-pthread", "-o", dest, src]
+    cmd += [f"-I{zp}/include", f"{zp}/lib/libzstd.a"] \
+        if os.path.exists(f"{zp}/lib/libzstd.a") else ["-lzstd"]
+    if uring:
+        lu = _find_liburing()
+        if not lu:
+            return None
+        inc, lib = lu
+        cmd = cmd[:6] + ["-DQVM_URING", f"-I{inc}"] + cmd[6:] + [lib]
     subprocess.run(cmd, check=True, capture_output=True)
     return dest
 

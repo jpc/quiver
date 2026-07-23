@@ -1196,6 +1196,23 @@ def test_qvm(tmp):
         assert (tmp / "qvm_win_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm OP_CALL: windowed streaming recompress, bounded memory, byte-exact")
 
+    # optional io_uring backend: per-file reads/writes go to the ring; the result
+    # must be byte-identical to the worker-pool path
+    qvu = str(tmp / "qvm_uring")
+    if qplan.build_qvm(qvu, uring=True):
+        os.environ["QVM_URING"] = "128"
+        try:
+            ua = str(tmp / "qvm_uring.nock")
+            un = qplan.pack(s, str(src), ua, qvu, frame_bytes=32 << 10, npool=8)
+            qplan.unpack(ua, str(tmp / "qvm_uring_x"), qvu, npool=8)
+        finally:
+            os.environ.pop("QVM_URING", None)
+        for pth in s.filter(~pl.col("is_dir"))["path"]:
+            assert (tmp / "qvm_uring_x" / pth).read_bytes() == (src / pth).read_bytes()
+        ok("qvm io_uring backend: per-file read/write via the ring, byte-exact")
+    else:
+        ok("qvm io_uring backend: skipped (liburing unavailable)")
+
     # compressed-source recompress: foreign .tar.zstd -> nock (decode-scan)
     import zstandard as _zstd
     tzst = str(tmp / "qvm_re.tar.zstd")
