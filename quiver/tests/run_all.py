@@ -1250,6 +1250,17 @@ def test_qvm(tmp):
     assert ns == nz, (ns, nz)                      # same members as decode-scan
     ok("qvm recompress streaming: .tar.zstd decoded once, bounded, byte-exact")
 
+    # teardown (unlink/rmdir deepest-first) + durability (fbarrier) — mirror tail
+    mr = tmp / "qvm_rm"
+    (mr / "a/b").mkdir(parents=True); (mr / "c").mkdir()
+    (mr / "a/f1").write_text("x"); (mr / "a/b/f2").write_text("y")
+    (mr / "keep").write_text("k")
+    qplan.run(qplan.plan_rm(["a/f1", "a/b/f2"], ["a/b", "a", "c"], str(mr)), qvm, "-")
+    assert not (mr / "a").exists() and not (mr / "c").exists()
+    assert (mr / "keep").read_text() == "k"        # untouched entry survives
+    qplan.run(qplan.plan_fbarrier([str(mr / "keep"), str(mr)]), qvm, "-")   # fsync
+    ok("qvm teardown+durability: unlink/rmdir deepest-first + fbarrier fsync")
+
 
 def main():
     tmp = Path(tempfile.mkdtemp())

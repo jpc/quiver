@@ -55,6 +55,7 @@ typedef struct { int64_t t0, t1, tid, op, buf, detail, epoch, off, aux; } TraceE
 enum {
     OP_ALLOC = 1, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA,
     OP_SPAWN, OP_JOIN, OP_INFLATE, OP_DEFLATE, OP_CALL,
+    OP_UNLINK, OP_RMDIR, OP_FBARRIER,     /* teardown + durability (mirror/sync) */
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -100,6 +101,7 @@ typedef struct Task {
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
        TK_MKDIR, TK_SETMETA, TK_INFLATE, TK_DEFLATE,
+       TK_UNLINK, TK_RMDIR, TK_FBARRIER,   /* teardown + durability */
        TK_BATCH_READY };   /* reader thread → scheduler: a CALL response arrived */
 
 #define QCAP 4096
@@ -218,6 +220,20 @@ static void run_task(Task *t){
                 {t->mtime_ns/1000000000, t->mtime_ns%1000000000}};
             if (utimensat(AT_FDCWD, t->path, ts, 0) < 0) t->res = -errno;
         }
+        break;
+    }
+    case TK_UNLINK:                       /* mirror/sync: drop an extraneous file */
+        if (unlink(t->path) < 0 && errno != ENOENT) t->res = -errno;
+        break;
+    case TK_RMDIR:                        /* remove a now-empty dir (deepest-first) */
+        if (rmdir(t->path) < 0 && errno != ENOENT) t->res = -errno;
+        break;
+    case TK_FBARRIER: {                   /* durability: fsync a path, or the archive */
+        int fd = t->path && t->path[0] ? open(t->path, O_RDONLY)
+                                       : (t->arch_fd >= 0 ? t->arch_fd : -1);
+        if (fd < 0) { t->res = -errno; break; }
+        if (fsync(fd) < 0) t->res = -errno;
+        if (t->path && t->path[0]) close(fd);        /* don't close the archive fd */
         break;
     }
     case TK_DEFLATE: {
@@ -555,11 +571,14 @@ static void run_thread(Sched *S, Thread *t){
             submit_mov(S, t, I);
             if (t->st == T_WAIT_IO) return;    /* async: wait for completion */
             break;                              /* sync (inline->buf): continue */
-        case OP_MKDIR: case OP_SETMETA: {
+        case OP_MKDIR: case OP_SETMETA:
+        case OP_UNLINK: case OP_RMDIR: case OP_FBARRIER: {
             Task *k = calloc(1, sizeof *k);
             k->tid = t->tid; k->epoch = t->epoch; k->path = I->path; k->op = I->op; k->buf_log = -1;
-            k->mode = I->mode; k->mtime_ns = I->mtime_ns;
-            k->kind = I->op==OP_MKDIR ? TK_MKDIR : TK_SETMETA;
+            k->mode = I->mode; k->mtime_ns = I->mtime_ns; k->arch_fd = S->arch_fd;
+            k->kind = I->op==OP_MKDIR ? TK_MKDIR : I->op==OP_SETMETA ? TK_SETMETA :
+                      I->op==OP_UNLINK ? TK_UNLINK : I->op==OP_RMDIR ? TK_RMDIR :
+                      TK_FBARRIER;
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
             return;
         }

@@ -29,7 +29,7 @@ from ..nock import zframe as _zf
 
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
- OP_INFLATE, OP_DEFLATE, OP_CALL) = range(1, 11)
+ OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER) = range(1, 14)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
@@ -152,6 +152,53 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
                         "lo": dbase, "cap": dbase + nd - 1}]
     root_df = pl.DataFrame(phase_rows)
     return _finalize([root_df, mkdir_df, mov, meta, dir_meta])
+
+
+# ------------------------------------------------------------- teardown / durability
+def plan_rm(files: list[str], dirs: list[str], root: str) -> pl.DataFrame:
+    """Remove a set of entries under `root`: unlink files (one thread each, all
+    parallel), then rmdir dirs DEEPEST-FIRST (a phase per depth, descending) so a
+    directory is empty before it is removed. This is the teardown tail of a
+    mirror/sync (ISA2 §5.1) — the dst entries not present in src."""
+    root = root.rstrip("/")
+    parts, phase_rows, sub, base = [], [], 0, 1
+    nf = len(files)
+    if nf:                                        # files: parallel unlink
+        parts.append(pl.DataFrame({
+            "tid": [base + i for i in range(nf)], "_sub": [0] * nf,
+            "op": [OP_UNLINK] * nf, "path": [f"{root}/{p}" for p in files]}))
+        phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN, "lo": base,
+                        "cap": base + nf - 1},
+                       {"tid": 0, "_sub": sub + 1, "op": OP_JOIN, "lo": base,
+                        "cap": base + nf - 1}]
+        sub += 2; base += nf
+    if dirs:                                      # dirs: rmdir deepest-first
+        byd: dict[int, list[str]] = {}
+        for d in dirs:
+            byd.setdefault(d.count("/"), []).append(d)
+        rows = []
+        for depth in sorted(byd, reverse=True):
+            lo = base
+            for d in byd[depth]:
+                rows.append({"tid": base, "_sub": 0, "op": OP_RMDIR,
+                             "path": f"{root}/{d}"}); base += 1
+            phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN, "lo": lo,
+                            "cap": base - 1},
+                           {"tid": 0, "_sub": sub + 1, "op": OP_JOIN, "lo": lo,
+                            "cap": base - 1}]
+            sub += 2
+        parts.append(pl.DataFrame(rows))
+    root_df = pl.DataFrame(phase_rows) if phase_rows else \
+        pl.DataFrame({"tid": [], "_sub": []})
+    return _finalize([root_df] + parts)
+
+
+def plan_fbarrier(paths: list[str]) -> pl.DataFrame:
+    """Emit an fsync durability barrier for each path (thread 0, in order). An
+    empty path "" fsyncs the output archive fd instead of a named file."""
+    rows = [{"tid": 0, "_sub": i, "op": OP_FBARRIER, "path": p}
+            for i, p in enumerate(paths)]
+    return _finalize([pl.DataFrame(rows)]) if rows else _empty_batch()
 
 
 # -------------------------------------------------------------- pack (uncompressed)
