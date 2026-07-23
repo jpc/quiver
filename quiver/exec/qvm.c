@@ -33,6 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
 
 /* ----------------------------------------------------------------- tracing  */
 /* When QVM_TRACE=<path> is set, every op is logged with monotonic start/end so
@@ -758,6 +759,65 @@ static uint8_t *read_framed(int fd, size_t *out){
     *out = len; return b;
 }
 
+/* ---------------------------------------------------- Arrow-emit (output) --
+ * qvm reads Arrow instruction batches; it now EMITS the footer completions as
+ * Arrow too (one serialization format both ways), via the compiler-generated
+ * template. Lifted from quiver-exec.c's output side. */
+struct WBuf { const void *p; int64_t len; };   /* p==NULL → empty validity */
+
+static int write_full(int fd, const void *p, size_t n){
+    const uint8_t *b = p;
+    while (n) { ssize_t r = write(fd, b, n);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        b += r; n -= (size_t)r; }
+    return 0;
+}
+static void emit_schema(int fd, const unsigned char *meta, int len){
+    uint32_t frame[2] = {0xFFFFFFFFu, (uint32_t)len};
+    if (write_full(fd, frame, 8) || write_full(fd, meta, (size_t)len)) { /* ignore */ }
+}
+static int emit_batch(int fd, const unsigned char *tmpl, int tmpl_len,
+                      int off_bodylen, int off_rblen,
+                      const int *node_off, int n_nodes,
+                      const int *buf_off, int n_bufs,
+                      int64_t n_rows, const struct WBuf *bufs){
+    uint8_t *meta = malloc((size_t)tmpl_len);
+    memcpy(meta, tmpl, (size_t)tmpl_len);
+    int64_t pos = 0, zero = 0;
+    for (int i = 0; i < n_bufs; i++) {
+        memcpy(meta + buf_off[i], &pos, 8);
+        memcpy(meta + buf_off[i] + 8, &bufs[i].len, 8);
+        pos += (bufs[i].len + 7) & ~7LL;
+    }
+    memcpy(meta + off_bodylen, &pos, 8);
+    memcpy(meta + off_rblen, &n_rows, 8);
+    for (int i = 0; i < n_nodes; i++) {
+        memcpy(meta + node_off[i], &n_rows, 8);
+        memcpy(meta + node_off[i] + 8, &zero, 8);
+    }
+    uint32_t fr[2] = {0xFFFFFFFFu, (uint32_t)tmpl_len};
+    static const uint8_t pad[8] = {0};
+    int rc = write_full(fd, fr, 8) || write_full(fd, meta, (size_t)tmpl_len);
+    for (int i = 0; !rc && i < n_bufs; i++)
+        if (bufs[i].len)
+            rc = write_full(fd, bufs[i].p, (size_t)bufs[i].len) ||
+                 write_full(fd, pad, (size_t)((-bufs[i].len) & 7));
+    free(meta);
+    return rc ? -1 : 0;
+}
+
+/* write the accumulated completions as one Arrow-IPC stream (schema+batch+EOS) */
+static void emit_completions(int fd, Sched *S){
+    emit_schema(fd, QCOMP_SCHEMA_META, QCOMP_SCHEMA_LEN);
+    struct WBuf b[QCOMP_N_BUFS] = {
+        {NULL,0},{S->cf, 8*(int64_t)S->ncomp}, {NULL,0},{S->cc, 8*(int64_t)S->ncomp},
+        {NULL,0},{S->cl, 8*(int64_t)S->ncomp}};
+    emit_batch(fd, QCOMP_BATCH_TMPL, QCOMP_TMPL_LEN, QCOMP_OFF_BODYLEN,
+               QCOMP_OFF_RBLEN, QCOMP_NODE_OFF, QCOMP_N_NODES,
+               QCOMP_BUF_OFF, QCOMP_N_BUFS, S->ncomp, b);
+    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(fd, eos, 8);
+}
+
 static uint8_t *read_all_fd(int fd, size_t *out){
     size_t cap = 1<<20, len = 0; uint8_t *b = malloc(cap);
     for (;;) {
@@ -812,17 +872,9 @@ int main(int argc, char **argv){
     qvm_batch(&out, &boot, 1);
     qvm_close(&out);
     int rc = out.failed;
-    if (strcmp(comp, "-") != 0) {               /* footer completions back */
+    if (strcmp(comp, "-") != 0) {               /* footer completions → Arrow */
         int cfd = open(comp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (cfd >= 0) {
-            uint32_t nc = (uint32_t)out.ncomp;
-            if (write(cfd, &nc, 4) != 4) rc = rc ? rc : -EIO;
-            for (int i = 0; i < out.ncomp; i++) {
-                int64_t row[3] = { out.cf[i], out.cc[i], out.cl[i] };
-                if (write(cfd, row, 24) != 24) rc = rc ? rc : -EIO;
-            }
-            close(cfd);
-        }
+        if (cfd >= 0) { emit_completions(cfd, &out); close(cfd); }
     }
     free(out.cf); free(out.cc); free(out.cl);
     if (arch_fd >= 0) close(arch_fd);

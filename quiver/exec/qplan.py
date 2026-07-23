@@ -700,10 +700,8 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
     with open(comp_path, "rb") as cf:
         raw = cf.read()
     os.unlink(comp_path)
-    (n,) = struct.unpack_from("<I", raw, 0)
-    a = np.frombuffer(raw, dtype="<i8", offset=4, count=3 * n).reshape(n, 3)
-    return pl.DataFrame({"frame": a[:, 0], "frame_coff": a[:, 1],
-                         "frame_clen": a[:, 2]})
+    comp = ipc.read_all(raw)                      # Arrow-IPC (frame, coff, clen)
+    return comp.rename({"coff": "frame_coff", "clen": "frame_clen"})
 
 
 def _empty_batch() -> pl.DataFrame:
