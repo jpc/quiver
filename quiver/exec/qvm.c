@@ -495,68 +495,91 @@ static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl){
     S->cf[S->ncomp] = f; S->cc[S->ncomp] = co; S->cl[S->ncomp] = cl; S->ncomp++;
 }
 
-static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
-                   int npool, int nworkers, Sched *out){
-    Sched S; memset(&S, 0, sizeof S);
-    S.arch_fd = arch_fd; S.npool = npool; S.failed = 0;
-    S.pool = calloc(npool, sizeof(BufSlot));
-    S.nsinks = nsinks;
-    S.sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
+/* Persistent scheduler: the pool, worker pool, sinks, completions and trace
+ * live across incrementally-fed instruction batches, so a buffer allocated in
+ * one batch survives into the next (the discovery→plan→execute feedback loop). */
+static pthread_t g_wt[64]; static int g_nworkers;
+
+static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
+                     int npool, int nworkers){
+    memset(S, 0, sizeof *S);
+    S->arch_fd = arch_fd; S->npool = npool;
+    S->pool = calloc(npool, sizeof(BufSlot));
+    S->nsinks = nsinks;
+    S->sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
     for (int i = 0; i < nsinks; i++) {
-        S.sinks[i].fd = sink_fds[i]; S.sinks[i].cursor = 0;
+        S->sinks[i].fd = sink_fds[i]; S->sinks[i].cursor = 0;
         struct stat st;                          /* pipe/socket → hold-through-write */
-        S.sinks[i].is_pipe = (fstat(sink_fds[i], &st) == 0
-                              && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)));
-        pthread_mutex_init(&S.sinks[i].mu, NULL);
+        S->sinks[i].is_pipe = (fstat(sink_fds[i], &st) == 0
+                               && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)));
+        pthread_mutex_init(&S->sinks[i].mu, NULL);
     }
-    tq_init(&S.tasks); tq_init(&S.comps);
-    build_threads(&S, ins, n);
-    const char *trp = getenv("QVM_TRACE");
-    if (trp) S.t_base = tr_now();
+    tq_init(&S->tasks); tq_init(&S->comps);
+    if (getenv("QVM_TRACE")) S->t_base = tr_now();
+    static Worker w; w.in = &S->tasks; w.out = &S->comps;
+    g_nworkers = nworkers;
+    for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
+}
 
-    pthread_t wt[64]; Worker w = { &S.tasks, &S.comps };
-    for (int k = 0; k < nworkers; k++) pthread_create(&wt[k], 0, worker_main, &w);
-
-    ready_push(&S, &S.th[0]);            /* only thread 0 starts */
+/* Run one batch's fiber tree to completion. The buffer pool persists, so this
+ * batch may reference buffers a prior batch allocated and left live. */
+static void qvm_batch(Sched *S, Instr *ins, int n){
+    build_threads(S, ins, n);            /* threads (tids) are per-batch */
+    S->ready_head = S->ready_tail = NULL; S->inflight = 0;
+    ready_push(S, &S->th[0]);            /* only thread 0 starts */
     for (;;) {
         Thread *t;
-        while ((t = ready_pop(&S))) run_thread(&S, t);
-        if (S.inflight == 0) break;
-        Task *k = tq_pop(&S.comps);      /* block for a completion */
-        S.inflight--;
-        if (k->res < 0 && !S.failed) S.failed = k->res;
+        while ((t = ready_pop(S))) run_thread(S, t);
+        if (S->inflight == 0) break;
+        Task *k = tq_pop(&S->comps);      /* block for a completion */
+        S->inflight--;
+        if (k->res < 0 && !S->failed) S->failed = k->res;
         if (k->kind == TK_DEFLATE && k->res == 0)
-            comp_add(&S, k->frame_id, k->coff, k->clen);
-        tr_log(&S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
+            comp_add(S, k->frame_id, k->coff, k->clen);
+        tr_log(S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
                k->kind == TK_DEFLATE ? k->clen : k->detail);
-        Thread *ct = &S.th[k->tid];
+        Thread *ct = &S->th[k->tid];
         if (ct->st == T_WAIT_IO) {                     /* resume at pc */
             ct->st = T_READY;   /* clear WAIT before running: a following sync
                                  * op (inline->buf) must not see stale WAIT_IO */
-            run_thread(&S, ct);
+            run_thread(S, ct);
         }
         free(k);
     }
-    S.tasks.stop = 1; pthread_cond_broadcast(&S.tasks.cv);
-    for (int k = 0; k < nworkers; k++) pthread_join(wt[k], 0);
-    if (trp) {                                   /* dump the trace */
+    free(S->th); S->th = NULL; S->nth = 0;
+}
+
+static void qvm_close(Sched *S){
+    S->tasks.stop = 1; pthread_cond_broadcast(&S->tasks.cv);
+    for (int k = 0; k < g_nworkers; k++) pthread_join(g_wt[k], 0);
+    const char *trp = getenv("QVM_TRACE");
+    if (trp && S->t_base) {                       /* dump the trace */
         int tf = open(trp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (tf >= 0) {
-            int64_t span = tr_now() - S.t_base; uint32_t nt = (uint32_t)S.ntr;
-            if (write(tf, &span, 8) != 8) S.failed = S.failed ? S.failed : -EIO;
-            if (write(tf, &nt, 4) != 4) S.failed = S.failed ? S.failed : -EIO;
-            if (S.ntr && write(tf, S.tr, (size_t)S.ntr * sizeof(TraceEv))
-                != (ssize_t)(S.ntr * sizeof(TraceEv)))
-                S.failed = S.failed ? S.failed : -EIO;
+            int64_t span = tr_now() - S->t_base; uint32_t nt = (uint32_t)S->ntr;
+            if (write(tf, &span, 8) != 8 || write(tf, &nt, 4) != 4)
+                S->failed = S->failed ? S->failed : -EIO;
+            if (S->ntr && write(tf, S->tr, (size_t)S->ntr * sizeof(TraceEv))
+                != (ssize_t)(S->ntr * sizeof(TraceEv)))
+                S->failed = S->failed ? S->failed : -EIO;
             close(tf);
         }
     }
-    free(S.tr);
+    free(S->tr);
+    for (int i = 0; i < S->npool; i++) free(S->pool[i].mem);
+    for (int i = 0; i < S->nsinks; i++) pthread_mutex_destroy(&S->sinks[i].mu);
+    free(S->pool); free(S->sinks);
+}
+
+/* single-batch wrapper (unit tests): open, one batch, close. */
+static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
+                   int npool, int nworkers, Sched *out){
+    Sched S;
+    qvm_open(&S, arch_fd, sink_fds, nsinks, npool, nworkers);
+    qvm_batch(&S, ins, n);
+    qvm_close(&S);
     int rc = S.failed;
-    for (int i = 0; i < npool; i++) free(S.pool[i].mem);
-    for (int i = 0; i < nsinks; i++) pthread_mutex_destroy(&S.sinks[i].mu);
-    free(S.pool); free(S.sinks); free(S.th);
-    if (out) *out = S;                   /* hand completions to the caller */
+    if (out) *out = S;
     else { free(S.cf); free(S.cc); free(S.cl); }
     return rc;
 }
@@ -676,6 +699,24 @@ static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
     return ins;
 }
 
+/* one framed instruction batch: [u32 len][len bytes]. NULL at clean EOF. */
+static uint8_t *read_framed(int fd, size_t *out){
+    uint32_t len;
+    ssize_t r = 0, got = 0;
+    while (got < 4) {                            /* the length prefix */
+        r = read(fd, (uint8_t *)&len + got, 4 - got);
+        if (r <= 0) return NULL;                 /* EOF before/at a boundary */
+        got += r;
+    }
+    uint8_t *b = malloc(len ? len : 1); size_t bg = 0;
+    while (bg < len) {
+        r = read(fd, b + bg, len - bg);
+        if (r <= 0) { free(b); return NULL; }
+        bg += r;
+    }
+    *out = len; return b;
+}
+
 static uint8_t *read_all_fd(int fd, size_t *out){
     size_t cap = 1<<20, len = 0; uint8_t *b = malloc(cap);
     for (;;) {
@@ -717,12 +758,18 @@ int main(int argc, char **argv){
         arch_fd = open(arch, O_RDWR | O_CREAT, 0644);
         if (arch_fd < 0) { perror("open arch"); return 2; }
     }
-    size_t sz; uint8_t *data = read_all_fd(0, &sz);
-    if (!data) { perror("read stdin"); return 2; }
-    int n; char *ap, *ad;
-    Instr *ins = qvm_decode_arrow(data, sz, &n, &ap, &ad);
     Sched out;
-    int rc = qvm_run(ins, n, arch_fd, sink_fds, nsinks, npool, nworkers, &out);
+    qvm_open(&out, arch_fd, sink_fds, nsinks, npool, nworkers);
+    size_t bsz; uint8_t *batch;                 /* incremental: one batch at a time */
+    while ((batch = read_framed(0, &bsz))) {
+        int n; char *ap, *ad;
+        Instr *ins = qvm_decode_arrow(batch, bsz, &n, &ap, &ad);
+        qvm_batch(&out, ins, n);
+        free(ins); free(ap); free(ad); free(batch);
+        if (out.failed) break;
+    }
+    qvm_close(&out);
+    int rc = out.failed;
     if (strcmp(comp, "-") != 0) {               /* footer completions back */
         int cfd = open(comp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (cfd >= 0) {
@@ -738,7 +785,7 @@ int main(int argc, char **argv){
     free(out.cf); free(out.cc); free(out.cl);
     if (arch_fd >= 0) close(arch_fd);
     for (int i = 0; i < nsinks; i++) close(sink_fds[i]);
-    free(sink_fds); free(ins); free(ap); free(ad); free(data);
+    free(sink_fds);
     if (rc < 0) { fprintf(stderr, "qvm: op failed: %d\n", rc); return 1; }
     return 0;
 }

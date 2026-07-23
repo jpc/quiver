@@ -1170,6 +1170,19 @@ def test_qvm(tmp):
         assert (tmp / "qvm_re_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm recompress: tar->nock multi-run gather from shared window (filter)")
 
+    # incremental instructions + Python feedback: pack in streamed chunks through
+    # ONE persistent qvm (scheduler + buffers survive across batches)
+    sst = wire.scan(str(src), "uring", 4)
+    stpath = str(tmp / "qvm_stream.nock")
+    nst = qplan.pack_stream(sst, str(src), stpath, qvm, chunk_rows=32,
+                            frame_bytes=16 << 10, npool=8)
+    stidx = _zf.read_index(stpath)
+    assert stidx["frame_coff"].null_count() == 0
+    qplan.unpack(stpath, str(tmp / "qvm_stream_x"), qvm, npool=8)
+    for pth in sst.filter(~pl.col("is_dir"))["path"]:
+        assert (tmp / "qvm_stream_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm streaming: incremental instruction batches, persistent scheduler")
+
     # compressed-source recompress: foreign .tar.zstd -> nock (decode-scan)
     import zstandard as _zstd
     tzst = str(tmp / "qvm_re.tar.zstd")

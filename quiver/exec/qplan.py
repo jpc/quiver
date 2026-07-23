@@ -163,7 +163,8 @@ def plan_pack_unc(scan: pl.DataFrame, root: str
 # -------------------------------------------------------------- pack (compressed)
 def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
               level: int = 6, npool: int = 16, predicate: pl.Expr | None = None,
-              shard_by: pl.Expr | None = None, shards: int = 1
+              shard_by: pl.Expr | None = None, shards: int = 1,
+              frame_base: int = 0
               ) -> tuple[pl.DataFrame, pl.DataFrame, int]:
     """fs -> compressed nock. Each frame is a thread that assembles [header|body]
     per member into a zeroed buffer and deflates it to its sink. `predicate`
@@ -222,13 +223,49 @@ def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
     deflate = frames.select(tid=ftid, _sub=pl.lit(_BIG), op=pl.lit(OP_DEFLATE),
                             buf_id=pl.col("bufid"), buf_off=pl.lit(0),
                             len=pl.col("dl"), sink=pl.col("sink"),
-                            level=pl.lit(level), frame_id=pl.col("frame"))
+                            level=pl.lit(level),
+                            frame_id=pl.col("frame") + frame_base)  # global id
     free = frames.select(tid=ftid, _sub=pl.lit(_BIG + 1), op=pl.lit(OP_FREE),
                          buf_id=pl.col("bufid"))
     instr = _finalize([root_df, alloc, hdr, body, deflate, free])
     members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
-                        "frame", "in_off", "sink")
+                        frame=pl.col("frame") + frame_base, in_off="in_off",
+                        sink="sink")
     return instr, members, (shards if shard_by is not None else 1)
+
+
+def pack_stream(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
+                chunk_rows: int = 64, frame_bytes: int = 1 << 20, level: int = 6,
+                npool: int = 16, nworkers: int = 8) -> int:
+    """Streaming pack with Python feedback: scan is split into chunks, each
+    planned into its own instruction batch (frame ids offset by a running base)
+    and STREAMED to the one persistent qvm — batch k+1 is planned while qvm packs
+    batch k. The generator plans lazily, so discovery/planning overlaps
+    execution. Completions accumulate; one footer at the end. Member count."""
+    files = scan.filter(~pl.col("is_dir")).sort("path")
+    collected: list[pl.DataFrame] = []
+
+    def batches():
+        base = 0
+        for i in range(0, files.height, chunk_rows):
+            sub = files.slice(i, chunk_rows)
+            instr, members, _ = plan_pack(sub, root, frame_bytes, level, npool,
+                                          frame_base=base)
+            collected.append(members)
+            base = int(members["frame"].max()) + 1 if members.height else base
+            yield instr
+
+    open(out_path, "wb").close()
+    comp = run_stream(batches(), qvm_exe, "-", sinks=(out_path,), npool=npool,
+                      nworkers=nworkers, want_comp=True)
+    members = (pl.concat(collected) if collected
+               else pl.DataFrame(schema={"frame": pl.Int64}))
+    footer = (members.join(comp, on="frame", how="left")
+                     .select([c for c, _ in _zf._FOOTER_IPC]))
+    ftmp = tempfile.TemporaryFile()
+    ipc.write_all(ftmp, footer)
+    _zf._write_footer(out_path, ftmp, False); ftmp.close()
+    return footer.height
 
 
 def pack_pipe(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
@@ -499,7 +536,18 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
     """Encode and drive the C `qvm` executor. `sinks` are deflate output files;
     `want_comp` collects the {frame, coff, clen} completions (via a temp fd) and
     returns them as a DataFrame."""
-    data = encode_stream(instr)
+    return run_stream([instr], qvm_exe, arch_path, sinks, npool, nworkers,
+                      want_comp)
+
+
+def run_stream(batches, qvm_exe: str, arch_path: str = "-",
+               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
+               want_comp: bool = False):
+    """Drive qvm with an INCREMENTAL stream of instruction batches (each a
+    length-framed Arrow batch: [u32 len][bytes]). qvm's scheduler is persistent
+    — buffers a batch allocates survive into later batches — so `batches` may be
+    a lazy generator that plans the next batch while qvm runs the current one
+    (the Python-feedback loop). Completions accumulate across batches."""
     comp_path = "-"
     if want_comp:
         fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
@@ -507,7 +555,13 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
             *sinks]
     pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # inherited pipes
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds)
-    p.stdin.write(data); p.stdin.close()
+    try:
+        for instr in batches:
+            data = encode_stream(instr)
+            p.stdin.write(struct.pack("<I", len(data)) + data)
+            p.stdin.flush()
+    finally:
+        p.stdin.close()
     rc = p.wait()
     if rc != 0:
         if want_comp:
