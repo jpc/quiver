@@ -93,7 +93,7 @@ typedef struct Task {
     Sink    *sink; int level; int64_t frame_id, coff, clen;  /* codec/sink */
     int      res;
     int      op; int64_t buf_log, detail; int64_t wt0, wt1;   /* trace */
-    int      epoch; struct Task *dnext;  /* owning batch; deferred-queue link */
+    int      epoch;              /* owning batch */
 } Task;
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
@@ -320,18 +320,28 @@ typedef struct BufSlot {
 } BufSlot;
 
 /* --------------------------------------------------------------- threads    */
+/* Every thread belongs to a BATCH (epoch). All batches' threads live in ONE
+ * scheduler and one ready queue, so a prefetch loader in an outer batch and the
+ * gather in a CALL-returned batch run fully concurrently. A thread is identified
+ * by (epoch, tid). */
 typedef struct Thread {
-    uint32_t tid;
+    uint32_t tid; int epoch;
     Instr *prog; int nprog, pc;
-    enum { T_INERT, T_READY, T_WAIT_IO, T_WAIT_JOIN, T_WAIT_ALLOC, T_DONE } st;
+    enum { T_INERT, T_READY, T_WAIT_IO, T_WAIT_JOIN, T_WAIT_ALLOC,
+           T_WAIT_CALL, T_DONE } st;
     int64_t join_lo, join_hi;    /* range this thread is joining on */
     int      last_res;
     struct Thread *wnext;        /* buffer-waiter list link */
     struct Thread *rnext;        /* ready-queue link */
 } Thread;
 
+/* a batch = a thread set + a completion count; when it finishes it wakes the
+ * fiber that CALLed it (its waiter) and frees the instruction memory it owns. */
+typedef struct { Thread *th; int nth, ndone; int wep, wtid, hasw;
+                 void *pm, *ap, *ad, *raw; } Batch;
+
 typedef struct {
-    Thread *th; int nth;         /* threads indexed by tid */
+    Batch *bat; int nbat, batcap; int cur_epoch;   /* batch registry */
     BufSlot *pool; int npool;
     int arch_fd;
     Sink *sinks; int nsinks;
@@ -342,8 +352,8 @@ typedef struct {
     int64_t *cf, *cc, *cl; int ncomp, ccap;   /* footer completions: frame,coff,clen */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
-    int batch_epoch, epoch_next; /* per-batch id (nested CALL batches distinct) */
-    Task *deferred;              /* completions for a suspended (outer) batch */
+    int pend_ep, pend_tid, has_pend;   /* a CALL waiting for its response batch */
+    int64_t pend_t0, pend_cid;
 #ifdef QVM_URING
     int use_uring, qd; TQ ring_tasks; pthread_t ring_th; struct io_uring ring;
 #endif
@@ -405,15 +415,13 @@ static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
     if (S->ntr == S->trcap) { S->trcap = S->trcap ? S->trcap*2 : 1024;
         S->tr = realloc(S->tr, S->trcap * sizeof(TraceEv)); }
     S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
-                                 tid, op, buf, detail, S->batch_epoch };
+                                 tid, op, buf, detail, S->cur_epoch };
 }
 
-/* forward decls: OP_CALL runs a returned batch nested (see run_thread) */
-static void run_batch_loop(Sched *S);
-static void build_threads(Sched *S, Instr *ins, int n);
 static uint8_t *read_framed(int fd, size_t *out);
 static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
                                char **ap, char **ad);
+static Thread *TH(Sched *S, int ep, int tid){ return &S->bat[ep].th[tid]; }
 
 static void ready_push(Sched *S, Thread *t){
     t->st = T_READY; t->rnext = NULL;
@@ -444,17 +452,25 @@ static void pool_free(Sched *S, int id){
     while (w) { Thread *n = w->wnext; ready_push(S, w); w = n; }
 }
 
-/* mark thread done; wake any join-waiters whose range is now fully done */
-static int range_done(Sched *S, int64_t lo, int64_t hi){
-    for (int64_t i = lo; i <= hi; i++) if (S->th[i].st != T_DONE) return 0;
+/* join range is within the thread's own batch (epoch ep) */
+static int range_done(Sched *S, int ep, int64_t lo, int64_t hi){
+    for (int64_t i = lo; i <= hi; i++) if (S->bat[ep].th[i].st != T_DONE) return 0;
     return 1;
 }
 static void thread_done(Sched *S, Thread *t){
     t->st = T_DONE;
-    for (int i = 0; i < S->nth; i++) {
-        Thread *w = &S->th[i];
-        if (w->st == T_WAIT_JOIN && range_done(S, w->join_lo, w->join_hi))
+    int ep = t->epoch;
+    Batch *b = &S->bat[ep];
+    for (int i = 0; i < b->nth; i++) {           /* wake same-batch join-waiters */
+        Thread *w = &b->th[i];
+        if (w->st == T_WAIT_JOIN && range_done(S, ep, w->join_lo, w->join_hi))
             { w->pc++; ready_push(S, w); }
+    }
+    if (++b->ndone == b->nth) {                  /* batch complete → wake its CALLer */
+        if (b->hasw) { Thread *w = TH(S, b->wep, b->wtid); w->pc++; ready_push(S, w); }
+        free(b->th); b->th = NULL;               /* batch retired: free its memory */
+        free(b->pm); free(b->ap); free(b->ad); free(b->raw);
+        b->pm = b->ap = b->ad = b->raw = NULL;
     }
 }
 
@@ -469,7 +485,7 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
         t->pc++; return;
     }
     Task *k = calloc(1, sizeof *k);
-    k->tid = t->tid; k->epoch = S->batch_epoch; k->arch_fd = S->arch_fd;
+    k->tid = t->tid; k->epoch = t->epoch; k->arch_fd = S->arch_fd;
     k->op = I->op; k->buf_log = I->buf_id;
     k->detail = I->len ? I->len : (int64_t)I->payload_len;
     k->path = I->path; k->dpath = I->dpath;
@@ -496,6 +512,7 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
 
 /* run a thread from pc until it suspends (task in flight / parked) or finishes */
 static void run_thread(Sched *S, Thread *t){
+    S->cur_epoch = t->epoch;                      /* for tr_log */
     while (t->pc < t->nprog) {
         Instr *I = &t->prog[t->pc];
         switch (I->op) {
@@ -514,7 +531,7 @@ static void run_thread(Sched *S, Thread *t){
             break;                              /* sync (inline->buf): continue */
         case OP_MKDIR: case OP_SETMETA: {
             Task *k = calloc(1, sizeof *k);
-            k->tid = t->tid; k->epoch = S->batch_epoch; k->path = I->path; k->op = I->op; k->buf_log = -1;
+            k->tid = t->tid; k->epoch = t->epoch; k->path = I->path; k->op = I->op; k->buf_log = -1;
             k->mode = I->mode; k->mtime_ns = I->mtime_ns;
             k->kind = I->op==OP_MKDIR ? TK_MKDIR : TK_SETMETA;
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
@@ -522,7 +539,7 @@ static void run_thread(Sched *S, Thread *t){
         }
         case OP_INFLATE: case OP_DEFLATE: {
             Task *k = calloc(1, sizeof *k);
-            k->tid = t->tid; k->epoch = S->batch_epoch; k->arch_fd = S->arch_fd;
+            k->tid = t->tid; k->epoch = t->epoch; k->arch_fd = S->arch_fd;
             k->op = I->op; k->buf_log = I->buf_id; k->detail = I->len;
             k->buf = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
             k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
@@ -534,69 +551,58 @@ static void run_thread(Sched *S, Thread *t){
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
             return;
         }
-        case OP_SPAWN:
+        case OP_SPAWN: {
             tr_log(S, tr_now(), tr_now(), t->tid, OP_SPAWN, I->lo, I->cap);
+            Batch *B = &S->bat[t->epoch];
             for (int64_t i = I->lo; i <= I->cap; i++)
-                if (S->th[i].st == T_INERT) ready_push(S, &S->th[i]);
+                if (B->th[i].st == T_INERT) ready_push(S, &B->th[i]);
             t->pc++; break;
+        }
         case OP_JOIN:
-            if (range_done(S, I->lo, I->cap)) { t->pc++; break; }
+            if (range_done(S, t->epoch, I->lo, I->cap)) { t->pc++; break; }
             tr_log(S, tr_now(), tr_now(), t->tid, OP_JOIN, I->lo, I->cap);
             t->join_lo = I->lo; t->join_hi = I->cap; t->st = T_WAIT_JOIN;
             return;
-        case OP_CALL: {
-            /* call into Python (emit frame_id as the call id), read the returned
-             * instruction batch, and run it NESTED — its threads share the pool,
-             * so they use whatever buffers THIS fiber holds (e.g. a decode
-             * window). When the nested batch joins, we resume and free them: the
-             * window's lifetime is exactly this fiber's scope. Requires the
-             * fiber's own batch to be quiescent here (no other in-flight ops),
-             * which the single-fiber window driver satisfies. */
-            int64_t cid = I->frame_id;
-            int64_t ct0 = tr_now();                      /* qvm blocks in Python… */
-            if (S->call_fd >= 0 && write(S->call_fd, &cid, 8) != 8)
-                { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
-            size_t blen; uint8_t *b = read_framed(0, &blen);
-            tr_log(S, ct0, tr_now(), t->tid, OP_CALL, cid, 0);  /* …span = Python time */
-            if (!b) { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
-            int nn; char *nap, *nad;
-            Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
-            Thread *sth = S->th; int snth = S->nth;      /* save caller's batch */
-            Thread *srh = S->ready_head, *srt = S->ready_tail; int sinf = S->inflight;
-            int sepoch = S->batch_epoch;
-            S->th = NULL; S->nth = 0;
-            S->ready_head = S->ready_tail = NULL; S->inflight = 0;
-            build_threads(S, nins, nn);
-            ready_push(S, &S->th[0]);
-            run_batch_loop(S);                           /* run to completion */
-            free(S->th);
-            S->th = sth; S->nth = snth;                  /* restore */
-            S->ready_head = srh; S->ready_tail = srt; S->inflight = sinf;
-            S->batch_epoch = sepoch;
-            free(nins); free(nap); free(nad); free(b);
-            t->pc++; break;
-        }
+        case OP_CALL:
+            /* Call into Python: emit the call id and SUSPEND. The scheduler
+             * (run_sched) reads the response batch, adds its threads, and wakes
+             * us when it completes. We do NOT run it nested — so anything this
+             * fiber already spawned (a prefetch loader) keeps running
+             * CONCURRENTLY with the returned batch. pc advances on wake. */
+            S->pend_t0 = tr_now(); S->pend_cid = I->frame_id;
+            if (S->call_fd < 0 || write(S->call_fd, &I->frame_id, 8) != 8) {
+                S->failed = S->failed ? S->failed : -EIO; t->pc++; break;
+            }
+            S->pend_ep = t->epoch; S->pend_tid = t->tid; S->has_pend = 1;
+            t->st = T_WAIT_CALL;
+            return;
         default: t->pc++; break;
         }
     }
     thread_done(S, t);
 }
 
-/* group a flat, tid-sorted Instr array into per-thread programs */
-static void build_threads(Sched *S, Instr *ins, int n){
-    S->batch_epoch = S->epoch_next++;            /* a fresh id for this batch */
+/* register a new batch (epoch) from a flat, tid-sorted Instr array; returns the
+ * epoch. Threads are per-batch, so tids never collide across concurrent batches. */
+static int build_batch(Sched *S, Instr *ins, int n){
+    if (S->nbat == S->batcap) { S->batcap = S->batcap ? S->batcap*2 : 16;
+        S->bat = realloc(S->bat, S->batcap * sizeof(Batch)); }
+    int ep = S->nbat++;
+    Batch *B = &S->bat[ep]; memset(B, 0, sizeof *B);
     int maxtid = 0;
     for (int i = 0; i < n; i++) if ((int)ins[i].tid > maxtid) maxtid = ins[i].tid;
-    S->nth = maxtid + 1;
-    S->th = calloc(S->nth, sizeof(Thread));
-    for (int i = 0; i < S->nth; i++) { S->th[i].tid = i; S->th[i].st = T_INERT; }
+    B->nth = maxtid + 1;
+    B->th = calloc(B->nth, sizeof(Thread));
+    for (int i = 0; i < B->nth; i++) {
+        B->th[i].tid = i; B->th[i].epoch = ep; B->th[i].st = T_INERT; }
     int i = 0;
     while (i < n) {
         uint32_t tid = ins[i].tid; int j = i;
         while (j < n && ins[j].tid == tid) j++;
-        S->th[tid].prog = &ins[i]; S->th[tid].nprog = j - i;
+        B->th[tid].prog = &ins[i]; B->th[tid].nprog = j - i;
         i = j;
     }
+    return ep;
 }
 
 /* deflate completions accumulate here for the footer; qvm_run returns them so
@@ -644,47 +650,47 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
 }
 
-/* drive the current thread set (S->th) until it is fully drained. A completion
- * for a SUSPENDED outer batch (its epoch != ours — its fiber is mid-CALL with
- * in-flight work, e.g. a prefetch loader) is stashed on S->deferred and reaped
- * when that batch resumes; only this batch's completions advance us. */
-static void run_batch_loop(Sched *S){
+/* THE scheduler loop — one loop over ALL batches' threads. Drain the ready
+ * queue, then: if a CALL is pending, read its response batch from Python and add
+ * its threads (the in-flight prefetch loader keeps running on the workers DURING
+ * this blocking read — that is the overlap); otherwise reap a completion and
+ * resume its thread. Runs until nothing is ready, pending, or in flight. */
+static void run_sched(Sched *S){
     for (;;) {
         Thread *t;
         while ((t = ready_pop(S))) run_thread(S, t);
-        if (S->inflight == 0) break;
-        Task *k = NULL;
-        for (Task **pp = &S->deferred; *pp; pp = &(*pp)->dnext)   /* ours, deferred? */
-            if ((*pp)->epoch == S->batch_epoch) { k = *pp; *pp = k->dnext; break; }
-        while (!k) {
-            Task *c = tq_pop(&S->comps);  /* block for a completion */
-            if (c->epoch == S->batch_epoch) k = c;
-            else { c->dnext = S->deferred; S->deferred = c; }     /* an outer batch's */
+        if (S->has_pend) {                           /* fetch the CALL response */
+            size_t blen; uint8_t *b = read_framed(0, &blen);
+            S->cur_epoch = S->pend_ep;
+            tr_log(S, S->pend_t0, tr_now(), S->pend_tid, OP_CALL, S->pend_cid, 0);
+            S->has_pend = 0;
+            if (!b) { S->failed = S->failed ? S->failed : -EIO; break; }
+            int nn; char *nap, *nad;
+            Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
+            int ne = build_batch(S, nins, nn);        /* threads of the new batch */
+            Batch *B = &S->bat[ne];
+            B->wep = S->pend_ep; B->wtid = S->pend_tid; B->hasw = 1;
+            B->pm = nins; B->ap = nap; B->ad = nad; B->raw = b;   /* freed at retire */
+            ready_push(S, &B->th[0]);
+            continue;
         }
+        if (S->inflight == 0) break;
+        Task *k = tq_pop(&S->comps);                  /* block for a completion */
         S->inflight--;
         if (k->res < 0 && !S->failed) S->failed = k->res;
         if (k->kind == TK_DEFLATE && k->res == 0)
             comp_add(S, k->frame_id, k->coff, k->clen);
+        S->cur_epoch = k->epoch;
         tr_log(S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
                k->kind == TK_DEFLATE ? k->clen : k->detail);
-        Thread *ct = &S->th[k->tid];
+        Thread *ct = TH(S, k->epoch, k->tid);
         if (ct->st == T_WAIT_IO) {                     /* resume at pc */
-            ct->st = T_READY;   /* clear WAIT before running: a following sync
-                                 * op (inline->buf) must not see stale WAIT_IO */
+            ct->st = T_READY;   /* clear WAIT: a following sync op (inline->buf)
+                                 * must not see stale WAIT_IO */
             run_thread(S, ct);
         }
         free(k);
     }
-}
-
-/* Run one batch's fiber tree to completion. The buffer pool persists, so this
- * batch may reference buffers a prior batch allocated and left live. */
-static void qvm_batch(Sched *S, Instr *ins, int n){
-    build_threads(S, ins, n);            /* threads (tids) are per-batch */
-    S->ready_head = S->ready_tail = NULL; S->inflight = 0;
-    ready_push(S, &S->th[0]);            /* only thread 0 starts */
-    run_batch_loop(S);
-    free(S->th); S->th = NULL; S->nth = 0;
 }
 
 static void qvm_close(Sched *S){
@@ -713,7 +719,11 @@ static void qvm_close(Sched *S){
     free(S->tr);
     for (int i = 0; i < S->npool; i++) free(S->pool[i].mem);
     for (int i = 0; i < S->nsinks; i++) pthread_mutex_destroy(&S->sinks[i].mu);
-    free(S->pool); free(S->sinks);
+    for (int i = 0; i < S->nbat; i++) {          /* any un-retired batch memory */
+        free(S->bat[i].th); free(S->bat[i].pm);
+        free(S->bat[i].ap); free(S->bat[i].ad); free(S->bat[i].raw);
+    }
+    free(S->bat); free(S->pool); free(S->sinks);
 }
 
 /* single-batch wrapper (unit tests): open, one batch, close. */
@@ -721,7 +731,9 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int *sink_fds, int nsinks,
                    int npool, int nworkers, Sched *out){
     Sched S;
     qvm_open(&S, arch_fd, sink_fds, nsinks, npool, nworkers, -1);
-    qvm_batch(&S, ins, n);
+    int ep = build_batch(&S, ins, n);            /* one batch, no CALL */
+    ready_push(&S, &S.bat[ep].th[0]);
+    run_sched(&S);
     qvm_close(&S);
     int rc = S.failed;
     if (out) *out = S;
@@ -972,7 +984,9 @@ int main(int argc, char **argv){
     Instr boot; memset(&boot, 0, sizeof boot);
     boot.op = OP_CALL; boot.frame_id = -1; boot.buf_id = -1;
     boot.path = ""; boot.dpath = "";
-    qvm_batch(&out, &boot, 1);
+    int ep = build_batch(&out, &boot, 1);        /* bootstrap: one CALL(-1) */
+    ready_push(&out, &out.bat[ep].th[0]);
+    run_sched(&out);
     qvm_close(&out);
     int rc = out.failed;
     if (strcmp(comp, "-") != 0) {               /* footer completions → Arrow */
