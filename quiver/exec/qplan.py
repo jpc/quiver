@@ -14,13 +14,14 @@ inflate/deflate + the sink lock (compressed pack/unpack/recompress) come next.
 """
 from __future__ import annotations
 
+import io
 import os
-import struct
 import subprocess
-import tarfile
 
-import numpy as np
 import polars as pl
+
+from .. import ipc
+from ..nock.format import TarFormat, plan_layout
 
 # opcodes — mirror qvm.c
 OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN = range(1, 8)
@@ -49,7 +50,9 @@ def _finalize(parts: list[pl.DataFrame]) -> pl.DataFrame:
     df = df.with_columns(
         *[pl.col(c).fill_null(v) for c, v in _DEFAULTS.items() if c in df.columns],
         *[pl.lit(v).alias(c) for c, v in _DEFAULTS.items() if c not in df.columns])
-    return df.select(*[pl.col(c).cast(t) for c, t in INSTR_COLS.items()])
+    # rechunk so the stream serialises as ONE Arrow record batch (the C reader
+    # takes the first batch); column order = INSTR_COLS drives the buffer map.
+    return df.select(*[pl.col(c).cast(t) for c, t in INSTR_COLS.items()]).rechunk()
 
 
 def _ancestors(rel: str):
@@ -98,86 +101,43 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
 def plan_pack_unc(scan: pl.DataFrame, root: str
                   ) -> tuple[pl.DataFrame, pl.DataFrame, int]:
     """fs -> uncompressed tar: lay each member as [512-aligned PAX header |
-    padded body] at a planner-computed offset, header via inline->arch, body via
-    copy_file_range fs->arch. Returns (instr_df, footer_df, archive_size)."""
-    files = scan.filter(~pl.col("is_dir")).sort("path")
-    rows = files.to_dicts()
-    headers, hoff, boff = [], [], []
-    cursor = 0
-    for r in rows:
-        ti = tarfile.TarInfo(r["path"])
-        ti.size = r["size"]; ti.mode = r["mode"] & 0o7777
-        ti.mtime = r["mtime_ns"] // 1_000_000_000
-        ti.uid = r.get("uid", 0) or 0; ti.gid = r.get("gid", 0) or 0
-        h = ti.tobuf(format=tarfile.PAX_FORMAT)
-        headers.append(h)
-        hoff.append(cursor); boff.append(cursor + len(h))
-        cursor += len(h) + ((r["size"] + 511) // 512) * 512
-    n = len(rows)
+    padded body] via inline->arch header + copy_file_range fs->arch body. Header
+    bytes and offsets come from the vectorized layout planner (nock.format —
+    ustar/PAX as Polars exprs, offsets a cum_sum): NO per-member Python loop.
+    Returns (instr_df, footer_df, archive_size)."""
+    plan = plan_layout(scan.lazy(), TarFormat(), sort=True).with_row_index("_k")
+    n = plan.height
+    total = int(plan["offset"][-1] + plan["block_len"][-1]) if n else 0
+    tid = pl.col("_k") + 1
 
     root_df = pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": n},
         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": n}])
-
-    tids = pl.arange(1, n + 1, eager=True, dtype=pl.Int64)
-    hdr = pl.DataFrame({
-        "tid": tids, "_sub": pl.zeros(n, pl.Int64, eager=True),
-        "op": pl.repeat(OP_MOV, n, eager=True),
-        "src": pl.repeat(E_INLINE, n, eager=True), "dst": pl.repeat(E_ARCH, n, eager=True),
-        "arch_off": pl.Series(hoff, dtype=pl.Int64),
-        "payload": pl.Series(headers, dtype=pl.Binary)})
-    bpaths = [root.rstrip("/") + "/" + r["path"] for r in rows]
-    body = pl.DataFrame({
-        "tid": tids, "_sub": pl.ones(n, pl.Int64, eager=True),
-        "op": pl.repeat(OP_MOV, n, eager=True),
-        "src": pl.repeat(E_FS, n, eager=True), "dst": pl.repeat(E_ARCH, n, eager=True),
-        "arch_off": pl.Series(boff, dtype=pl.Int64),
-        "path": pl.Series(bpaths),
-        "len": pl.Series([r["size"] for r in rows], dtype=pl.Int64)})
+    hdr = plan.select(                                 # inline PAX header -> arch
+        tid=tid, _sub=pl.lit(0), op=pl.lit(OP_MOV),
+        src=pl.lit(E_INLINE), dst=pl.lit(E_ARCH),
+        arch_off=pl.col("offset"), payload=pl.col("header"))
+    body = plan.select(                                # copy_file_range body -> arch
+        tid=tid, _sub=pl.lit(1), op=pl.lit(OP_MOV),
+        src=pl.lit(E_FS), dst=pl.lit(E_ARCH),
+        arch_off=pl.col("data_offset"),
+        path=pl.lit(root.rstrip("/") + "/") + pl.col("path"), len=pl.col("size"))
     instr = _finalize([root_df, hdr, body])
 
-    footer = pl.DataFrame({
-        "path": files["path"], "size": files["size"], "mode": files["mode"],
-        "mtime_ns": files["mtime_ns"],
-        "data_offset": pl.Series(boff, dtype=pl.Int64),
-        "read_size": files["size"]})
-    return instr, footer, cursor
+    footer = plan.select("path", "size", "mode", "mtime_ns", "data_offset",
+                         read_size=pl.col("size"))
+    return instr, footer, total
 
 
 # ------------------------------------------------------------------- encoding
-_REC = np.dtype([
-    ("tid", "<u4"), ("op", "u1"), ("src", "u1"), ("dst", "u1"), ("pad", "u1"),
-    ("buf_id", "<i4"), ("mode", "<i4"),
-    ("buf_off", "<i8"), ("len", "<i8"), ("cap", "<i8"), ("lo", "<i8"),
-    ("arch_off", "<i8"), ("mtime_ns", "<i8"),
-    ("path_off", "<u4"), ("path_len", "<u4"),
-    ("dpath_off", "<u4"), ("dpath_len", "<u4"),
-    ("payload_off", "<u4"), ("payload_len", "<u4")])
-assert _REC.itemsize == 88
-
-
 def encode_stream(instr: pl.DataFrame) -> bytes:
-    """Serialise to [u32 N][u64 heap_len][N×88-byte records][heap]. Var-length
-    path/dpath/payload live in the heap (each \\0-terminated so C can point in
-    for strings); records carry (offset,len) into it."""
-    n = instr.height
-    a = np.zeros(n, dtype=_REC)
-    for f in ("tid", "op", "src", "dst", "buf_id", "buf_off", "len", "cap",
-              "lo", "arch_off", "mode", "mtime_ns"):
-        a[f] = instr[f].to_numpy()
-    heap = bytearray()
-
-    def put(b: bytes):
-        off = len(heap); heap.extend(b); heap.append(0); return off, len(b)
-
-    paths = instr["path"].to_list()
-    dpaths = instr["dpath"].to_list()
-    payloads = instr["payload"].to_list()
-    for i in range(n):
-        a["path_off"][i], a["path_len"][i] = put((paths[i] or "").encode())
-        a["dpath_off"][i], a["dpath_len"][i] = put((dpaths[i] or "").encode())
-        a["payload_off"][i], a["payload_len"][i] = put(payloads[i] or b"")
-    return struct.pack("<IQ", n, len(heap)) + a.tobytes() + bytes(heap)
+    """The instruction stream IS an Arrow-IPC batch — one serialization path
+    with the rest of the system (quiver.ipc, compat=oldest so the C reader gets
+    large_utf8/large_binary + i64 offsets), produced vectorized by Polars. No
+    hand-rolled encoding: the 'heap' is Arrow's own string/binary data buffer."""
+    buf = io.BytesIO()
+    ipc.write_all(buf, instr)
+    return buf.getvalue()
 
 
 def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",

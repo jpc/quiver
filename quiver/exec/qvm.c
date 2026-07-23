@@ -374,40 +374,114 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int npool, int nworkers){
     return rc;
 }
 
-/* ----------------------------------------------------- wire decode + CLI    */
-/* Matches quiver/exec/qplan.py _REC (packed, little-endian, 88 bytes). */
-typedef struct __attribute__((packed)) {
-    uint32_t tid; uint8_t op, src, dst, pad;
-    int32_t buf_id, mode;
-    int64_t buf_off, len, cap, lo, arch_off, mtime_ns;
-    uint32_t path_off, path_len, dpath_off, dpath_len, payload_off, payload_len;
-} Rec;
+/* ----------------------------------------------------- Arrow decode + CLI   */
+/* The instruction stream is an Arrow-IPC batch (quiver.ipc, compat=oldest) —
+ * one serialization path with the rest of the system, produced vectorized by
+ * Polars. We read the columns straight out of the batch buffers. Minimal
+ * flatbuffer navigation, mirroring quiver-exec.c's input side. */
+static uint16_t fb_u16(const uint8_t *b, int64_t o){ uint16_t v; memcpy(&v,b+o,2); return v; }
+static int32_t  fb_i32(const uint8_t *b, int64_t o){ int32_t v;  memcpy(&v,b+o,4); return v; }
+static uint32_t fb_u32(const uint8_t *b, int64_t o){ uint32_t v; memcpy(&v,b+o,4); return v; }
+static int64_t  fb_i64(const uint8_t *b, int64_t o){ int64_t v;  memcpy(&v,b+o,8); return v; }
+static int64_t  fb_root(const uint8_t *b){ return fb_u32(b,0); }
+static int64_t fb_field(const uint8_t *b, int64_t table, int id){
+    int64_t vt = table - fb_i32(b, table);
+    int slot = 4 + 2*id;
+    if (slot >= fb_u16(b, vt)) return -1;
+    uint16_t voff = fb_u16(b, vt + slot);
+    return voff ? table + voff : -1;
+}
+static int64_t fb_offset_field(const uint8_t *b, int64_t table, int id){
+    int64_t p = fb_field(b, table, id);
+    return p < 0 ? -1 : p + fb_u32(b, p);
+}
 
-/* Decode [u32 N][u64 heap_len][N×Rec][heap] into an Instr array. Strings point
- * straight into the (retained) heap, which is \0-terminated per entry. */
-static Instr *qvm_decode(const uint8_t *data, size_t sz, int *n_out,
-                         uint8_t **heap_out){
-    if (sz < 12) return NULL;
-    uint32_t n; uint64_t hlen;
-    memcpy(&n, data, 4); memcpy(&hlen, data + 4, 8);
-    const Rec *rec = (const Rec *)(data + 12);
-    if (sz < 12 + (size_t)n * sizeof(Rec) + hlen) return NULL;
-    const uint8_t *heap = data + 12 + (size_t)n * sizeof(Rec);
-    uint8_t *hcopy = malloc(hlen ? hlen : 1);
-    memcpy(hcopy, heap, hlen);
-    Instr *ins = calloc(n ? n : 1, sizeof(Instr));
-    for (uint32_t i = 0; i < n; i++) {
-        const Rec *r = &rec[i]; Instr *I = &ins[i];
-        I->tid = r->tid; I->op = r->op; I->src = r->src; I->dst = r->dst;
-        I->buf_id = r->buf_id; I->mode = r->mode;
-        I->buf_off = r->buf_off; I->len = r->len; I->cap = r->cap;
-        I->lo = r->lo; I->arch_off = r->arch_off; I->mtime_ns = r->mtime_ns;
-        I->path    = r->path_len    ? (const char *)(hcopy + r->path_off)  : "";
-        I->dpath   = r->dpath_len   ? (const char *)(hcopy + r->dpath_off) : "";
-        I->payload = r->payload_len ? hcopy + r->payload_off : NULL;
-        I->payload_len = r->payload_len;
+/* Buffer indices for the instruction schema (column order = qplan.INSTR_COLS,
+ * compat=oldest: primitives = [validity, values]; large_utf8/large_binary =
+ * [validity, offsets(i64), data]). 33 buffers total. */
+enum {
+    B_TID=1, B_OP=3, B_SRC=5, B_DST=7, B_BUFID=9, B_BUFOFF=11, B_LEN=13,
+    B_CAP=15, B_LO=17, B_AOFF=19,
+    B_PATH_O=21, B_PATH_D=22, B_DPATH_O=24, B_DPATH_D=25, B_PAY_O=27, B_PAY_D=28,
+    B_MODE=30, B_MTIME=32,
+};
+static const uint8_t *abuf(const uint8_t *meta, int64_t bufs,
+                          const uint8_t *body, int k){
+    return body + fb_i64(meta, bufs + 4 + 16*(int64_t)k);  /* buffer k's offset */
+}
+/* build a \0-terminated arena from a large_utf8 (offsets,data); set ptrs[i] */
+static char *str_arena(const int64_t *off, const uint8_t *dat, int n,
+                       const char **ptrs){
+    int64_t total = n ? off[n] : 0;
+    char *a = malloc((size_t)total + n + 1); int64_t c = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t len = off[i+1] - off[i];
+        memcpy(a + c, dat + off[i], (size_t)len); a[c+len] = 0;
+        ptrs[i] = a + c; c += len + 1;
     }
-    *n_out = (int)n; *heap_out = hcopy;
+    return a;
+}
+
+/* Decode the single Arrow record batch into an Instr array. `data` is retained
+ * by the caller (payload bytes point into it); path/dpath get \0 arenas. */
+static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
+                               char **arena_path, char **arena_dpath){
+    const uint8_t *meta = NULL, *body = NULL; int64_t bufs = 0, nrows = 0;
+    size_t pos = 0;
+    while (pos + 8 <= sz) {
+        uint32_t cont, mlen;
+        memcpy(&cont, data+pos, 4); memcpy(&mlen, data+pos+4, 4);
+        if (cont != 0xFFFFFFFFu || mlen == 0) break;         /* EOS/EOF */
+        const uint8_t *m = data + pos + 8;
+        int64_t rt = fb_root(m);
+        int64_t htp = fb_field(m, rt, 1); int htype = htp>=0 ? m[htp] : 0;
+        int64_t blp = fb_field(m, rt, 3); int64_t blen = blp>=0 ? fb_i64(m,blp):0;
+        const uint8_t *bd = m + mlen;
+        if (htype == 3) {                                    /* RecordBatch */
+            int64_t rb = fb_offset_field(m, rt, 2);
+            nrows = fb_i64(m, fb_field(m, rb, 0));
+            bufs  = fb_offset_field(m, rb, 2);
+            meta = m; body = bd; break;                      /* single batch */
+        }
+        size_t adv = 8 + mlen + (size_t)blen; adv = (adv + 7) & ~(size_t)7;
+        pos += adv;
+    }
+    int n = (int)nrows;
+    Instr *ins = calloc(n ? n : 1, sizeof(Instr));
+    *arena_path = *arena_dpath = NULL; *n_out = n;
+    if (!meta || !n) return ins;
+
+    const int64_t *tid=(const int64_t*)abuf(meta,bufs,body,B_TID);
+    const uint8_t *op =abuf(meta,bufs,body,B_OP), *src=abuf(meta,bufs,body,B_SRC),
+                  *dst=abuf(meta,bufs,body,B_DST);
+    const int32_t *bufid=(const int32_t*)abuf(meta,bufs,body,B_BUFID),
+                  *mode =(const int32_t*)abuf(meta,bufs,body,B_MODE);
+    const int64_t *boff=(const int64_t*)abuf(meta,bufs,body,B_BUFOFF),
+                  *len =(const int64_t*)abuf(meta,bufs,body,B_LEN),
+                  *cap =(const int64_t*)abuf(meta,bufs,body,B_CAP),
+                  *lo  =(const int64_t*)abuf(meta,bufs,body,B_LO),
+                  *aoff=(const int64_t*)abuf(meta,bufs,body,B_AOFF),
+                  *mt  =(const int64_t*)abuf(meta,bufs,body,B_MTIME);
+    const int64_t *po_p=(const int64_t*)abuf(meta,bufs,body,B_PATH_O);
+    const uint8_t *pd_p=abuf(meta,bufs,body,B_PATH_D);
+    const int64_t *po_d=(const int64_t*)abuf(meta,bufs,body,B_DPATH_O);
+    const uint8_t *pd_d=abuf(meta,bufs,body,B_DPATH_D);
+    const int64_t *po_y=(const int64_t*)abuf(meta,bufs,body,B_PAY_O);
+    const uint8_t *pd_y=abuf(meta,bufs,body,B_PAY_D);
+
+    const char **pp = malloc(sizeof(char*)*n), **pd = malloc(sizeof(char*)*n);
+    *arena_path  = str_arena(po_p, pd_p, n, pp);
+    *arena_dpath = str_arena(po_d, pd_d, n, pd);
+    for (int i = 0; i < n; i++) {
+        Instr *I = &ins[i];
+        I->tid=(uint32_t)tid[i]; I->op=op[i]; I->src=src[i]; I->dst=dst[i];
+        I->buf_id=bufid[i]; I->mode=mode[i];
+        I->buf_off=boff[i]; I->len=len[i]; I->cap=cap[i]; I->lo=lo[i];
+        I->arch_off=aoff[i]; I->mtime_ns=mt[i];
+        I->path=pp[i]; I->dpath=pd[i];
+        I->payload = pd_y + po_y[i]; I->payload_len = po_y[i+1]-po_y[i];
+    }
+    free(pp); free(pd);
     return ins;
 }
 
@@ -441,12 +515,11 @@ int main(int argc, char **argv){
     }
     size_t sz; uint8_t *data = read_all_fd(0, &sz);
     if (!data) { perror("read stdin"); return 2; }
-    int n; uint8_t *heap;
-    Instr *ins = qvm_decode(data, sz, &n, &heap);
-    if (!ins) { fprintf(stderr, "qvm: bad instruction stream\n"); return 2; }
+    int n; char *ap, *ad;
+    Instr *ins = qvm_decode_arrow(data, sz, &n, &ap, &ad);
     int rc = qvm_run(ins, n, arch_fd, npool, nworkers);
     if (arch_fd >= 0) close(arch_fd);
-    free(ins); free(heap); free(data);
+    free(ins); free(ap); free(ad); free(data);
     if (rc < 0) { fprintf(stderr, "qvm: op failed: %d\n", rc); return 1; }
     return 0;
 }
