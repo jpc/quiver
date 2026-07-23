@@ -94,25 +94,35 @@ def _dir_phases(dirs_depth, base_tid):
 
 # --------------------------------------------------------------------- cp
 def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
-    """fs -> fs: mkdir the ancestor set (depth order) in thread 0, then spawn a
-    thread per file that copy_file_ranges src->dst and sets its metadata."""
+    """fs -> fs: mkdir the directory set (depth order) in thread 0, spawn a
+    thread per file that copy_file_ranges src->dst and sets its metadata, then a
+    FINISH phase that restores each directory's mode+mtime. The dir mtimes must
+    be re-set last: creating files/subdirs bumps a parent's mtime, so mkdir-time
+    metadata would be clobbered. In batch mode all creation precedes any setmeta,
+    so the finish order is irrelevant (setmeta touches only that dir's inode) —
+    no deepest-first walk needed."""
     files = scan.filter(~pl.col("is_dir")).sort("path")
     n = files.height
 
-    dirs, seen = [], set()                       # ancestor set
+    # real dirs from the scan (carry mode/mtime, include EMPTY dirs), unioned with
+    # file ancestors so every parent exists even if the scan omitted it.
+    dmeta = scan.filter(pl.col("is_dir")).sort("path")
+    known = set(dmeta["path"])
+    extra, seen = [], set(known)                 # ancestors not present as dir rows
     for p in files["path"]:
         for a in _ancestors(p):
             if a not in seen:
-                seen.add(a); dirs.append(a)
-    # dst_root (depth 0), then each ancestor at its depth; mkdirs run in parallel
-    dd = [(dst_root, 0)] + [(os.path.join(dst_root, d), d.count("/") + 1)
-                            for d in dirs]
+                seen.add(a); extra.append(a)
+    # dst_root (depth 0), then every dir at its path depth; mkdirs run in parallel
+    dd = ([(dst_root, 0)]
+          + [(os.path.join(dst_root, d), d.count("/") + 1) for d in dmeta["path"]]
+          + [(os.path.join(dst_root, d), d.count("/") + 1) for d in extra])
     mkdir_df, phase_rows, fbase, sub = _dir_phases(dd, 1)
     phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN,
                     "lo": fbase, "cap": fbase + n - 1},
                    {"tid": 0, "_sub": sub + 1, "op": OP_JOIN,
                     "lo": fbase, "cap": fbase + n - 1}]
-    root_df = pl.DataFrame(phase_rows)
+    sub += 2
 
     f = files.with_row_index("k")
     tid = pl.col("k") + fbase                    # a thread per file, after mkdirs
@@ -125,7 +135,23 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
     meta = f.select(tid=tid, _sub=pl.lit(1), op=pl.lit(OP_SETMETA),
                     path=dstp, mode=pl.col("mode") & 0o7777,
                     mtime_ns=pl.col("mtime_ns"))
-    return _finalize([root_df, mkdir_df, mov, meta])
+
+    # finish: restore dir mode+mtime, one thread per dir, after every file lands
+    dbase = fbase + n
+    nd = dmeta.height
+    dir_meta = pl.DataFrame({"tid": [], "_sub": []})
+    if nd:
+        dm = dmeta.with_row_index("k")
+        dir_meta = dm.select(
+            tid=pl.col("k") + dbase, _sub=pl.lit(0), op=pl.lit(OP_SETMETA),
+            path=pl.lit(dst_root.rstrip("/") + "/") + pl.col("path"),
+            mode=pl.col("mode") & 0o7777, mtime_ns=pl.col("mtime_ns"))
+        phase_rows += [{"tid": 0, "_sub": sub, "op": OP_SPAWN,
+                        "lo": dbase, "cap": dbase + nd - 1},
+                       {"tid": 0, "_sub": sub + 1, "op": OP_JOIN,
+                        "lo": dbase, "cap": dbase + nd - 1}]
+    root_df = pl.DataFrame(phase_rows)
+    return _finalize([root_df, mkdir_df, mov, meta, dir_meta])
 
 
 # -------------------------------------------------------------- pack (uncompressed)
@@ -210,7 +236,8 @@ def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
     ftid = pl.col("frame") + 1
     alloc = frames.select(tid=ftid, _sub=pl.lit(0), op=pl.lit(OP_ALLOC),
-                          buf_id=pl.col("bufid"), cap=pl.col("dl"))
+                          buf_id=pl.col("bufid"), cap=pl.col("dl"),
+                          mode=pl.lit(1))          # zero: tar body padding must be NUL
     hdr = df.select(tid=pl.col("tid"), _sub=1 + 2 * pl.col("mrank"),
                     op=pl.lit(OP_MOV), src=pl.lit(E_INLINE), dst=pl.lit(E_BUF),
                     buf_id=pl.col("bufid"), buf_off=pl.col("local"),

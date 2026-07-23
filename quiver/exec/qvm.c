@@ -42,12 +42,14 @@
 /* When QVM_TRACE=<path> is set, every op is logged with monotonic start/end so
  * the visualizer can draw the fiber timeline + buffer-pool occupancy. Events
  * are appended only from the scheduler thread (worker times are carried back on
- * the Task), so no locking. Dump: [i64 t_base][u32 n][n × 6×i64]. */
+ * the Task), so no locking. Dump: [i64 span][u32 n][n × 9×i64]. */
 static int64_t tr_now(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-typedef struct { int64_t t0, t1, tid, op, buf, detail, epoch; } TraceEv;
+/* off/aux carry op parameters for the viz: mov → (offset, endpoint-kind),
+ * deflate → (frame_id, input_len), inflate → (arch_off, frame_id). */
+typedef struct { int64_t t0, t1, tid, op, buf, detail, epoch, off, aux; } TraceEv;
 
 /* ------------------------------------------------------------------ opcodes */
 enum {
@@ -414,12 +416,12 @@ static void *ring_worker(void *arg){
 #endif
 
 static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
-                   int64_t buf, int64_t detail){
+                   int64_t buf, int64_t detail, int64_t off, int64_t aux){
     if (!S->t_base) return;                       /* tracing off */
     if (S->ntr == S->trcap) { S->trcap = S->trcap ? S->trcap*2 : 1024;
         S->tr = realloc(S->tr, S->trcap * sizeof(TraceEv)); }
     S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
-                                 tid, op, buf, detail, S->cur_epoch };
+                                 tid, op, buf, detail, S->cur_epoch, off, aux };
 }
 
 static uint8_t *read_framed(int fd, size_t *out);
@@ -452,14 +454,19 @@ static PW *pw_pop(Sched *S){
     return w;
 }
 
-static int pool_alloc(Sched *S, Thread *t, int id, int64_t cap){
+static int pool_alloc(Sched *S, Thread *t, int id, int64_t cap, int zero){
     BufSlot *b = &S->pool[id];
     if (b->in_use) {                     /* backpressure: park until freed */
         t->wnext = b->waiters; b->waiters = t; t->st = T_WAIT_ALLOC;
         return 0;
     }
     if (b->cap < (size_t)cap) { b->mem = realloc(b->mem, cap); b->cap = cap; }
-    if (cap > 0) memset(b->mem, 0, (size_t)cap);   /* clean tar body padding */
+    /* Zeroing is OPT-IN (pack needs clean tar padding). It is skipped by default
+     * because it runs INLINE on the scheduler thread and, on a fresh slot, faults
+     * in `cap` bytes — serializing allocs and stalling scheduling. When the buffer
+     * is fully overwritten anyway (window load, inflate, gather) the first-touch
+     * fault is deferred to the worker that writes it, in parallel and off-thread. */
+    if (zero && cap > 0) memset(b->mem, 0, (size_t)cap);
     b->in_use = 1;
     return 1;
 }
@@ -499,7 +506,8 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
         int64_t tt = tr_now();
         memcpy(S->pool[I->buf_id].mem + I->buf_off, I->payload,
                (size_t)I->payload_len);
-        tr_log(S, tt, tr_now(), t->tid, OP_MOV, I->buf_id, I->payload_len);
+        tr_log(S, tt, tr_now(), t->tid, OP_MOV, I->buf_id, I->payload_len,
+               I->buf_off, 100);                  /* aux 100 = inline->buf */
         t->pc++; return;
     }
     Task *k = calloc(1, sizeof *k);
@@ -536,12 +544,12 @@ static void run_thread(Sched *S, Thread *t){
         switch (I->op) {
         case OP_ALLOC: {
             int64_t tt = tr_now();
-            if (!pool_alloc(S, t, I->buf_id, I->cap)) return;   /* parked */
-            tr_log(S, tt, tr_now(), t->tid, OP_ALLOC, I->buf_id, I->cap);
+            if (!pool_alloc(S, t, I->buf_id, I->cap, I->mode > 0)) return; /* parked */
+            tr_log(S, tt, tr_now(), t->tid, OP_ALLOC, I->buf_id, I->cap, 0, I->mode>0);
             t->pc++; break;
         }
         case OP_FREE:
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_FREE, I->buf_id, 0);
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_FREE, I->buf_id, 0, 0, 0);
             pool_free(S, I->buf_id); t->pc++; break;
         case OP_MOV:
             submit_mov(S, t, I);
@@ -570,7 +578,7 @@ static void run_thread(Sched *S, Thread *t){
             return;
         }
         case OP_SPAWN: {
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_SPAWN, I->lo, I->cap);
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_SPAWN, I->lo, I->cap, 0, 0);
             Batch *B = &S->bat[t->epoch];
             for (int64_t i = I->lo; i <= I->cap; i++)
                 if (B->th[i].st == T_INERT) ready_push(S, &B->th[i]);
@@ -578,7 +586,7 @@ static void run_thread(Sched *S, Thread *t){
         }
         case OP_JOIN:
             if (range_done(S, t->epoch, I->lo, I->cap)) { t->pc++; break; }
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_JOIN, I->lo, I->cap);
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_JOIN, I->lo, I->cap, 0, 0);
             t->join_lo = I->lo; t->join_hi = I->cap; t->st = T_WAIT_JOIN;
             return;
         case OP_CALL:
@@ -706,7 +714,7 @@ static void run_sched(Sched *S){
                 free(raw); if (S->pw_count == 0 && S->inflight == 0) break; else continue;
             }
             S->cur_epoch = w->ep;
-            tr_log(S, w->t0, tr_now(), w->tid, OP_CALL, w->cid, 0);  /* Python span */
+            tr_log(S, w->t0, tr_now(), w->tid, OP_CALL, w->cid, 0, 0, 0); /* Python */
             int nn; char *nap, *nad;
             Instr *nins = qvm_decode_arrow(raw, rawlen, &nn, &nap, &nad);
             int ne = build_batch(S, nins, nn);
@@ -722,8 +730,14 @@ static void run_sched(Sched *S){
         if (k->kind == TK_DEFLATE && k->res == 0)
             comp_add(S, k->frame_id, k->coff, k->clen);
         S->cur_epoch = k->epoch;
-        tr_log(S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
-               k->kind == TK_DEFLATE ? k->clen : k->detail);
+        {   /* op params for the viz: mov→(arch_off, endpoint-kind), */
+            int64_t off = k->arch_off, aux = 0;   /* deflate→(frame_id, in_len) */
+            if (k->op == OP_DEFLATE) { off = k->frame_id; aux = k->len; }
+            else if (k->op == OP_INFLATE) { aux = k->frame_id; }
+            else if (k->op == OP_MOV) { aux = k->kind; }
+            tr_log(S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
+                   k->kind == TK_DEFLATE ? k->clen : k->detail, off, aux);
+        }
         Thread *ct = TH(S, k->epoch, k->tid);
         if (ct->st == T_WAIT_IO) {                     /* resume at pc */
             ct->st = T_READY;   /* clear WAIT: a following sync op (inline->buf)
