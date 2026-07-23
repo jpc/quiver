@@ -302,14 +302,7 @@ def pack_stream(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
     open(out_path, "wb").close()
     comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
                      nworkers=nworkers, want_comp=True)
-    members = (pl.concat(collected) if collected
-               else pl.DataFrame(schema={"frame": pl.Int64}))
-    footer = (members.join(comp, on="frame", how="left")
-                     .select([c for c, _ in _zf._FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)
-    _zf._write_footer(out_path, ftmp, False); ftmp.close()
-    return footer.height
+    return _stream_footer(out_path, collected, comp)   # stream per-chunk parts
 
 
 def pack_pipe(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
@@ -340,12 +333,7 @@ def pack_pipe(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
 
     with open(out_path, "wb") as f:
         f.write(b"".join(chunks))                # streamed frame bytes, in order
-    footer = (members.join(comp, on="frame", how="left")
-                     .select([c for c, _ in _zf._FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)
-    _zf._write_footer(out_path, ftmp, False); ftmp.close()
-    return footer.height
+    return _stream_footer(out_path, [members], comp)
 
 
 def tar_scan(tar_path: str) -> pl.DataFrame:
@@ -435,12 +423,7 @@ def recompress(tar_path: str, out_path: str, qvm_exe: str,
     open(out_path, "wb").close()
     comp = run(instr, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
                nworkers=nworkers, want_comp=True)
-    footer = (members.join(comp, on="frame", how="left")
-                     .select([c for c, _ in _zf._FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)
-    _zf._write_footer(out_path, ftmp, False); ftmp.close()
-    return footer.height
+    return _stream_footer(out_path, [members], comp)
 
 
 def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
@@ -633,14 +616,7 @@ def recompress_zst_stream(src_path: str, out_path: str, qvm_exe: str,
     open(out_path, "wb").close()
     comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
                      nworkers=nworkers, want_comp=True)
-    members_all = (pl.concat(collected) if collected
-                   else pl.DataFrame(schema={"frame": pl.Int64}))
-    footer = (members_all.join(comp, on="frame", how="left")
-                         .select([c for c, _ in _zf._FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)
-    _zf._write_footer(out_path, ftmp, False); ftmp.close()
-    return footer.height
+    return _stream_footer(out_path, collected, comp)   # stream per-window parts
 
 
 def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
@@ -707,14 +683,7 @@ def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
     open(out_path, "wb").close()
     comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=depth,
                      nworkers=nworkers, want_comp=True)
-    members_all = (pl.concat(collected) if collected
-                   else pl.DataFrame(schema={"frame": pl.Int64}))
-    footer = (members_all.join(comp, on="frame", how="left")
-                         .select([c for c, _ in _zf._FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)
-    _zf._write_footer(out_path, ftmp, False); ftmp.close()
-    return footer.height
+    return _stream_footer(out_path, collected, comp)   # stream per-window parts
 
 
 def recompress_zst(src_path: str, out_path: str, qvm_exe: str,
@@ -740,6 +709,52 @@ def recompress_zst(src_path: str, out_path: str, qvm_exe: str,
         os.unlink(tmp)
 
 
+def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
+                   dirs: pl.DataFrame | None = None, force_sidecar: bool = False,
+                   chunk_rows: int = 1 << 20) -> int:
+    """Write the nock footer by joining + serializing it in COLUMNAR CHUNKS
+    (one Arrow record batch per `chunk_rows`) instead of one big
+    members⋈completions join + full serialization. This avoids a second
+    whole-index copy (the join) and streams the write, so peak footer overhead is
+    ~chunk_rows rows rather than the entire (100M-row) index materialized twice.
+    Stays in Arrow/Polars throughout — no per-row Python objects. `parts` is an
+    iterable of member frames (path,size,mode,mtime_ns,uid,gid,frame,in_off);
+    `comp` carries the frame completions; `dirs` are frame=-1 directory rows.
+    Returns the file count (dirs excluded)."""
+    _pl = {"large_string": pl.Utf8, "i64": pl.Int64, "i32": pl.Int32}
+    fs = {c: _pl[t] for c, t in _zf._FOOTER_IPC}
+    fcols = [c for c, _ in _zf._FOOTER_IPC]
+    if comp is not None and comp.height:
+        comp = comp.select(frame=pl.col("frame").cast(pl.Int64),
+                           frame_coff="frame_coff", frame_clen="frame_clen")
+    ftmp = tempfile.TemporaryFile()
+    total = 0
+    for part in parts:
+        if part is None or part.height == 0:
+            continue
+        for off in range(0, part.height, chunk_rows):
+            sl = part.slice(off, chunk_rows).with_columns(
+                pl.col("frame").cast(pl.Int64))
+            j = (sl.join(comp, on="frame", how="left") if comp is not None
+                 else sl.with_columns(frame_coff=pl.lit(-1, pl.Int64),
+                                      frame_clen=pl.lit(-1, pl.Int64)))
+            j = j.select([pl.col(c).cast(fs[c]) for c in fcols])
+            ipc.write_batch(ftmp, j)          # columnar batch, streamed
+            total += j.height
+    if dirs is not None and dirs.height:          # directory rows: frame=-1, no data
+        d = dirs.select(
+            path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns",
+            uid="uid", gid="gid", frame=pl.lit(-1, pl.Int32),
+            frame_coff=pl.lit(-1, pl.Int64), frame_clen=pl.lit(-1, pl.Int64),
+            in_off=pl.lit(-1, pl.Int64)).select(
+            [pl.col(c).cast(fs[c]) for c in fcols])
+        ipc.write_batch(ftmp, d)
+    ipc.write_eos(ftmp)
+    _zf._write_footer(out_path, ftmp, force_sidecar)
+    ftmp.close()
+    return total
+
+
 def _shard_paths(out_path: str, n: int) -> list[str]:
     if n == 1:
         return [out_path]
@@ -763,17 +778,10 @@ def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
         open(o, "wb").close()
     comp = run(instr, qvm_exe, "-", sinks=tuple(outs), npool=npool,
                nworkers=nworkers, want_comp=True)
-    joined = members.join(comp, on="frame", how="left")
     dirs = _dir_footer_rows(scan)                 # dir metadata (frame=-1 rows)
-    # canonical footer dtypes (frame is i32 so the dir sentinel -1 fits; also
-    # aligns the written footer with its declared _FOOTER_IPC schema)
-    _pl = {"large_string": pl.Utf8, "i64": pl.Int64, "i32": pl.Int32}
-    fs = {c: _pl[t] for c, t in _zf._FOOTER_IPC}
     total = 0
     for s, o in enumerate(outs):
-        pf = joined.filter(pl.col("sink") == s) if nsinks > 1 else joined
-        part = pf.select([pl.col(c).cast(fs[c]) for c, _ in _zf._FOOTER_IPC])
-        total += part.height                      # member count = files only
+        pf = members.filter(pl.col("sink") == s) if nsinks > 1 else members
         # a single archive records the WHOLE dir tree (incl. empty dirs); each
         # reshard shard records only its own files' ancestor dirs (self-contained)
         sd = dirs
@@ -782,12 +790,9 @@ def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
             for p in pf["path"]:
                 anc.update(_ancestors(p))
             sd = dirs.filter(pl.col("path").is_in(list(anc)))
-        if sd.height:                             # dirs carry frame=-1 (no data)
-            part = pl.concat([part, sd.select(
-                [pl.col(c).cast(fs[c]) for c in part.columns])])
-        ftmp = tempfile.TemporaryFile()
-        ipc.write_all(ftmp, part)
-        _zf._write_footer(o, ftmp, False); ftmp.close()
+        # stream the footer (members⋈completions done row-group-wise, not one
+        # big join+serialize) so a 100M-member index never fully materializes
+        total += _stream_footer(o, [pf], comp, dirs=sd)
     return total
 
 
