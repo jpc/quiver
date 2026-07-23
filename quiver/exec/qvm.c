@@ -82,7 +82,7 @@ typedef struct { int fd; int64_t cursor; int is_pipe; pthread_mutex_t mu; } Sink
 /* A Task is a unit of async work handed to the worker pool; buffer operands are
  * resolved to raw pointers at submit time so workers never touch scheduler
  * state. The worker fills res (0 or -errno) and posts the tid back. */
-typedef struct {
+typedef struct Task {
     uint32_t tid;
     uint8_t  kind;               /* mirrors the mov case / namespace op */
     int      arch_fd;
@@ -93,6 +93,7 @@ typedef struct {
     Sink    *sink; int level; int64_t frame_id, coff, clen;  /* codec/sink */
     int      res;
     int      op; int64_t buf_log, detail; int64_t wt0, wt1;   /* trace */
+    int      epoch; struct Task *dnext;  /* owning batch; deferred-queue link */
 } Task;
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
@@ -342,6 +343,7 @@ typedef struct {
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
     int batch_epoch, epoch_next; /* per-batch id (nested CALL batches distinct) */
+    Task *deferred;              /* completions for a suspended (outer) batch */
 #ifdef QVM_URING
     int use_uring, qd; TQ ring_tasks; pthread_t ring_th; struct io_uring ring;
 #endif
@@ -467,7 +469,7 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
         t->pc++; return;
     }
     Task *k = calloc(1, sizeof *k);
-    k->tid = t->tid; k->arch_fd = S->arch_fd;
+    k->tid = t->tid; k->epoch = S->batch_epoch; k->arch_fd = S->arch_fd;
     k->op = I->op; k->buf_log = I->buf_id;
     k->detail = I->len ? I->len : (int64_t)I->payload_len;
     k->path = I->path; k->dpath = I->dpath;
@@ -512,7 +514,7 @@ static void run_thread(Sched *S, Thread *t){
             break;                              /* sync (inline->buf): continue */
         case OP_MKDIR: case OP_SETMETA: {
             Task *k = calloc(1, sizeof *k);
-            k->tid = t->tid; k->path = I->path; k->op = I->op; k->buf_log = -1;
+            k->tid = t->tid; k->epoch = S->batch_epoch; k->path = I->path; k->op = I->op; k->buf_log = -1;
             k->mode = I->mode; k->mtime_ns = I->mtime_ns;
             k->kind = I->op==OP_MKDIR ? TK_MKDIR : TK_SETMETA;
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
@@ -520,7 +522,7 @@ static void run_thread(Sched *S, Thread *t){
         }
         case OP_INFLATE: case OP_DEFLATE: {
             Task *k = calloc(1, sizeof *k);
-            k->tid = t->tid; k->arch_fd = S->arch_fd;
+            k->tid = t->tid; k->epoch = S->batch_epoch; k->arch_fd = S->arch_fd;
             k->op = I->op; k->buf_log = I->buf_id; k->detail = I->len;
             k->buf = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
             k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
@@ -642,13 +644,23 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
 }
 
-/* drive the current thread set (S->th) until it is fully drained */
+/* drive the current thread set (S->th) until it is fully drained. A completion
+ * for a SUSPENDED outer batch (its epoch != ours — its fiber is mid-CALL with
+ * in-flight work, e.g. a prefetch loader) is stashed on S->deferred and reaped
+ * when that batch resumes; only this batch's completions advance us. */
 static void run_batch_loop(Sched *S){
     for (;;) {
         Thread *t;
         while ((t = ready_pop(S))) run_thread(S, t);
         if (S->inflight == 0) break;
-        Task *k = tq_pop(&S->comps);      /* block for a completion */
+        Task *k = NULL;
+        for (Task **pp = &S->deferred; *pp; pp = &(*pp)->dnext)   /* ours, deferred? */
+            if ((*pp)->epoch == S->batch_epoch) { k = *pp; *pp = k->dnext; break; }
+        while (!k) {
+            Task *c = tq_pop(&S->comps);  /* block for a completion */
+            if (c->epoch == S->batch_epoch) k = c;
+            else { c->dnext = S->deferred; S->deferred = c; }     /* an outer batch's */
+        }
         S->inflight--;
         if (k->res < 0 && !S->failed) S->failed = k->res;
         if (k->kind == TK_DEFLATE && k->res == 0)

@@ -448,14 +448,16 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
 
 def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
                         window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
-                        level: int = 6, nworkers: int = 8,
+                        level: int = 6, nworkers: int = 8, depth: int = 2,
                         predicate: pl.Expr | None = None) -> int:
-    """Windowed streaming recompress via OP_CALL — BOUNDED memory. The whole
-    program is a driver fiber that, per window: allocs one window buffer, loads
-    that byte-range of the tar, CALLs into Python (which plans the window's
-    gather and returns it as a nested batch that deflates from the held buffer),
-    then frees the buffer. Only one window is ever resident; the buffer's
-    lifetime is exactly the driver's per-window scope."""
+    """Windowed streaming recompress via OP_CALL — bounded to `depth` windows.
+    The driver fiber PREFETCHES: before CALLing Python to gather window k, it
+    spawns a loader fiber that reads window k+1 into the next buffer, so the load
+    of the next window overlaps Python's planning and the current window's
+    compression. `depth` window buffers ring the pool (2 = double-buffer); the
+    pool's alloc backpressure keeps at most `depth` resident. This needs the
+    caller batch to have in-flight work at the CALL — hence epoch-routed
+    completions in the C scheduler."""
     members = tar_scan(tar_path)
     if predicate is not None:
         members = members.filter(predicate)
@@ -464,22 +466,55 @@ def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
     members = members.with_columns(win=(pl.col("_c") // window_bytes))
     windows = members.partition_by("win", maintain_order=True)
 
-    driver_rows = []
     win_info = []
-    for k, wdf in enumerate(windows):
+    for wdf in windows:
         ws = int(wdf["offset"].min())
         we = int((wdf["offset"] + wdf["range"]).max())
         win_info.append((ws, we - ws, wdf))
-        b = 4 * k
-        driver_rows += [
-            {"tid": 0, "_sub": b, "op": OP_ALLOC, "buf_id": 0, "cap": we - ws},
-            {"tid": 0, "_sub": b + 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
-             "buf_id": 0, "buf_off": 0, "path": tar_path, "arch_off": ws,
-             "len": we - ws},
-            {"tid": 0, "_sub": b + 2, "op": OP_CALL, "frame_id": k},
-            {"tid": 0, "_sub": b + 3, "op": OP_FREE, "buf_id": 0}]
-    driver = _finalize([pl.DataFrame(driver_rows)]) if driver_rows \
-        else _empty_batch()
+    K = len(win_info)
+
+    if depth <= 1:
+        # sequential: one buffer, load then gather then free (no prefetch)
+        dr = []
+        for k, (ws, wlen, _w) in enumerate(win_info):
+            b = 4 * k
+            dr += [
+                {"tid": 0, "_sub": b, "op": OP_ALLOC, "buf_id": 0, "cap": wlen},
+                {"tid": 0, "_sub": b + 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
+                 "buf_id": 0, "buf_off": 0, "path": tar_path, "arch_off": ws,
+                 "len": wlen},
+                {"tid": 0, "_sub": b + 2, "op": OP_CALL, "frame_id": k},
+                {"tid": 0, "_sub": b + 3, "op": OP_FREE, "buf_id": 0}]
+        driver = _finalize([pl.DataFrame(dr)]) if dr else _empty_batch()
+    else:
+        # prefetch: a loader fiber per window (tid w+1) into buf[w%depth]; the
+        # driver spawns the NEXT loader before CALLing to gather the current, so
+        # the load overlaps Python planning + compression. `depth` buffers ring
+        # the pool; alloc backpressure keeps at most `depth` resident.
+        loaders = []
+        for w, (ws, wlen, _wdf) in enumerate(win_info):
+            loaders += [
+                {"tid": w + 1, "_sub": 0, "op": OP_ALLOC, "buf_id": w % depth,
+                 "cap": wlen},
+                {"tid": w + 1, "_sub": 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
+                 "buf_id": w % depth, "buf_off": 0, "path": tar_path,
+                 "arch_off": ws, "len": wlen}]
+        dr, sub = [], 0
+        if K:
+            dr += [{"tid": 0, "_sub": sub, "op": OP_SPAWN, "lo": 1, "cap": 1},
+                   {"tid": 0, "_sub": sub + 1, "op": OP_JOIN, "lo": 1, "cap": 1}]
+            sub += 2                                   # load window 0
+        for k in range(K):
+            if k + 1 < K:                              # prefetch window k+1 (async)
+                dr.append({"tid": 0, "_sub": sub, "op": OP_SPAWN,
+                           "lo": k + 2, "cap": k + 2}); sub += 1
+            dr.append({"tid": 0, "_sub": sub, "op": OP_CALL, "frame_id": k}); sub += 1
+            if k + 1 < K:
+                dr.append({"tid": 0, "_sub": sub, "op": OP_JOIN,
+                           "lo": k + 2, "cap": k + 2}); sub += 1
+            dr.append({"tid": 0, "_sub": sub, "op": OP_FREE,
+                       "buf_id": k % depth}); sub += 1
+        driver = _finalize([pl.DataFrame(dr + loaders)]) if dr else _empty_batch()
 
     collected: list[pl.DataFrame] = []
     state = {"base": 0}
@@ -488,13 +523,14 @@ def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
         if cid == -1:                                # entry: the window driver
             return driver
         ws, wlen, wdf = win_info[cid]
-        g, wmem = plan_window_gather(wdf, ws, 0, frame_bytes, level, state["base"])
+        g, wmem = plan_window_gather(wdf, ws, cid % depth, frame_bytes, level,
+                                     state["base"])
         collected.append(wmem)
         state["base"] += wmem["frame"].n_unique() if wmem.height else 0
         return g
 
     open(out_path, "wb").close()
-    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=1,
+    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=depth,
                      nworkers=nworkers, want_comp=True)
     members_all = (pl.concat(collected) if collected
                    else pl.DataFrame(schema={"frame": pl.Int64}))
