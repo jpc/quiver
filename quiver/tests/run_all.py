@@ -1112,6 +1112,37 @@ def test_qvm(tmp):
     assert nmem == nf
     ok("qvm pack/unpack: compressed nock round-trips byte-exact (codec + sink)")
 
+    # filter: predicate keeps a subset (planning fewer members)
+    from quiver.nock import zframe as _zf
+    (src / "keep0.keep").write_bytes(b"K" * 500)
+    (src / "keep1.keep").write_bytes(b"K" * 700)
+    s2 = wire.scan(str(src), "uring", 4)
+    fa = str(tmp / "qvm_filt.nock")
+    nkeep = qplan.pack(s2, str(src), fa, qvm, frame_bytes=16 << 10, npool=8,
+                       predicate=pl.col("path").str.ends_with(".keep"))
+    fidx = _zf.read_index(fa)
+    assert nkeep == 2 and all(p.endswith(".keep") for p in fidx["path"])
+    qplan.unpack(fa, str(tmp / "qvm_filt_x"), qvm, npool=8)
+    assert (tmp / "qvm_filt_x" / "keep0.keep").read_bytes() == b"K" * 500
+    ok("qvm filter: predicate keeps a subset, unpacks byte-exact")
+
+    # reshard: fan out to N self-contained shards by hash
+    pat = str(tmp / "qvm_sh.tar.zstd")
+    nt = qplan.pack(s, str(src), pat, qvm, frame_bytes=16 << 10, npool=8,
+                    shard_by=pl.col("path").hash() % 3, shards=3)
+    seen = 0
+    for sh in range(3):
+        sp = str(tmp / f"qvm_sh.shard{sh}.tar.zstd")
+        si = _zf.read_index(sp)
+        assert (si.with_columns(h=pl.col("path").hash() % 3)["h"] == sh).all()
+        qplan.unpack(sp, str(tmp / f"qvm_ush{sh}"), qvm, npool=8)
+        for pth in si["path"]:
+            assert (tmp / f"qvm_ush{sh}" / pth).read_bytes() == \
+                (src / pth).read_bytes()
+            seen += 1
+    assert seen == nt
+    ok("qvm reshard: N self-contained shards, correct routing, byte-exact")
+
 
 def main():
     tmp = Path(tempfile.mkdtemp())

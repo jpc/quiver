@@ -162,40 +162,54 @@ def plan_pack_unc(scan: pl.DataFrame, root: str
 
 # -------------------------------------------------------------- pack (compressed)
 def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
-              level: int = 6, npool: int = 16) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """fs -> compressed nock: group members into ~frame_bytes frames; each frame
-    is a thread that assembles [header|body] per member into a zeroed buffer and
-    deflates it to sink 0. Returns (instr_df, members_df); members_df joins the
-    {frame,coff,clen} completions to build the footer. Buffer ids ring over
-    `npool` (must match the runner) so at most npool frames pack concurrently."""
-    df = (TarFormat().with_header_cols(
-              scan.lazy().filter(~pl.col("is_dir")).sort("path"))
+              level: int = 6, npool: int = 16, predicate: pl.Expr | None = None,
+              shard_by: pl.Expr | None = None, shards: int = 1
+              ) -> tuple[pl.DataFrame, pl.DataFrame, int]:
+    """fs -> compressed nock. Each frame is a thread that assembles [header|body]
+    per member into a zeroed buffer and deflates it to its sink. `predicate`
+    keeps only matching members (filter is just planning fewer). `shard_by`
+    (an expr -> sink id, 0..shards-1) routes members to `shards` output sinks,
+    each framed independently. Returns (instr_df, members_df, nsinks); members_df
+    carries `sink` and joins the {frame,coff,clen} completions."""
+    lf = scan.lazy().filter(~pl.col("is_dir")).sort("path")
+    if predicate is not None:
+        lf = lf.filter(predicate)
+    df = (TarFormat().with_header_cols(lf)
           .with_columns(payload_len=((pl.col("size") + 511) // 512) * 512)
           .with_columns(block_len=pl.col("header_len") + pl.col("payload_len"))
           .collect())
-    df = df.with_columns(_eo=pl.col("block_len").cum_sum() - pl.col("block_len"))
-    df = df.with_columns(frame=(pl.col("_eo") // frame_bytes).cast(pl.Int64))
+    df = df.with_columns(sink=(shard_by.cast(pl.Int32) if shard_by is not None
+                               else pl.lit(0, pl.Int32)))
+    # frames pack by cumulative footprint WITHIN each sink; global dense frame id
+    df = df.with_columns(
+        _eo=pl.col("block_len").cum_sum().over("sink") - pl.col("block_len"))
+    df = df.with_columns(_lf=(pl.col("_eo") // frame_bytes).cast(pl.Int64))
+    fr = (df.select("sink", "_lf").unique().sort("sink", "_lf")
+            .with_row_index("frame"))
+    df = df.join(fr, on=["sink", "_lf"])
     df = df.with_columns(_fs=pl.col("_eo").min().over("frame"))
     df = df.with_columns(
         local=pl.col("_eo") - pl.col("_fs"),
         in_off=pl.col("_eo") - pl.col("_fs") + pl.col("header_len"),
         mrank=pl.int_range(pl.len()).over("frame"))
-    frames = (df.group_by("frame").agg(clen=pl.col("block_len").sum())
-                .sort("frame").with_row_index("frank"))
+    frames = (df.group_by("frame")
+                .agg(clen=pl.col("block_len").sum(), sink=pl.col("sink").first())
+                .sort("frame"))
     nf = frames.height
-    frames = frames.with_columns(
-        dl=pl.col("clen") + pl.when(pl.col("frank") == nf - 1)
-                              .then(1024).otherwise(0),          # tar EOF in last
-        bufid=(pl.col("frank") % npool).cast(pl.Int32))
-    df = df.join(frames.select("frame", "frank", "bufid"), on="frame") \
-           .with_columns(tid=pl.col("frank") + 1)
+    last = frames.group_by("sink").agg(_last=pl.col("frame").max())   # EOF/sink
+    frames = frames.join(last, on="sink").with_columns(
+        dl=pl.col("clen") + pl.when(pl.col("frame") == pl.col("_last"))
+                              .then(1024).otherwise(0),
+        bufid=(pl.col("frame") % npool).cast(pl.Int32))
+    df = df.join(frames.select("frame", "bufid"), on="frame") \
+           .with_columns(tid=pl.col("frame") + 1)
 
     root_df = pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
-    alloc = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(0),
-                          op=pl.lit(OP_ALLOC), buf_id=pl.col("bufid"),
-                          cap=pl.col("dl"))
+    ftid = pl.col("frame") + 1
+    alloc = frames.select(tid=ftid, _sub=pl.lit(0), op=pl.lit(OP_ALLOC),
+                          buf_id=pl.col("bufid"), cap=pl.col("dl"))
     hdr = df.select(tid=pl.col("tid"), _sub=1 + 2 * pl.col("mrank"),
                     op=pl.lit(OP_MOV), src=pl.lit(E_INLINE), dst=pl.lit(E_BUF),
                     buf_id=pl.col("bufid"), buf_off=pl.col("local"),
@@ -205,33 +219,51 @@ def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
                      buf_id=pl.col("bufid"), buf_off=pl.col("in_off"),
                      path=pl.lit(root.rstrip("/") + "/") + pl.col("path"),
                      len=pl.col("size"))
-    deflate = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(_BIG),
-                            op=pl.lit(OP_DEFLATE), buf_id=pl.col("bufid"),
-                            buf_off=pl.lit(0), len=pl.col("dl"), sink=pl.lit(0),
+    deflate = frames.select(tid=ftid, _sub=pl.lit(_BIG), op=pl.lit(OP_DEFLATE),
+                            buf_id=pl.col("bufid"), buf_off=pl.lit(0),
+                            len=pl.col("dl"), sink=pl.col("sink"),
                             level=pl.lit(level), frame_id=pl.col("frame"))
-    free = frames.select(tid=pl.col("frank") + 1, _sub=pl.lit(_BIG + 1),
-                         op=pl.lit(OP_FREE), buf_id=pl.col("bufid"))
+    free = frames.select(tid=ftid, _sub=pl.lit(_BIG + 1), op=pl.lit(OP_FREE),
+                         buf_id=pl.col("bufid"))
     instr = _finalize([root_df, alloc, hdr, body, deflate, free])
     members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
-                        "frame", "in_off")
-    return instr, members
+                        "frame", "in_off", "sink")
+    return instr, members, (shards if shard_by is not None else 1)
+
+
+def _shard_paths(out_path: str, n: int) -> list[str]:
+    if n == 1:
+        return [out_path]
+    if "%d" in out_path:
+        return [out_path % s for s in range(n)]
+    stem = out_path[:-len(".tar.zstd")] if out_path.endswith(".tar.zstd") else out_path
+    return [f"{stem}.shard{s}.tar.zstd" for s in range(n)]
 
 
 def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
          frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
-         nworkers: int = 8) -> int:
-    """Plan + run a compressed nock pack, then write the footer from the frame
-    completions. Returns the member count."""
-    instr, members = plan_pack(scan, root, frame_bytes, level, npool)
-    open(out_path, "wb").close()
-    comp = run(instr, qvm_exe, "-", sinks=(out_path,), npool=npool,
+         nworkers: int = 8, predicate: pl.Expr | None = None,
+         shard_by: pl.Expr | None = None, shards: int = 1) -> int:
+    """Plan + run a compressed nock pack, then write per-sink footers from the
+    frame completions. With shard_by, fans out to `shards` self-contained nock
+    archives (out_path %-pattern or `.shardN.tar.zstd`). Returns member count."""
+    instr, members, nsinks = plan_pack(scan, root, frame_bytes, level, npool,
+                                       predicate, shard_by, shards)
+    outs = _shard_paths(out_path, nsinks)
+    for o in outs:
+        open(o, "wb").close()
+    comp = run(instr, qvm_exe, "-", sinks=tuple(outs), npool=npool,
                nworkers=nworkers, want_comp=True)
-    footer = (members.join(comp, on="frame", how="left")
-                     .select([c for c, _ in _zf._FOOTER_IPC]))
-    ftmp = tempfile.TemporaryFile()
-    ipc.write_all(ftmp, footer)
-    _zf._write_footer(out_path, ftmp, False); ftmp.close()
-    return footer.height
+    joined = members.join(comp, on="frame", how="left")
+    total = 0
+    for s, o in enumerate(outs):
+        part = (joined.filter(pl.col("sink") == s) if nsinks > 1 else joined) \
+            .select([c for c, _ in _zf._FOOTER_IPC])
+        ftmp = tempfile.TemporaryFile()
+        ipc.write_all(ftmp, part)
+        _zf._write_footer(o, ftmp, False); ftmp.close()
+        total += part.height
+    return total
 
 
 # --------------------------------------------------------------------- unpack
