@@ -374,6 +374,84 @@ static int qvm_run(Instr *ins, int n, int arch_fd, int npool, int nworkers){
     return rc;
 }
 
+/* ----------------------------------------------------- wire decode + CLI    */
+/* Matches quiver/exec/qplan.py _REC (packed, little-endian, 88 bytes). */
+typedef struct __attribute__((packed)) {
+    uint32_t tid; uint8_t op, src, dst, pad;
+    int32_t buf_id, mode;
+    int64_t buf_off, len, cap, lo, arch_off, mtime_ns;
+    uint32_t path_off, path_len, dpath_off, dpath_len, payload_off, payload_len;
+} Rec;
+
+/* Decode [u32 N][u64 heap_len][N×Rec][heap] into an Instr array. Strings point
+ * straight into the (retained) heap, which is \0-terminated per entry. */
+static Instr *qvm_decode(const uint8_t *data, size_t sz, int *n_out,
+                         uint8_t **heap_out){
+    if (sz < 12) return NULL;
+    uint32_t n; uint64_t hlen;
+    memcpy(&n, data, 4); memcpy(&hlen, data + 4, 8);
+    const Rec *rec = (const Rec *)(data + 12);
+    if (sz < 12 + (size_t)n * sizeof(Rec) + hlen) return NULL;
+    const uint8_t *heap = data + 12 + (size_t)n * sizeof(Rec);
+    uint8_t *hcopy = malloc(hlen ? hlen : 1);
+    memcpy(hcopy, heap, hlen);
+    Instr *ins = calloc(n ? n : 1, sizeof(Instr));
+    for (uint32_t i = 0; i < n; i++) {
+        const Rec *r = &rec[i]; Instr *I = &ins[i];
+        I->tid = r->tid; I->op = r->op; I->src = r->src; I->dst = r->dst;
+        I->buf_id = r->buf_id; I->mode = r->mode;
+        I->buf_off = r->buf_off; I->len = r->len; I->cap = r->cap;
+        I->lo = r->lo; I->arch_off = r->arch_off; I->mtime_ns = r->mtime_ns;
+        I->path    = r->path_len    ? (const char *)(hcopy + r->path_off)  : "";
+        I->dpath   = r->dpath_len   ? (const char *)(hcopy + r->dpath_off) : "";
+        I->payload = r->payload_len ? hcopy + r->payload_off : NULL;
+        I->payload_len = r->payload_len;
+    }
+    *n_out = (int)n; *heap_out = hcopy;
+    return ins;
+}
+
+static uint8_t *read_all_fd(int fd, size_t *out){
+    size_t cap = 1<<20, len = 0; uint8_t *b = malloc(cap);
+    for (;;) {
+        if (len == cap) { cap *= 2; b = realloc(b, cap); }
+        ssize_t r = read(fd, b + len, cap - len);
+        if (r < 0) { free(b); return NULL; }
+        if (r == 0) break;
+        len += r;
+    }
+    *out = len; return b;
+}
+
+#ifndef QVM_TEST
+/* qvm <arch|-> <npool> <nworkers> : read an encoded instruction stream on
+ * stdin and execute it. `arch` is the output archive fd for E_ARCH movs. */
+int main(int argc, char **argv){
+    if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
+        fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers]\n", argv[0]);
+        return 2;
+    }
+    const char *arch = argc > 2 ? argv[2] : "-";
+    int npool = argc > 3 ? atoi(argv[3]) : 16;
+    int nworkers = argc > 4 ? atoi(argv[4]) : 8;
+    int arch_fd = -1;
+    if (strcmp(arch, "-") != 0) {
+        arch_fd = open(arch, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (arch_fd < 0) { perror("open arch"); return 2; }
+    }
+    size_t sz; uint8_t *data = read_all_fd(0, &sz);
+    if (!data) { perror("read stdin"); return 2; }
+    int n; uint8_t *heap;
+    Instr *ins = qvm_decode(data, sz, &n, &heap);
+    if (!ins) { fprintf(stderr, "qvm: bad instruction stream\n"); return 2; }
+    int rc = qvm_run(ins, n, arch_fd, npool, nworkers);
+    if (arch_fd >= 0) close(arch_fd);
+    free(ins); free(heap); free(data);
+    if (rc < 0) { fprintf(stderr, "qvm: op failed: %d\n", rc); return 1; }
+    return 0;
+}
+#endif
+
 #ifdef QVM_TEST
 /* ------------------------------------------------------------------- tests */
 #include <assert.h>
