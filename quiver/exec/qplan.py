@@ -304,14 +304,11 @@ def pack_pipe(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
     return footer.height
 
 
-def plan_recompress(tar_path: str, frame_bytes: int = 1 << 20, level: int = 6,
-                    predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """(uncompressed) tar -> compressed nock. Thread 0 loads the whole tar into a
-    shared window (buf 0), then spawns a child per output frame; each child
-    multi-run `deflate`s its members' byte RANGES straight from the window (no
-    re-copy), so a filter that drops members just yields non-contiguous runs.
-    The window is freed after the join (shared read-only, lifetime = the scope).
-    Returns (instr_df, members_df)."""
+def tar_scan(tar_path: str) -> pl.DataFrame:
+    """Decode a (uncompressed) tar into a member-row stream — the same schema as
+    the filesystem scan (path, is_dir, size, mode, mtime_ns, uid, gid) plus the
+    member's location in the archive (offset, header_len, range = header + padded
+    body). So tar decode and fs scan are interchangeable discovery front-ends."""
     import tarfile
     rows = []
     with tarfile.open(tar_path, "r:") as tf:
@@ -319,13 +316,25 @@ def plan_recompress(tar_path: str, frame_bytes: int = 1 << 20, level: int = 6,
             if not m.isfile():
                 continue
             hl = m.offset_data - m.offset
-            rng = hl + ((m.size + 511) // 512) * 512      # header + padded body
-            rows.append({"path": m.name, "offset": m.offset, "header_len": hl,
-                         "size": m.size, "range": rng, "mode": m.mode,
-                         "mtime_ns": int(m.mtime) * 1_000_000_000,
-                         "uid": m.uid, "gid": m.gid})
+            rows.append({"path": m.name, "is_dir": False, "size": m.size,
+                         "mode": m.mode, "mtime_ns": int(m.mtime) * 1_000_000_000,
+                         "uid": m.uid, "gid": m.gid, "offset": m.offset,
+                         "header_len": hl,
+                         "range": hl + ((m.size + 511) // 512) * 512})
+    return pl.DataFrame(rows)
+
+
+def plan_recompress(members: pl.DataFrame, tar_path: str,
+                    frame_bytes: int = 1 << 20, level: int = 6,
+                    predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """(uncompressed) tar -> compressed nock, from a tar_scan member stream.
+    Thread 0 loads the whole tar into a shared window (buf 0), then spawns a
+    child per output frame; each child multi-run `deflate`s its members' byte
+    RANGES straight from the window (no re-copy), so a filter that drops members
+    just yields non-contiguous runs. The window is freed after the join (shared
+    read-only, lifetime = the scope). Returns (instr_df, members_df)."""
     tarsize = os.path.getsize(tar_path)
-    df = pl.DataFrame(rows)
+    df = members
     if predicate is not None:
         df = df.filter(predicate)
     df = df.sort("offset")
@@ -378,7 +387,8 @@ def recompress(tar_path: str, out_path: str, qvm_exe: str,
                nworkers: int = 8, predicate: pl.Expr | None = None) -> int:
     """Plan + run a tar->nock recompress (multi-run gather), then write the
     footer from the completions. Returns the member count."""
-    instr, members = plan_recompress(tar_path, frame_bytes, level, predicate)
+    instr, members = plan_recompress(tar_scan(tar_path), tar_path, frame_bytes,
+                                     level, predicate)
     open(out_path, "wb").close()
     comp = run(instr, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
                nworkers=nworkers, want_comp=True)
