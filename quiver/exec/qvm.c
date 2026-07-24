@@ -885,23 +885,22 @@ static void run_sched(Sched *S){
         while ((t = ready_pop(S))) run_thread(S, t);
         if (S->inflight == 0 && S->pw_count == 0) break;  /* nothing left to do */
         Task *k = tq_pop(&S->comps);         /* one event: completion OR response */
-        if (k->kind == TK_BATCH_READY) {     /* a CALL response the reader fetched */
+        if (k->kind == TK_BATCH_READY) {     /* Python sent a batch (reader thread) */
             uint8_t *raw = k->buf; size_t rawlen = (size_t)k->len; free(k);
-            PW *w = pw_pop(S);               /* matches the oldest pending CALL */
-            if (!raw || !w) {                /* reader EOF with a CALL outstanding */
-                if (w) { S->failed = S->failed ? S->failed : -EIO; free(w); }
-                free(raw); if (S->pw_count == 0 && S->inflight == 0) break; else continue;
+            if (!raw) {                      /* reader EOF: no more batches will come */
+                if (S->pw_count == 0 && S->inflight == 0) break; else continue;
             }
-            S->cur_epoch = w->ep;
-            tr_log(S, w->t0, tr_now(), w->tid, OP_CALL, w->cid, 0, 0, 0); /* Python */
+            PW *w = pw_pop(S);               /* a CALL response? else a PUSHED batch */
+            if (w) { S->cur_epoch = w->ep;
+                tr_log(S, w->t0, tr_now(), w->tid, OP_CALL, w->cid, 0, 0, 0); }
             int nn; char *nap, *nad;
             Instr *nins = qvm_decode_arrow(raw, rawlen, &nn, &nap, &nad);
             int ne = build_batch(S, nins, nn);
             Batch *B = &S->bat[ne];
-            B->wep = w->ep; B->wtid = w->tid; B->hasw = 1;
+            if (w) { B->wep = w->ep; B->wtid = w->tid; B->hasw = 1; free(w); }
+            else B->hasw = 0;                /* pushed batch: independent, no waiter */
             B->pm = nins; B->ap = nap; B->ad = nad; B->raw = raw;  /* freed at retire */
             ready_push(S, &B->th[0]);
-            free(w);
             continue;
         }
         S->inflight--;
