@@ -30,7 +30,8 @@ from ..nock import nockidx as _zf     # the nock footer-index layer (no old-engi
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
  OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER,
- OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE, OP_TARSCAN, OP_SRC_SCAN) = range(1, 19)
+ OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE, OP_TARSCAN, OP_SRC_SCAN,
+ OP_SCANDIR, OP_CKSUM) = range(1, 21)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
@@ -158,15 +159,15 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
 # ------------------------------------------------------------------------ scan
 def scan(root: str, qvm_exe: str, threads: int = 8,
          transport: list | None = None) -> pl.DataFrame:
-    """Parallel filesystem scan by qvm itself (no dependency on the old scanner):
-    `qvm scan <root>` walks the tree with a worker pool and emits one Arrow batch
-    — relative path, is_dir, size, mode, mtime_ns, uid, gid (root excluded, dirs +
-    files incl. empty). Drop-in for wire.scan for the columns the planner uses.
-    `transport=["ssh", host]` runs the scan on a node (root is a remote path)."""
+    """Parallel filesystem scan by qvm itself (OP_SCANDIR): push a one-op batch,
+    the VM walks the tree with a worker pool and pushes one STAT batch back on the
+    DATA channel — relative path, is_dir, size, mode, mtime_ns, uid, gid (root
+    excluded, dirs + files incl. empty). Drop-in for wire.scan for the columns the
+    planner uses. `transport=["ssh", host]` runs it on a node (remote root)."""
     root2 = root if transport else os.path.abspath(root)
-    p = subprocess.run((transport or []) + [qvm_exe, "scan", root2, str(threads)],
-                       stdout=subprocess.PIPE, check=True)
-    df = ipc.read_all(p.stdout)
+    instr = _finalize([pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": OP_SCANDIR, "path": root2, "level": threads}])])
+    df = _push_scan(instr, qvm_exe, transport=transport)
     return df.with_columns(pl.col("is_dir").cast(pl.Boolean))
 
 
@@ -404,10 +405,11 @@ def tar_scan(tar_path: str, qvm_exe: str | None = None) -> pl.DataFrame:
     ustar/PAX/GNU, no per-member Python) — far faster for many-member tars, so
     recompress can scan in C and gather from qvm's own buffer instead of shipping
     decoded windows through the pipe. Without it, the tarfile fallback."""
-    if qvm_exe is not None:
-        p = subprocess.run([qvm_exe, "tarscan", os.path.abspath(tar_path)],
-                           stdout=subprocess.PIPE, check=True)
-        return ipc.read_all(p.stdout)
+    if qvm_exe is not None:                        # OP_TARSCAN file mode (mmap + parse)
+        instr = _finalize([pl.DataFrame([
+            {"tid": 0, "_sub": 0, "op": OP_TARSCAN, "buf_id": -1,
+             "path": os.path.abspath(tar_path)}])])
+        return _push_scan(instr, qvm_exe)
     import tarfile
     rows = []
     with tarfile.open(tar_path, "r:") as tf:
@@ -1031,13 +1033,18 @@ def verify(archive: str, qvm_exe: str, npool: int = 16, nworkers: int = 8
 # ------------------------------------------------------------------------ S3
 def s3_etags(paths: list[str], qvm_exe: str, part_size: int = 8 << 20,
              threads: int = 8) -> pl.DataFrame:
-    """Local S3-compatible ETags (+ CRC64NVME) computed by qvm: single PutObject
-    (<= part_size) → MD5(file); multipart → MD5(concat of per-part MD5s)+"-N".
-    Returns {path, etag, cksum} — the basis for content-addressed S3 sync."""
-    p = subprocess.run([qvm_exe, "etag", str(part_size), str(threads)],
-                       input="\n".join(paths).encode(), stdout=subprocess.PIPE,
-                       check=True)
-    return ipc.read_all(p.stdout)
+    """Local S3-compatible ETags (+ CRC64NVME) computed by qvm (OP_CKSUM): single
+    PutObject (<= part_size) → MD5(file); multipart → MD5(concat of per-part
+    MD5s)+"-N". The newline-joined paths ride in the op's payload; the VM hashes
+    them in parallel and pushes {path, etag, cksum} back on the DATA channel — the
+    basis for content-addressed S3 sync."""
+    if not paths:
+        return pl.DataFrame(schema={"path": pl.Utf8, "etag": pl.Utf8,
+                                    "cksum": pl.Int64})
+    instr = _finalize([pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": OP_CKSUM, "payload": "\n".join(paths).encode(),
+         "cap": part_size, "level": threads}])])
+    return _push_scan(instr, qvm_exe)
 
 
 def _s3_put(client, bucket, key, local, size, part_size):
@@ -1238,6 +1245,16 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
     {frame, coff, clen} completions if want_comp. `sinks` are deflate outputs."""
     return push_exec(lambda vm: vm.push(instr), qvm_exe, arch_path, sinks, npool,
                      nworkers, want_comp, env=env, transport=transport)
+
+
+def _push_scan(instr: pl.DataFrame, qvm_exe: str,
+               transport: list | None = None) -> pl.DataFrame:
+    """Push a single scanning-op batch (OP_SCANDIR / OP_CKSUM / OP_TARSCAN) and
+    return the one member/stat batch the VM pushes back on the DATA channel."""
+    out = {}
+    push_exec(lambda vm: (vm.push(instr), out.__setitem__("df", vm.read_rows())),
+              qvm_exe, "-", transport=transport)
+    return out["df"]
 
 
 def _empty_batch() -> pl.DataFrame:

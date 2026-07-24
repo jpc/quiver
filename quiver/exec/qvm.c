@@ -66,6 +66,8 @@ enum {
     OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE,  /* streaming decompress source */
     OP_TARSCAN,                              /* parse decoded tar → DATA rows */
     OP_SRC_SCAN,                             /* decode window + member-aligned scan → DATA */
+    OP_SCANDIR,                              /* parallel fs walk → STAT rows on DATA */
+    OP_CKSUM,                                /* S3 ETag + CRC64 per path → DATA rows */
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -757,7 +759,10 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
 }
 
 /* run a thread from pc until it suspends (task in flight / parked) or finishes */
-static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz);  /* defined below */
+static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz);       /* defined below */
+static int  emit_tarscan_file(Sched *S, const char *tar_path);         /* scanning ops */
+static int  emit_scandir(Sched *S, const char *root, int nthreads);
+static void emit_cksum(Sched *S, const char *in, size_t len, int64_t part_size, int nthreads);
 
 static void run_thread(Sched *S, Thread *t){
     S->cur_epoch = t->epoch;                      /* for tr_log */
@@ -791,11 +796,28 @@ static void run_thread(Sched *S, Thread *t){
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
             return;
         }
-        case OP_TARSCAN: {                       /* parse decoded tar → DATA rows */
-            uint8_t *m = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
-            int64_t len = I->len ? I->len : (m ? S->pool[I->buf_id].cap : 0);
-            emit_tarscan(S, m ? m + I->buf_off : NULL, len);
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, len, 0);
+        case OP_TARSCAN: {                       /* parse tar → DATA rows */
+            if (I->buf_id < 0 && I->path && I->path[0]) {   /* file mode: mmap + scan */
+                int rc = emit_tarscan_file(S, I->path);
+                if (rc) S->failed = S->failed ? S->failed : rc;
+            } else {                              /* buffer mode: scan pool[buf_id] */
+                uint8_t *m = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
+                int64_t len = I->len ? I->len : (m ? S->pool[I->buf_id].cap : 0);
+                emit_tarscan(S, m ? m + I->buf_off : NULL, len);
+            }
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, I->len, 0);
+            t->pc++; break;
+        }
+        case OP_SCANDIR: {                       /* parallel fs walk → STAT rows */
+            int rc = emit_scandir(S, I->path, I->level > 0 ? I->level : 8);
+            if (rc) S->failed = S->failed ? S->failed : rc;
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_SCANDIR, 0, 0, 0, 0);
+            t->pc++; break;
+        }
+        case OP_CKSUM: {                         /* S3 ETag + CRC64 per path → DATA */
+            emit_cksum(S, (const char *)I->payload, (size_t)I->payload_len,
+                       I->cap, I->level > 0 ? I->level : 8);
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_CKSUM, 0, 0, 0, 0);
             t->pc++; break;
         }
         case OP_SRC_NEXT: {                      /* decode next window → buf/sink (task) */
@@ -1452,16 +1474,21 @@ static void emit_data(Sched *S, uint8_t kind, const uint8_t *buf, uint32_t len){
 /* OP_TARSCAN: parse the decoded tar image in pool[buf_id] region [off,off+len)
  * into member rows and push them down the DATA channel. Builds the QTAR batch
  * into a memfd (to learn its length), then frames it as one DATA message. */
-/* Serialize a TAcc as one QTAR batch (via a memfd, to learn its length) and push
- * it down the DATA channel as member rows (kind 0). */
-static void emit_tacc(Sched *S, TAcc *a){
-    int mfd = memfd_create("qtar", 0);
-    if (mfd < 0) return;
-    emit_qtar(mfd, a);
+/* An op emits its result batch by writing schema+batch+eos to a memfd (to learn
+ * the length), then framing it as one DATA message (kind 0 = rows). Shared by
+ * every scanning op — tar, fs, etag. */
+static void memfd_to_data(Sched *S, int mfd){
     off_t n = lseek(mfd, 0, SEEK_END);
     uint8_t *bytes = malloc(n ? n : 1);
     if (bytes && pread(mfd, bytes, n, 0) == n) emit_data(S, 0, bytes, (uint32_t)n);
     free(bytes); close(mfd);
+}
+
+static void emit_tacc(Sched *S, TAcc *a){
+    int mfd = memfd_create("qtar", 0);
+    if (mfd < 0) return;
+    emit_qtar(mfd, a);
+    memfd_to_data(S, mfd);
 }
 
 static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz){
@@ -1481,16 +1508,18 @@ static int64_t scan_window_emit(struct Sched_ *S, const uint8_t *buf, int64_t M,
     return n;
 }
 
-static int qvm_tarscan(const char *tar_path, int outfd){
+/* OP_TARSCAN file mode: mmap a whole tar and push its members on the DATA
+ * channel (the old `tarscan` subcommand, now an op). Returns 0 or -errno. */
+static int emit_tarscan_file(Sched *S, const char *tar_path){
     int fd = open(tar_path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "qvm tarscan: %s: %s\n", tar_path, strerror(errno)); return 1; }
-    struct stat st; if (fstat(fd, &st)) { close(fd); return 1; }
+    if (fd < 0) return -errno;
+    struct stat st; if (fstat(fd, &st)) { int e = -errno; close(fd); return e; }
     int64_t sz = st.st_size;
     uint8_t *m = sz ? mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
-    if (sz && m == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
+    if (sz && m == MAP_FAILED) { close(fd); return -errno; }
     TAcc a; memset(&a, 0, sizeof a);
     tar_parse(m, sz, &a);
-    emit_qtar(outfd, &a);
+    emit_tacc(S, &a);
     if (m) munmap(m, sz); close(fd);
     tacc_free(&a);
     return 0;
@@ -1588,38 +1617,53 @@ static void *scan_worker(void *arg){
     }
     return NULL;
 }
-static int qvm_scan(const char *root, int nthreads, int outfd){
+/* Parallel walk of `root` into `s` (worker threads on a dir queue). 0 or -errno. */
+static int scandir_run(const char *root, int nthreads, Scan *s){
     int rfd = open(root, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if (rfd < 0) { fprintf(stderr, "qvm scan: open %s: %s\n", root, strerror(errno)); return 1; }
+    if (rfd < 0) return -errno;
     struct stat rst; uint64_t rino = fstat(rfd, &rst) == 0 ? (uint64_t)rst.st_ino : 0;
-    Scan s; memset(&s, 0, sizeof s);
-    pthread_mutex_init(&s.qmu,0); pthread_cond_init(&s.qcv,0); pthread_mutex_init(&s.amu,0);
+    memset(s, 0, sizeof *s);
+    pthread_mutex_init(&s->qmu,0); pthread_cond_init(&s->qcv,0); pthread_mutex_init(&s->amu,0);
     if (nthreads < 1) nthreads = 1;
-    sq_push(&s, rfd, strdup(""), rino);             /* seed: root, rel "" */
+    sq_push(s, rfd, strdup(""), rino);              /* seed: root, rel "" */
     pthread_t *th = malloc(nthreads*sizeof *th);
-    for (int i=0;i<nthreads;i++) pthread_create(&th[i],0,scan_worker,&s);
+    for (int i=0;i<nthreads;i++) pthread_create(&th[i],0,scan_worker,s);
     for (int i=0;i<nthreads;i++) pthread_join(th[i],0);
-
-    emit_schema(outfd, QSCAN_SCHEMA_META, QSCAN_SCHEMA_LEN);
-    int64_t n = s.n;
+    free(th);
+    return 0;
+}
+static void emit_scan(int fd, Scan *s){
+    int64_t n = s->n;
+    emit_schema(fd, QSCAN_SCHEMA_META, QSCAN_SCHEMA_LEN);
     struct WBuf b[QSCAN_N_BUFS] = {
-        {NULL,0},{s.poff, 8*(n+1)},{s.pdata, s.plen},
-        {NULL,0},{s.isdir, n},     {NULL,0},{s.size, 8*n},
-        {NULL,0},{s.mode, 4*n},    {NULL,0},{s.mtime, 8*n},
-        {NULL,0},{s.uid, 4*n},     {NULL,0},{s.gid, 4*n},
-        {NULL,0},{s.ino, 8*n},     {NULL,0},{s.pino, 8*n},
-        {NULL,0},{s.dev, 8*n},     {NULL,0},{s.blocks, 8*n},
-        {NULL,0},{s.nlink, 4*n},   {NULL,0},{s.atime, 8*n},
-        {NULL,0},{s.ctime, 8*n},   {NULL,0},{s.depth, 4*n}};
+        {NULL,0},{s->poff, 8*(n+1)},{s->pdata, s->plen},
+        {NULL,0},{s->isdir, n},     {NULL,0},{s->size, 8*n},
+        {NULL,0},{s->mode, 4*n},    {NULL,0},{s->mtime, 8*n},
+        {NULL,0},{s->uid, 4*n},     {NULL,0},{s->gid, 4*n},
+        {NULL,0},{s->ino, 8*n},     {NULL,0},{s->pino, 8*n},
+        {NULL,0},{s->dev, 8*n},     {NULL,0},{s->blocks, 8*n},
+        {NULL,0},{s->nlink, 4*n},   {NULL,0},{s->atime, 8*n},
+        {NULL,0},{s->ctime, 8*n},   {NULL,0},{s->depth, 4*n}};
     if (n == 0) b[1] = (struct WBuf){NULL,0};       /* no offsets when empty */
-    emit_batch(outfd, QSCAN_BATCH_TMPL, QSCAN_TMPL_LEN, QSCAN_OFF_BODYLEN,
+    emit_batch(fd, QSCAN_BATCH_TMPL, QSCAN_TMPL_LEN, QSCAN_OFF_BODYLEN,
                QSCAN_OFF_RBLEN, QSCAN_NODE_OFF, QSCAN_N_NODES,
                QSCAN_BUF_OFF, QSCAN_N_BUFS, n, b);
-    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
-    free(s.poff); free(s.pdata); free(s.isdir); free(s.size); free(s.mtime);
-    free(s.atime); free(s.ctime); free(s.blocks); free(s.mode); free(s.uid);
-    free(s.gid); free(s.nlink); free(s.depth); free(s.ino); free(s.pino);
-    free(s.dev); free(th);
+    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(fd, eos, 8);
+}
+static void scan_free(Scan *s){
+    free(s->poff); free(s->pdata); free(s->isdir); free(s->size); free(s->mtime);
+    free(s->atime); free(s->ctime); free(s->blocks); free(s->mode); free(s->uid);
+    free(s->gid); free(s->nlink); free(s->depth); free(s->ino); free(s->pino);
+    free(s->dev);
+}
+
+/* OP_SCANDIR: walk `root` and push the full STAT batch on the DATA channel. */
+static int emit_scandir(Sched *S, const char *root, int nthreads){
+    Scan s; int rc = scandir_run(root, nthreads, &s);
+    if (rc) return rc;
+    int mfd = memfd_create("qscan", 0);
+    if (mfd >= 0) { emit_scan(mfd, &s); memfd_to_data(S, mfd); }
+    scan_free(&s);
     return 0;
 }
 
@@ -1682,12 +1726,10 @@ static void *etag_worker(void *arg){
     }
     return NULL;
 }
-static int qvm_etag(int64_t part_size, int nthreads, int outfd){
+/* OP_CKSUM: compute S3 ETag + CRC64 for each newline-separated path in `in`,
+ * parallel across files, and push (path, etag, cksum) rows on the DATA channel. */
+static void emit_cksum(Sched *S, const char *in, size_t len, int64_t part_size, int nthreads){
     pthread_once(&g_crc64_once, crc64_setup);
-    /* read newline-separated paths from stdin */
-    size_t cap = 1<<16, len = 0; char *in = malloc(cap);
-    ssize_t r; while ((r = read(0, in+len, cap-len)) > 0) { len += r;
-        if (len == cap) { cap *= 2; in = realloc(in, cap); } }
     char **paths = NULL; int n = 0, pc = 0;
     for (size_t i = 0, s = 0; i <= len; i++) {
         if (i == len || in[i] == '\n') { if (i > s) {
@@ -1700,7 +1742,7 @@ static int qvm_etag(int64_t part_size, int nthreads, int outfd){
     pthread_t *th = malloc(nthreads*sizeof *th);
     for (int i=0;i<nthreads;i++) pthread_create(&th[i],0,etag_worker,&j);
     for (int i=0;i<nthreads;i++) pthread_join(th[i],0);
-    /* build large_utf8 (path, etag) + i64 cksum, emit QETAG */
+    /* build large_utf8 (path, etag) + i64 cksum, emit QETAG to a memfd → DATA */
     int64_t *poff = malloc((n+1)*8), *eoff = malloc((n+1)*8);
     int64_t pl=0, el=0; poff[0]=eoff[0]=0;
     for (int i=0;i<n;i++){ pl += strlen(paths[i]); poff[i+1]=pl;
@@ -1711,19 +1753,22 @@ static int qvm_etag(int64_t part_size, int nthreads, int outfd){
         const char *e=j.etags[i]?j.etags[i]:""; size_t b=strlen(e); memcpy(ed+eo,e,b); eo+=b; }
     int64_t *cks = malloc((n?n:1)*8);
     for (int i=0;i<n;i++) cks[i] = (int64_t)j.crc[i];
-    emit_schema(outfd, QETAG_SCHEMA_META, QETAG_SCHEMA_LEN);
-    struct WBuf b[QETAG_N_BUFS] = {
-        {NULL,0},{poff,8*(n+1)},{pd,pl}, {NULL,0},{eoff,8*(n+1)},{ed,el},
-        {NULL,0},{cks,8*n}};
-    if (n==0){ b[1]=(struct WBuf){NULL,0}; b[4]=(struct WBuf){NULL,0}; }
-    emit_batch(outfd, QETAG_BATCH_TMPL, QETAG_TMPL_LEN, QETAG_OFF_BODYLEN,
-               QETAG_OFF_RBLEN, QETAG_NODE_OFF, QETAG_N_NODES,
-               QETAG_BUF_OFF, QETAG_N_BUFS, n, b);
-    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
+    int mfd = memfd_create("qetag", 0);
+    if (mfd >= 0) {
+        emit_schema(mfd, QETAG_SCHEMA_META, QETAG_SCHEMA_LEN);
+        struct WBuf b[QETAG_N_BUFS] = {
+            {NULL,0},{poff,8*(n+1)},{pd,pl}, {NULL,0},{eoff,8*(n+1)},{ed,el},
+            {NULL,0},{cks,8*n}};
+        if (n==0){ b[1]=(struct WBuf){NULL,0}; b[4]=(struct WBuf){NULL,0}; }
+        emit_batch(mfd, QETAG_BATCH_TMPL, QETAG_TMPL_LEN, QETAG_OFF_BODYLEN,
+                   QETAG_OFF_RBLEN, QETAG_NODE_OFF, QETAG_N_NODES,
+                   QETAG_BUF_OFF, QETAG_N_BUFS, n, b);
+        uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(mfd, eos, 8);
+        memfd_to_data(S, mfd);
+    }
     for (int i=0;i<n;i++){ free(paths[i]); free(j.etags[i]); }
     free(paths); free(j.etags); free(j.crc); free(j.err); free(th);
-    free(poff); free(eoff); free(pd); free(ed); free(cks); free(in);
-    return 0;
+    free(poff); free(eoff); free(pd); free(ed); free(cks);
 }
 
 #ifndef QVM_TEST
@@ -1733,16 +1778,11 @@ static int qvm_etag(int64_t part_size, int nthreads, int outfd){
  * (O_RDWR|CREAT|TRUNC). Deflate completions {frame_id, coff, clen} are written
  * to the `comp` file path as [u32 n][n×3 i64] unless it is "-". */
 int main(int argc, char **argv){
-    if (argc >= 3 && strcmp(argv[1], "scan") == 0)   /* qvm scan <root> [threads] */
-        return qvm_scan(argv[2], argc > 3 ? atoi(argv[3]) : 8, 1);
-    if (argc >= 3 && strcmp(argv[1], "etag") == 0)   /* qvm etag <part_size> [threads] <stdin paths */
-        return qvm_etag(atoll(argv[2]), argc > 3 ? atoi(argv[3]) : 8, 1);
-    if (argc >= 3 && strcmp(argv[1], "tarscan") == 0)   /* qvm tarscan <tar> */
-        return qvm_tarscan(argv[2], 1);
+    /* scan / etag / tarscan are now OPS (OP_SCANDIR / OP_CKSUM / OP_TARSCAN),
+     * pushed like any other batch — no subcommands. */
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
         fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [comp|-] "
-                        "[callfd|-] [sink ...]\n  or:  %s scan <root> [threads]\n",
-                argv[0], argv[0]);
+                        "[callfd|-] [sink ...]\n", argv[0]);
         return 2;
     }
     const char *arch = argc > 2 ? argv[2] : "-";
