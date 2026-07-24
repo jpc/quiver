@@ -29,7 +29,8 @@ from ..nock import nockidx as _zf     # the nock footer-index layer (no old-engi
 
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
- OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER) = range(1, 14)
+ OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER,
+ OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE) = range(1, 17)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)

@@ -62,6 +62,7 @@ enum {
     OP_ALLOC = 1, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA,
     OP_SPAWN, OP_JOIN, OP_INFLATE, OP_DEFLATE, OP_CALL,
     OP_UNLINK, OP_RMDIR, OP_FBARRIER,     /* teardown + durability (mirror/sync) */
+    OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE,  /* streaming decompress source */
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -136,12 +137,19 @@ static uint64_t xxh_digest(XXH *s){
     h^=h>>33; h*=XXH_P2; h^=h>>29; h*=XXH_P3; h^=h>>32; return h;
 }
 
+/* a streaming decompress source: a stateful zstd stream over a file, drained
+ * window-by-window by OP_SRC_NEXT. A source is decoded by ONE (serial, low-tid)
+ * fiber, so no lock — the read-side analog of a Sink. */
+typedef struct { ZSTD_DStream *ds; int fd; uint8_t *in; size_t incap, inpos, inlen;
+                 int eof; int64_t produced; } Source;
+
 typedef struct Task {
     uint32_t tid;
     uint8_t  kind;               /* mirrors the mov case / namespace op */
     int      arch_fd;
     uint8_t *buf; int64_t buf_off, arch_off, len;
     uint8_t **bufv;              /* deflate: pool[i].mem snapshot — a run's buf_id */
+    Source  *source;             /* OP_SRC_NEXT: the stream to drain */
     const char *path, *dpath;
     const uint8_t *payload; int64_t payload_len;
     int32_t mode; int64_t mtime_ns;
@@ -155,6 +163,7 @@ enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_INLINE_TO_ARCH, TK_CFR_FS_TO_FS, TK_CFR_FS_TO_ARCH,
        TK_MKDIR, TK_SETMETA, TK_INFLATE, TK_DEFLATE,
        TK_UNLINK, TK_RMDIR, TK_FBARRIER,   /* teardown + durability */
+       TK_SRC_NEXT,                        /* decode next window from a source */
        TK_BATCH_READY };   /* reader thread → scheduler: a CALL response arrived */
 
 #define QCAP 4096
@@ -288,6 +297,41 @@ static void run_task(Task *t){
         if (fsync(fd) < 0) t->res = -errno;
         if (t->path && t->path[0]) close(fd);        /* don't close the archive fd */
         break;
+    }
+    case TK_SRC_NEXT: {          /* decode the next window (<= len) → sink; serial */
+        Source *s = t->source;
+        uint8_t *win = malloc((size_t)t->len);
+        if (!win) { t->res = -ENOMEM; break; }
+        ZSTD_outBuffer out = {win, (size_t)t->len, 0};
+        while (out.pos < out.size && !s->eof) {
+            if (s->inpos >= s->inlen) {           /* refill compressed input */
+                ssize_t r = read(s->fd, s->in, s->incap);
+                if (r < 0) { t->res = -errno; break; }
+                if (r == 0) { s->eof = 1; break; }
+                s->inpos = 0; s->inlen = (size_t)r;
+            }
+            ZSTD_inBuffer in = {s->in, s->inlen, s->inpos};
+            size_t rc = ZSTD_decompressStream(s->ds, &out, &in);
+            s->inpos = in.pos;
+            if (ZSTD_isError(rc)) { t->res = -EIO; break; }
+        }
+        size_t n = out.pos; s->produced += (int64_t)n;
+        if (t->res == 0 && t->sink && n) {        /* append the window to the sink */
+            Sink *sk = t->sink;
+            if (sk->is_pipe) { pthread_mutex_lock(&sk->mu);
+                int64_t coff = sk->cursor; size_t off = 0;
+                while (off < n) { ssize_t w = write(sk->fd, win+off, n-off);
+                    if (w <= 0) { t->res = -errno; break; } off += (size_t)w; }
+                sk->cursor += (int64_t)n; pthread_mutex_unlock(&sk->mu);
+                t->coff = coff;
+            } else { pthread_mutex_lock(&sk->mu);
+                int64_t coff = sk->cursor; sk->cursor += (int64_t)n;
+                pthread_mutex_unlock(&sk->mu);
+                if (pwrite(sk->fd, win, n, coff) != (ssize_t)n) t->res = -errno;
+                t->coff = coff; }
+        }
+        t->clen = (int64_t)n; t->digest = s->eof;   /* report decoded size + eof */
+        free(win); break;
     }
     case TK_DEFLATE: {
         /* compress and append to the sink. payload (if present) is a packed list
@@ -430,6 +474,7 @@ typedef struct {
     BufSlot *pool; int npool;
     int arch_fd;
     Sink *sinks; int nsinks;
+    Source *src; int nsrc;                          /* streaming decompress sources */
     TQ tasks, comps;
     int inflight;
     Thread *ready_head, *ready_tail;
@@ -639,6 +684,30 @@ static void run_thread(Sched *S, Thread *t){
         case OP_FREE:
             tr_log(S, tr_now(), tr_now(), t->tid, OP_FREE, I->buf_id, 0, 0, 0);
             pool_free(S, I->buf_id); t->pc++; break;
+        case OP_SRC_OPEN: {                      /* open src[lo] over path (zstd) */
+            Source *s = &S->src[I->lo];
+            s->fd = open(I->path, O_RDONLY|O_CLOEXEC);
+            if (s->fd < 0) S->failed = S->failed ? S->failed : -errno;
+            else { s->ds = ZSTD_createDStream(); ZSTD_initDStream(s->ds);
+                   s->incap = 1<<20; s->in = malloc(s->incap);
+                   s->inpos = s->inlen = 0; s->eof = 0; s->produced = 0; }
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
+            t->pc++; break;
+        }
+        case OP_SRC_CLOSE: {
+            Source *s = &S->src[I->lo];
+            if (s->ds) ZSTD_freeDStream(s->ds);
+            if (s->fd > 0) close(s->fd); free(s->in); memset(s, 0, sizeof *s);
+            t->pc++; break;
+        }
+        case OP_SRC_NEXT: {                      /* decode next window → sink (task) */
+            Task *k = calloc(1, sizeof *k);
+            k->tid = t->tid; k->epoch = t->epoch; k->op = I->op; k->kind = TK_SRC_NEXT;
+            k->source = &S->src[I->lo]; k->sink = &S->sinks[I->sink];
+            k->len = I->len; k->buf_log = -1;
+            t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
+            return;
+        }
         case OP_MOV:
             submit_mov(S, t, I);
             if (t->st == T_WAIT_IO) return;    /* async: wait for completion */
@@ -762,6 +831,7 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     memset(S, 0, sizeof *S);
     S->arch_fd = arch_fd; S->npool = npool; S->call_fd = call_fd;
     S->pool = calloc(npool, sizeof(BufSlot));
+    S->nsrc = 8; S->src = calloc(S->nsrc, sizeof(Source));   /* decompress sources */
     S->nsinks = nsinks;
     /* WAL: resume-after-crash. QVM_WAL=<path> → append (frame,coff,clen,digest)
      * per committed deflate, fsync'd periodically. QVM_SINK_STARTS=off0,off1,...
@@ -901,6 +971,9 @@ static void qvm_close(Sched *S){
     }
     free(S->tr);
     for (int i = 0; i < S->npool; i++) free(S->pool[i].mem);
+    for (int i = 0; i < S->nsrc; i++) { Source *s = &S->src[i];  /* leftover sources */
+        if (s->ds) ZSTD_freeDStream(s->ds); if (s->fd > 0) close(s->fd); free(s->in); }
+    free(S->src);
     for (int i = 0; i < S->nsinks; i++) pthread_mutex_destroy(&S->sinks[i].mu);
     for (int i = 0; i < S->nbat; i++) {          /* any un-retired batch memory */
         free(S->bat[i].th); free(S->bat[i].pm);
