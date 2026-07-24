@@ -1314,18 +1314,6 @@ static int qvm_etag(int64_t part_size, int nthreads, int outfd){
     return 0;
 }
 
-static uint8_t *read_all_fd(int fd, size_t *out){
-    size_t cap = 1<<20, len = 0; uint8_t *b = malloc(cap);
-    for (;;) {
-        if (len == cap) { cap *= 2; b = realloc(b, cap); }
-        ssize_t r = read(fd, b + len, cap - len);
-        if (r < 0) { free(b); return NULL; }
-        if (r == 0) break;
-        len += r;
-    }
-    *out = len; return b;
-}
-
 #ifndef QVM_TEST
 /* qvm <arch|-> <npool> <nworkers> <comp|-> [sink ...] : read an Arrow
  * instruction stream on stdin and execute it. `arch` is the archive fd

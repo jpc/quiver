@@ -419,44 +419,66 @@ def tar_scan(tar_path: str) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
-def plan_recompress(members: pl.DataFrame, tar_path: str,
-                    frame_bytes: int = 1 << 20, level: int = 6,
-                    predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """(uncompressed) tar -> compressed nock, from a tar_scan member stream.
-    Thread 0 loads the whole tar into a shared window (buf 0), then spawns a
-    child per output frame; each child multi-run `deflate`s its members' byte
-    RANGES straight from the window (no re-copy), so a filter that drops members
-    just yields non-contiguous runs. The window is freed after the join (shared
-    read-only, lifetime = the scope). Returns (instr_df, members_df)."""
-    tarsize = os.path.getsize(tar_path)
-    df = members
-    if predicate is not None:
-        df = df.filter(predicate)
-    df = df.sort("offset")
+# The multi-run GATHER core, shared by every tar→nock path (recompress, windowed,
+# streaming). Members carry a buffer-relative offset `boff`; they are grouped into
+# frames by cumulative footprint, each member gets its in-frame offset, and each
+# frame's contiguous (off,len) runs are packed for the in-place deflate. The three
+# planners differ ONLY in how the buffer is filled (whole tar / window load /
+# inline) — the gather itself is identical.
+def _gather_frames(df: pl.DataFrame, frame_bytes: int):
+    """Returns (df + frame/in_off, per-frame clen table, {frame: packed runs})."""
+    df = df.sort("boff")
     df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
     df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
     df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
     df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
-    # runs: a new run whenever the frame changes or the tar is non-contiguous
-    df = df.with_columns(_pe=(pl.col("offset") + pl.col("range")).shift(1),
-                         _pf=pl.col("frame").shift(1))
-    df = df.with_columns(_new=((pl.col("offset") != pl.col("_pe"))
+    df = df.with_columns(_pe=(pl.col("boff") + pl.col("range")).shift(1),
+                         _pf=pl.col("frame").shift(1))     # a new run when the frame
+    df = df.with_columns(_new=((pl.col("boff") != pl.col("_pe"))   # changes or the
                                | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
-    df = df.with_columns(run=pl.col("_new").cum_sum())
+    df = df.with_columns(run=pl.col("_new").cum_sum())     # buffer is non-contiguous
     runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
-                                   off=pl.col("offset").min(),
-                                   rlen=pl.col("range").sum())
-              .sort("off"))                       # gather order = tar order
+                                   off=pl.col("boff").min(),
+                                   rlen=pl.col("range").sum()).sort("off"))
     frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
-    nf = frames.height
-    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"),
-                                                          pl.col("rlen"))
+    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
     payloads = {}
     for r in rbf.iter_rows(named=True):
         a = np.empty(2 * len(r["off"]), dtype="<i8")
         a[0::2] = r["off"]; a[1::2] = r["rlen"]
         payloads[int(r["frame"])] = a.tobytes()
+    return df, frames, payloads
 
+
+def _gather_deflate(frames: pl.DataFrame, payloads: dict, buf_id: int,
+                    level: int, frame_base: int) -> pl.DataFrame:
+    """Per-frame multi-run deflate rows (digest on) — one thread per frame."""
+    return frames.with_columns(
+        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
+        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
+        buf_id=pl.lit(buf_id), buf_off=pl.lit(0), len=pl.col("clen"),
+        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1),   # digest on
+        frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
+
+
+def _gather_members(df: pl.DataFrame, frame_base: int) -> pl.DataFrame:
+    return df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
+                     frame=pl.col("frame") + frame_base, in_off="in_off")
+
+
+def plan_recompress(members: pl.DataFrame, tar_path: str,
+                    frame_bytes: int = 1 << 20, level: int = 6,
+                    predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """(uncompressed) tar -> compressed nock, from a tar_scan member stream.
+    Thread 0 loads the whole tar into a shared window (buf 0), spawns a child per
+    output frame that multi-run `deflate`s its members' byte RANGES straight from
+    the window (a dropped member just yields non-contiguous runs), and frees it
+    after the join. Returns (instr_df, members_df)."""
+    tarsize = os.path.getsize(tar_path)
+    df = members if predicate is None else members.filter(predicate)
+    df = df.with_columns(boff=pl.col("offset"))            # buffer = the whole tar
+    df, frames, payloads = _gather_frames(df, frame_bytes)
+    nf = frames.height
     root_df = pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": tarsize},
         {"tid": 0, "_sub": 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
@@ -464,16 +486,8 @@ def plan_recompress(members: pl.DataFrame, tar_path: str,
         {"tid": 0, "_sub": 2, "op": OP_SPAWN, "lo": 1, "cap": nf},
         {"tid": 0, "_sub": 3, "op": OP_JOIN, "lo": 1, "cap": nf},
         {"tid": 0, "_sub": _BIG, "op": OP_FREE, "buf_id": 0}])
-    deflate = frames.with_columns(
-        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
-        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
-        buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
-        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1), frame_id=pl.col("frame"),
-        payload=pl.col("payload"))
-    instr = _finalize([root_df, deflate])
-    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
-                        "frame", "in_off")
-    return instr, members
+    instr = _finalize([root_df, _gather_deflate(frames, payloads, 0, level, 0)])
+    return instr, _gather_members(df, 0)
 
 
 def recompress(tar_path: str, out_path: str, qvm_exe: str,
@@ -496,40 +510,14 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
     frame, each multi-run `deflate`s its members' WINDOW-RELATIVE ranges from the
     window buffer `buf_id` (the driver holds it). No alloc/free here — the driver
     owns the buffer. Returns (instr_df, members_df)."""
-    df = wdf.sort("offset").with_columns(rel=pl.col("offset") - win_start)
-    df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
-    df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
-    df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
-    df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
-    df = df.with_columns(_pe=(pl.col("rel") + pl.col("range")).shift(1),
-                         _pf=pl.col("frame").shift(1))
-    df = df.with_columns(_new=((pl.col("rel") != pl.col("_pe"))
-                               | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
-    df = df.with_columns(run=pl.col("_new").cum_sum())
-    runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
-                                   off=pl.col("rel").min(),
-                                   rlen=pl.col("range").sum()).sort("off"))
-    frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
+    df = wdf.with_columns(boff=pl.col("offset") - win_start)   # relative to window
+    df, frames, payloads = _gather_frames(df, frame_bytes)
     nf = frames.height
-    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
-    payloads = {}
-    for r in rbf.iter_rows(named=True):
-        a = np.empty(2 * len(r["off"]), dtype="<i8")
-        a[0::2] = r["off"]; a[1::2] = r["rlen"]
-        payloads[int(r["frame"])] = a.tobytes()
     root_df = pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
-    deflate = frames.with_columns(
-        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
-        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
-        buf_id=pl.lit(buf_id), buf_off=pl.lit(0), len=pl.col("clen"),
-        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1),   # digest on
-        frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
-    instr = _finalize([root_df, deflate])
-    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
-                        frame=pl.col("frame") + frame_base, in_off="in_off")
-    return instr, members
+    instr = _finalize([root_df, _gather_deflate(frames, payloads, buf_id, level, frame_base)])
+    return instr, _gather_members(df, frame_base)
 
 
 def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
@@ -547,30 +535,11 @@ def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
         df = df.filter(predicate)
     if df.height == 0:
         return _empty_batch(), pl.DataFrame(schema={"frame": pl.Int64})
-    df = df.sort("offset").with_columns(rel=pl.col("offset") - win_start)
-    df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
-    df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
-    df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
-    df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
-    df = df.with_columns(_pe=(pl.col("rel") + pl.col("range")).shift(1),
-                         _pf=pl.col("frame").shift(1))
-    df = df.with_columns(_new=((pl.col("rel") != pl.col("_pe"))
-                               | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
-    df = df.with_columns(run=pl.col("_new").cum_sum())
-    runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
-                                   off=pl.col("rel").min(),
-                                   rlen=pl.col("range").sum()).sort("off"))
-    frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
+    df = df.with_columns(boff=pl.col("offset") - win_start)    # relative to window
+    df, frames, payloads = _gather_frames(df, frame_bytes)
     nf = frames.height
-    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
-    payloads = {}
-    for r in rbf.iter_rows(named=True):
-        a = np.empty(2 * len(r["off"]), dtype="<i8")
-        a[0::2] = r["off"]; a[1::2] = r["rlen"]
-        payloads[int(r["frame"])] = a.tobytes()
-    wlen = len(win_bytes)
     root = pl.concat([
-        pl.DataFrame([{"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": wlen}]),
+        pl.DataFrame([{"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": len(win_bytes)}]),
         pl.DataFrame({"tid": [0], "_sub": [1], "op": [OP_MOV], "src": [E_INLINE],
                       "dst": [E_BUF], "buf_id": [0], "buf_off": [0],
                       "payload": [win_bytes]}),
@@ -579,16 +548,8 @@ def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
             {"tid": 0, "_sub": 3, "op": OP_JOIN, "lo": 1, "cap": nf},
             {"tid": 0, "_sub": 4, "op": OP_FREE, "buf_id": 0}]),
     ], how="diagonal_relaxed")
-    deflate = frames.with_columns(
-        payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
-        tid=pl.col("frame") + 1, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
-        buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"),
-        sink=pl.lit(0), level=pl.lit(level), mode=pl.lit(1),   # digest on
-        frame_id=pl.col("frame") + frame_base, payload=pl.col("payload"))
-    instr = _finalize([root, deflate])
-    members = df.select("path", "size", "mode", "mtime_ns", "uid", "gid",
-                        frame=pl.col("frame") + frame_base, in_off="in_off")
-    return instr, members
+    instr = _finalize([root, _gather_deflate(frames, payloads, 0, level, frame_base)])
+    return instr, _gather_members(df, frame_base)
 
 
 def _tar_window_stream(src_path: str, window_bytes: int):
