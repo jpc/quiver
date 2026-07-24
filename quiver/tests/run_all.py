@@ -1326,7 +1326,8 @@ def test_qvm(tmp):
         {"tid": 0, "_sub": 2, "op": qplan.OP_TARSCAN, "buf_id": 0, "buf_off": 0,
          "len": tsz}])])
     dgot = []
-    qplan.run_calls(lambda cid: dprog, qvm, "-", on_data=dgot.append)
+    qplan.run_calls(lambda cid: dprog, qvm, "-",
+                    on_data=lambda kind, df: dgot.append(df))
     assert dgot, "OP_TARSCAN pushed no DATA batch"
     dscan = pl.concat(dgot).sort("path")
     assert dscan.select(dref.columns).equals(dref), "DATA rows != tar_scan"
@@ -1343,6 +1344,21 @@ def test_qvm(tmp):
     for pth in pidx["path"]:
         assert (tmp / "qvm_push_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm PUSH recompress: DATA-driven scan → gather, byte-exact, no temp/ship")
+
+    # BOUNDED push: OP_SRC_SCAN decodes ONE member-aligned window at a time (carry
+    # in the source), gathers it from a single reused buffer, frees it, repeats.
+    # A tiny window forces many windows + carries; must still be byte-exact, and
+    # works on the multi-frame streaming source (no size hint).
+    wp = str(tmp / "qvm_wpush.nock")
+    small = 64 << 10                               # << the whole tar → many windows
+    wpn = qplan.recompress_zst_window_push(tzst, wp, qvm, window_bytes=small,
+                                           frame_bytes=16 << 10)
+    assert wpn == nz, (wpn, nz)
+    wpidx = _zf.read_index(wp).filter(pl.col("frame") >= 0)
+    qplan.unpack(wp, str(tmp / "qvm_wpush_x"), qvm, npool=8)
+    for pth in wpidx["path"]:
+        assert (tmp / "qvm_wpush_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm windowed PUSH: member-aligned windows, bounded memory, byte-exact")
 
     # teardown (unlink/rmdir deepest-first) + durability (fbarrier) — mirror tail
     mr = tmp / "qvm_rm"

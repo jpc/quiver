@@ -64,6 +64,7 @@ enum {
     OP_UNLINK, OP_RMDIR, OP_FBARRIER,     /* teardown + durability (mirror/sync) */
     OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE,  /* streaming decompress source */
     OP_TARSCAN,                              /* parse decoded tar → DATA rows */
+    OP_SRC_SCAN,                             /* decode window + member-aligned scan → DATA */
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -142,7 +143,9 @@ static uint64_t xxh_digest(XXH *s){
  * window-by-window by OP_SRC_NEXT. A source is decoded by ONE (serial, low-tid)
  * fiber, so no lock — the read-side analog of a Sink. */
 typedef struct { ZSTD_DStream *ds; int fd; uint8_t *in; size_t incap, inpos, inlen;
-                 int eof; int64_t produced; } Source;
+                 int eof; int64_t produced;
+                 uint8_t *carry; size_t carry_len, carry_cap;  /* member-aligned window carry */
+                 } Source;
 
 typedef struct Task {
     uint32_t tid;
@@ -150,7 +153,8 @@ typedef struct Task {
     int      arch_fd;
     uint8_t *buf; int64_t buf_off, arch_off, len;
     uint8_t **bufv;              /* deflate: pool[i].mem snapshot — a run's buf_id */
-    Source  *source;             /* OP_SRC_NEXT: the stream to drain */
+    Source  *source;             /* OP_SRC_NEXT/SCAN: the stream to drain */
+    struct Sched_ *sched;        /* OP_SRC_SCAN: for the DATA-channel emit */
     const char *path, *dpath;
     const uint8_t *payload; int64_t payload_len;
     int32_t mode; int64_t mtime_ns;
@@ -165,6 +169,7 @@ enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_MKDIR, TK_SETMETA, TK_INFLATE, TK_DEFLATE,
        TK_UNLINK, TK_RMDIR, TK_FBARRIER,   /* teardown + durability */
        TK_SRC_NEXT,                        /* decode next window from a source */
+       TK_SRC_SCAN,                        /* decode + member-aligned scan → DATA rows */
        TK_BATCH_READY };   /* reader thread → scheduler: a CALL response arrived */
 
 #define QCAP 4096
@@ -220,6 +225,13 @@ static ssize_t do_cfr(int in, int64_t *ioff, int out, int64_t *ooff, int64_t n){
     }
     return done;
 }
+
+/* Member-align buf[0..M), push the complete members as DATA rows, and report the
+ * carry boundary (*end) + end-of-archive (*done). Returns the member count (0 with
+ * !*done and !eof ⟹ a member larger than the window). Defined below (needs TAcc). */
+static int64_t scan_window_emit(struct Sched_ *S, const uint8_t *buf, int64_t M,
+                                int64_t *end, int *done);
+static void emit_data(struct Sched_ *S, uint8_t kind, const uint8_t *buf, uint32_t len);
 
 static void run_task(Task *t){
     t->res = 0;
@@ -336,6 +348,40 @@ static void run_task(Task *t){
         }
         t->clen = (int64_t)n; t->digest = s->eof;   /* report decoded size + eof */
         if (owned) free(win); break;
+    }
+    case TK_SRC_SCAN: {          /* decode a window into buf, member-align, push rows */
+        Source *s = t->source; uint8_t *buf = t->buf; int64_t cap = t->len;
+        int64_t base = (int64_t)s->carry_len;       /* carried partial member */
+        if (base) memcpy(buf, s->carry, (size_t)base);
+        ZSTD_outBuffer out = {buf, (size_t)cap, (size_t)base};
+        while (out.pos < out.size && !s->eof) {      /* fill to cap (or eof) */
+            if (s->inpos >= s->inlen) {
+                ssize_t r = read(s->fd, s->in, s->incap);
+                if (r < 0) { t->res = -errno; break; }
+                if (r == 0) { s->eof = 1; break; }
+                s->inpos = 0; s->inlen = (size_t)r;
+            }
+            ZSTD_inBuffer in = {s->in, s->inlen, s->inpos};
+            size_t rc = ZSTD_decompressStream(s->ds, &out, &in);
+            s->inpos = in.pos;
+            if (ZSTD_isError(rc)) { t->res = -EIO; break; }
+        }
+        int64_t M = (int64_t)out.pos; s->produced += M - base;
+        int64_t e = 0; int zero = 0;
+        /* member-align + emit the file rows (kind 0). A dir-only window advances
+         * e (headers parsed) with 0 file rows — legitimate, keep going. No
+         * progress (e==0) on a non-final window ⟹ a member larger than the window. */
+        int64_t nmemb = scan_window_emit(t->sched, buf, M, &e, &zero);
+        int fin = zero || s->eof;                    /* zero-block or source EOF */
+        if (nmemb == 0 && e == 0 && !fin) { t->res = -EMSGSIZE; break; }
+        if (fin) emit_data(t->sched, 2, NULL, 0);    /* end-of-stream marker */
+        int64_t clen = M - e;                        /* carry the trailing partial */
+        if (clen > (int64_t)s->carry_cap) {
+            s->carry = realloc(s->carry, (size_t)clen); s->carry_cap = (size_t)clen; }
+        if (clen) memcpy(s->carry, buf + e, (size_t)clen);
+        s->carry_len = (size_t)clen;
+        t->clen = e; t->digest = fin;
+        break;
     }
     case TK_DEFLATE: {
         /* compress and append to the sink. payload (if present) is a packed list
@@ -473,7 +519,7 @@ typedef struct { Thread *th; int nth, ndone; int wep, wtid, hasw;
 /* a CALL awaiting its response (FIFO, scheduler-thread only) */
 typedef struct PW { int ep, tid; int64_t t0, cid; struct PW *next; } PW;
 
-typedef struct {
+typedef struct Sched_ {
     Batch *bat; int nbat, batcap; int cur_epoch;   /* batch registry */
     BufSlot *pool; int npool;
     int arch_fd;
@@ -486,6 +532,7 @@ typedef struct {
     int64_t *cf, *cc, *cl, *cd; int ncomp, ccap;  /* completions: frame,coff,clen,digest */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
+    pthread_mutex_t call_mu;     /* serializes CALL + DATA writes on call_fd */
     PW *pw_head, *pw_tail; int pw_count;   /* CALLs awaiting responses */
     pthread_t reader_th; int has_reader;   /* off-thread CALL-response reader */
     int wal_fd, wal_n;                     /* WAL: append each committed frame */
@@ -703,8 +750,16 @@ static void run_thread(Sched *S, Thread *t){
         case OP_SRC_CLOSE: {
             Source *s = &S->src[I->lo];
             if (s->ds) ZSTD_freeDStream(s->ds);
-            if (s->fd > 0) close(s->fd); free(s->in); memset(s, 0, sizeof *s);
+            if (s->fd > 0) close(s->fd); free(s->in); free(s->carry); memset(s, 0, sizeof *s);
             t->pc++; break;
+        }
+        case OP_SRC_SCAN: {                      /* decode window + member scan → DATA */
+            Task *k = calloc(1, sizeof *k);
+            k->tid = t->tid; k->epoch = t->epoch; k->op = I->op; k->kind = TK_SRC_SCAN;
+            k->source = &S->src[I->lo]; k->sched = S; k->buf_log = I->buf_id;
+            k->buf = S->pool[I->buf_id].mem; k->len = I->len;   /* len = buffer cap */
+            t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
+            return;
         }
         case OP_TARSCAN: {                       /* parse decoded tar → DATA rows */
             uint8_t *m = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
@@ -778,9 +833,10 @@ static void run_thread(Sched *S, Thread *t){
              * compression keep running concurrently. pc advances on wake. */
             {   /* tagged: [0][int64 id] — shares stdout with DATA rows ([1]...) */
                 uint8_t msg[9]; msg[0] = 0; memcpy(msg + 1, &I->frame_id, 8);
-                if (S->call_fd < 0 || write(S->call_fd, msg, 9) != 9) {
-                    S->failed = S->failed ? S->failed : -EIO; t->pc++; break;
-                }
+                int w = -1;
+                if (S->call_fd >= 0) { pthread_mutex_lock(&S->call_mu);
+                    w = write(S->call_fd, msg, 9); pthread_mutex_unlock(&S->call_mu); }
+                if (w != 9) { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
             }
             pw_push(S, t->epoch, t->tid, tr_now(), I->frame_id);
             t->st = T_WAIT_CALL;
@@ -848,6 +904,7 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
                      int npool, int nworkers, int call_fd){
     memset(S, 0, sizeof *S);
     S->arch_fd = arch_fd; S->npool = npool; S->call_fd = call_fd;
+    pthread_mutex_init(&S->call_mu, 0);
     S->pool = calloc(npool, sizeof(BufSlot));
     S->nsrc = 8; S->src = calloc(S->nsrc, sizeof(Source));   /* decompress sources */
     S->nsinks = nsinks;
@@ -991,6 +1048,7 @@ static void qvm_close(Sched *S){
     for (int i = 0; i < S->nsrc; i++) { Source *s = &S->src[i];  /* leftover sources */
         if (s->ds) ZSTD_freeDStream(s->ds); if (s->fd > 0) close(s->fd); free(s->in); }
     free(S->src);
+    pthread_mutex_destroy(&S->call_mu);
     for (int i = 0; i < S->nsinks; i++) pthread_mutex_destroy(&S->sinks[i].mu);
     for (int i = 0; i < S->nbat; i++) {          /* any un-retired batch memory */
         free(S->bat[i].th); free(S->bat[i].pm);
@@ -1241,7 +1299,7 @@ static void tar_parse_pax(const uint8_t *b, int64_t n, char *path, int *hp, int6
         i = end;
     }
 }
-typedef struct { char *pd; int64_t plen, pcap, *poff;
+typedef struct TAcc { char *pd; int64_t plen, pcap, *poff;
                  int64_t *sz, *mt, *off, *hl, *rng; int32_t *mode, *uid, *gid;
                  int64_t n, cap; } TAcc;
 static void tacc_add(TAcc *a, const char *nm, int64_t sz, int64_t mode, int64_t mt,
@@ -1300,6 +1358,55 @@ static void tar_parse(const uint8_t *m, int64_t sz, TAcc *a){
     }
 }
 
+/* Member-aligned windowed scan: parse buf[0..M) (buffer-relative offsets),
+ * emitting members whose header+body fit ENTIRELY within M. Stops at the first
+ * member (or its pax/GNU prefix) that would run past M — *end is the byte offset
+ * just past the last COMPLETE member, so buf[*end..M) is carried to the next
+ * window. *done is set on the end-of-archive zero block. */
+static void tar_parse_windowed(const uint8_t *m, int64_t M, TAcc *a,
+                               int64_t *end, int *done){
+    char pax[4096], gnu[4096]; int has_pax = 0, has_gnu = 0; int64_t pax_sz = -1, mstart = -1;
+    int64_t off = 0, e = 0;
+    while (off + 512 <= M) {
+        const uint8_t *h = m + off;
+        int zero = 1; for (int i = 0; i < 512; i++) if (h[i]) { zero = 0; break; }
+        if (zero) { *done = 1; break; }            /* end-of-archive */
+        char tf = (char)h[156];
+        int64_t fsz = tar_oct(h + 124, 12);
+        int64_t pad = ((fsz + 511) / 512) * 512;
+        if (tf == 'x' || tf == 'g') {              /* PAX extended header */
+            if (off + 512 + pad > M) break;        /* payload not fully in window */
+            tar_parse_pax(m + off + 512, fsz, pax, &has_pax, &pax_sz);
+            if (mstart < 0) mstart = off; off += 512 + pad; continue;
+        }
+        if (tf == 'L' || tf == 'K') {              /* GNU long name/link */
+            if (off + 512 + pad > M) break;
+            int64_t nl = fsz < 4095 ? fsz : 4095; memcpy(gnu, m + off + 512, nl);
+            while (nl > 0 && gnu[nl-1] == 0) nl--; gnu[nl] = 0; has_gnu = 1;
+            if (mstart < 0) mstart = off; off += 512 + pad; continue;
+        }
+        int64_t real = (has_pax && pax_sz >= 0) ? pax_sz : fsz;
+        int64_t body = ((real + 511) / 512) * 512;
+        if (off + 512 + body > M) break;           /* member body not fully in window */
+        if (tf == '0' || tf == 0) {                /* a regular file → emit */
+            char name[4200];
+            if (has_pax) snprintf(name, sizeof name, "%s", pax);
+            else if (has_gnu) snprintf(name, sizeof name, "%s", gnu);
+            else { char nm[101], pfx[156]; memcpy(nm, h, 100); nm[100] = 0;
+                   memcpy(pfx, h + 345, 155); pfx[155] = 0;
+                   if (pfx[0]) snprintf(name, sizeof name, "%s/%s", pfx, nm);
+                   else snprintf(name, sizeof name, "%s", nm); }
+            int64_t ms = mstart >= 0 ? mstart : off, doff = off + 512;
+            tacc_add(a, name, real, tar_oct(h+100,8), tar_oct(h+136,12)*1000000000,
+                     tar_oct(h+108,8), tar_oct(h+116,8), ms, doff - ms, (doff - ms) + body);
+        }
+        off = (off + 512) + body;
+        e = off;                                   /* a complete member boundary */
+        has_pax = has_gnu = 0; pax_sz = -1; mstart = -1;
+    }
+    *end = e;
+}
+
 /* Emit the QTAR member batch (schema + one batch + eos) from `a` to `outfd`. */
 static void emit_qtar(int outfd, TAcc *a){
     int64_t n = a->n;
@@ -1325,24 +1432,43 @@ static void tacc_free(TAcc *a){
  * CALL requests by a leading tag byte — [1][u32 len][ipc-stream bytes] for DATA,
  * [0][int64 id] for a CALL. Emitted on the scheduler thread (like OP_CALL), so
  * the two never interleave on the shared fd. */
-static void emit_data(int fd, const uint8_t *buf, uint32_t len){
-    uint8_t hdr[5]; hdr[0] = 1; memcpy(hdr + 1, &len, 4);
-    if (write_full(fd, hdr, 5) || write_full(fd, buf, (size_t)len)) { /* ignore */ }
+static void emit_data(Sched *S, uint8_t kind, const uint8_t *buf, uint32_t len){
+    uint8_t hdr[6]; hdr[0] = 1; hdr[1] = kind; memcpy(hdr + 2, &len, 4);
+    pthread_mutex_lock(&S->call_mu);             /* may race OP_CALL / other emits */
+    if (write_full(S->call_fd, hdr, 6) || write_full(S->call_fd, buf, (size_t)len)) {}
+    pthread_mutex_unlock(&S->call_mu);
 }
 
 /* OP_TARSCAN: parse the decoded tar image in pool[buf_id] region [off,off+len)
  * into member rows and push them down the DATA channel. Builds the QTAR batch
  * into a memfd (to learn its length), then frames it as one DATA message. */
+/* Serialize a TAcc as one QTAR batch (via a memfd, to learn its length) and push
+ * it down the DATA channel as member rows (kind 0). */
+static void emit_tacc(Sched *S, TAcc *a){
+    int mfd = memfd_create("qtar", 0);
+    if (mfd < 0) return;
+    emit_qtar(mfd, a);
+    off_t n = lseek(mfd, 0, SEEK_END);
+    uint8_t *bytes = malloc(n ? n : 1);
+    if (bytes && pread(mfd, bytes, n, 0) == n) emit_data(S, 0, bytes, (uint32_t)n);
+    free(bytes); close(mfd);
+}
+
 static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz){
     TAcc a; memset(&a, 0, sizeof a);
     tar_parse(m, sz, &a);
-    int mfd = memfd_create("qtar", 0);
-    if (mfd < 0) { tacc_free(&a); return; }
-    emit_qtar(mfd, &a);
-    off_t n = lseek(mfd, 0, SEEK_END);
-    uint8_t *bytes = malloc(n ? n : 1);
-    if (bytes && pread(mfd, bytes, n, 0) == n) emit_data(S->call_fd, bytes, (uint32_t)n);
-    free(bytes); close(mfd); tacc_free(&a);
+    emit_tacc(S, &a);
+    tacc_free(&a);
+}
+
+static int64_t scan_window_emit(struct Sched_ *S, const uint8_t *buf, int64_t M,
+                                int64_t *end, int *done){
+    TAcc a; memset(&a, 0, sizeof a);
+    tar_parse_windowed(buf, M, &a, end, done);
+    int64_t n = a.n;
+    emit_tacc(S, &a);            /* 0 rows ⟺ end-of-stream (the driver's done signal) */
+    tacc_free(&a);
+    return n;
 }
 
 static int qvm_tarscan(const char *tar_path, int outfd){

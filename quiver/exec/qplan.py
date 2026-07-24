@@ -30,7 +30,7 @@ from ..nock import nockidx as _zf     # the nock footer-index layer (no old-engi
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
  OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER,
- OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE, OP_TARSCAN) = range(1, 18)
+ OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE, OP_TARSCAN, OP_SRC_SCAN) = range(1, 19)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
@@ -789,8 +789,75 @@ def recompress_zst_push(src_path: str, out_path: str, qvm_exe: str,
 
     open(out_path, "wb").close()
     comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
-                     nworkers=nworkers, want_comp=True, on_data=st["rows"].append)
+                     nworkers=nworkers, want_comp=True,
+                     on_data=lambda kind, df: st["rows"].append(df))
     return _stream_footer(out_path, [st["members"]], comp)
+
+
+def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
+                              window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
+                              level: int = 6, npool: int = 4, nworkers: int = 8,
+                              predicate: pl.Expr | None = None) -> int:
+    """BOUNDED-memory push recompress: like recompress_zst_push, but the VM decodes
+    ONE member-aligned window at a time. OP_SRC_SCAN decodes the next `window_bytes`
+    into a pool buffer, cuts at the last complete member (carrying the partial tail
+    in the source), and PUSHES that window's member rows on the DATA channel; the VM
+    then CALLs us for the window's gather, which we plan from the rows (buffer-
+    relative) and hand back — spawning a deflate per frame that reads the window
+    buffer, then freeing it before the next window. Peak memory is ~one window, not
+    the whole tar. A 0-row window is the end-of-stream signal. `window_bytes` must
+    exceed the largest single member. Works on multi-frame sources too (no size
+    hint needed). Returns the member count."""
+    cap = window_bytes
+    st = {"rows": None, "done": False, "members": [], "frame_base": 0}
+
+    def on_data(kind, df):
+        if kind == 2:                                # end-of-stream marker
+            st["done"] = True
+        else:
+            st["rows"] = df                          # this window's file rows
+
+    def scan_thread0(sub0):                          # alloc buf0, decode+scan a window
+        return [{"tid": 0, "_sub": sub0, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
+                {"tid": 0, "_sub": sub0 + 1, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0,
+                 "len": cap}]
+
+    def handler(cid):
+        if cid == -1:                                # open + decode/scan the first window
+            rows = [{"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path}]
+            rows += scan_thread0(1)
+            rows += [{"tid": 0, "_sub": 3, "op": OP_CALL, "frame_id": 0}]
+            return _finalize([pl.DataFrame(rows)])
+        wdf = st["rows"]                             # window `cid`'s rows (pushed pre-CALL)
+        st["rows"] = None
+        if predicate is not None and wdf is not None and wdf.height:
+            wdf = wdf.filter(predicate)
+        gather, nf = [], 0
+        if wdf is not None and wdf.height:           # plan this window's gather (buf 0)
+            df = wdf.with_columns(boff=pl.col("offset"))   # offsets are window-relative
+            df, frames, payloads = _gather_frames(df, frame_bytes, 0)
+            nf = frames.height
+            st["members"].append(_gather_members(df, st["frame_base"]))
+            gather = [_gather_deflate(frames, payloads, 0, level, st["frame_base"])]
+            st["frame_base"] += nf
+        # thread 0: run the gather (if any), free buf 0, then either finish (source
+        # drained) or decode+scan the NEXT window and CALL again.
+        head = [{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
+                {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}] if nf else []
+        tail = [{"tid": 0, "_sub": 2, "op": OP_FREE, "buf_id": 0}]
+        if st["done"]:
+            tail += [{"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0}]
+        else:
+            tail += scan_thread0(3) + [{"tid": 0, "_sub": 5, "op": OP_CALL,
+                                        "frame_id": cid + 1}]
+        return _finalize([pl.DataFrame(head + tail), *gather])
+
+    open(out_path, "wb").close()
+    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 2),
+                     nworkers=nworkers, want_comp=True, on_data=on_data)
+    if not st["members"]:
+        st["members"].append(pl.DataFrame(schema={"frame": pl.Int64}))
+    return _stream_footer(out_path, st["members"], comp)
 
 
 def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
@@ -1322,10 +1389,11 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
             if not tag:
                 break                            # qvm closed stdout → done
             if tag[0] == 1:                      # DATA: rows the VM pushed to us
+                kind = _readn(out, 1)[0]         # 0 = member rows, 2 = control (no batch)
                 (n,) = struct.unpack("<I", _readn(out, 4))
                 batch = _readn(out, n)
                 if on_data is not None:
-                    on_data(ipc.read_all(batch))
+                    on_data(kind, ipc.read_all(batch) if n else None)
                 continue
             (cid,) = struct.unpack("<q", _readn(out, 8))  # CALL request
             data = encode_stream(handler(cid))
