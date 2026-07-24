@@ -56,7 +56,10 @@ static int64_t tr_now(void){
 }
 /* off/aux carry op parameters for the viz: mov → (offset, endpoint-kind),
  * deflate → (frame_id, input_len), inflate → (arch_off, frame_id). */
-typedef struct { int64_t t0, t1, tid, op, buf, detail, epoch, off, aux; } TraceEv;
+/* wk: which physical lane ran this op — a worker index (>=0), -1 = scheduler
+ * thread (sync ops + bookkeeping), -2 = Python (a PLAN span, op = OP_PLAN). */
+#define OP_PLAN 100
+typedef struct { int64_t t0, t1, tid, op, buf, detail, epoch, off, aux, wk; } TraceEv;
 
 /* ------------------------------------------------------------------ opcodes */
 enum {
@@ -233,7 +236,7 @@ typedef struct Task {
     Sink    *sink; int level; int64_t frame_id, coff, clen;  /* codec/sink */
     int      digest_on; int64_t digest;   /* xxh64 of the frame's decoded content */
     int      res;
-    int      op; int64_t buf_log, detail; int64_t wt0, wt1;   /* trace */
+    int      op; int64_t buf_log, detail; int64_t wt0, wt1; int wk;   /* trace */
     int      epoch;              /* owning batch */
 } Task;
 enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
@@ -527,13 +530,14 @@ static void run_task(Task *t){
     }
 }
 
-typedef struct { TQ *in; TQ *out; } Worker;
+typedef struct { TQ *in; TQ *out; int idx; } Worker;
 static void *worker_main(void *a){
     Worker *w = a;
     for (;;) {
         Task *t = tq_pop(w->in);
         if (!t) break;
         t->wt0 = tr_now(); run_task(t); t->wt1 = tr_now();
+        t->wk = w->idx;                          /* physical lane for the trace */
         tq_push(w->out, t);
     }
     return NULL;
@@ -648,7 +652,16 @@ static void tr_log(Sched *S, int64_t t0, int64_t t1, uint32_t tid, int op,
     if (S->ntr == S->trcap) { S->trcap = S->trcap ? S->trcap*2 : 1024;
         S->tr = realloc(S->tr, S->trcap * sizeof(TraceEv)); }
     S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
-                                 tid, op, buf, detail, S->cur_epoch, off, aux };
+                                 tid, op, buf, detail, S->cur_epoch, off, aux, -1 };
+}
+/* a Python-planning span: the scheduler sat idle (no ready work, nothing in
+ * flight) waiting for Python to plan + push the next batch. Lane -2. */
+static void tr_plan(Sched *S, int64_t t0, int64_t t1){
+    if (!S->t_base) return;
+    if (S->ntr == S->trcap) { S->trcap = S->trcap ? S->trcap*2 : 1024;
+        S->tr = realloc(S->tr, S->trcap * sizeof(TraceEv)); }
+    S->tr[S->ntr++] = (TraceEv){ t0 - S->t_base, t1 - S->t_base,
+                                 -1, OP_PLAN, -1, 0, -1, 0, 0, -2 };
 }
 
 static uint8_t *read_framed(int fd, size_t *out);
@@ -979,9 +992,12 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
                pthread_create(&S->ring_th, 0, ring_worker, S); }
     }
 #endif
-    static Worker w; w.in = &S->tasks; w.out = &S->comps;
+    static Worker g_wa[64];
     g_nworkers = nworkers;
-    for (int k = 0; k < nworkers; k++) pthread_create(&g_wt[k], 0, worker_main, &w);
+    for (int k = 0; k < nworkers; k++) {
+        g_wa[k] = (Worker){ &S->tasks, &S->comps, k };
+        pthread_create(&g_wt[k], 0, worker_main, &g_wa[k]);
+    }
     if (call_fd >= 0) {                          /* CALL responses read off-thread */
         S->has_reader = 1;
         pthread_create(&S->reader_th, 0, reader_main, S);
@@ -1001,10 +1017,13 @@ static void run_sched(Sched *S){
          * drained. When idle but stdin still open, tq_pop blocks for the next
          * pushed batch — so an empty ready queue is a pause, not termination. */
         if (S->inflight == 0 && S->reader_eof) break;
+        /* fully idle (nothing ready, nothing in flight) ⟹ blocked on Python */
+        int64_t idle0 = (S->t_base && S->inflight == 0) ? tr_now() : -1;
         Task *k = tq_pop(&S->comps);         /* one event: completion OR pushed batch */
         if (k->kind == TK_BATCH_READY) {     /* Python PUSHED a batch (reader thread) */
             uint8_t *raw = k->buf; size_t rawlen = (size_t)k->len; free(k);
             if (!raw) { S->reader_eof = 1; continue; }   /* stdin closed */
+            if (idle0 >= 0) tr_plan(S, idle0, tr_now());  /* the Python-planning span */
             int nn; char *nap, *nad;
             Instr *nins = qvm_decode_arrow(raw, rawlen, &nn, &nap, &nad);
             int ne = build_batch(S, nins, nn);
@@ -1033,6 +1052,7 @@ static void run_sched(Sched *S){
             else if (k->op == OP_MOV) { aux = k->kind; }
             tr_log(S, k->wt0, k->wt1, k->tid, k->op, k->buf_log,
                    k->kind == TK_DEFLATE ? k->clen : k->detail, off, aux);
+            if (S->t_base) S->tr[S->ntr-1].wk = k->wk;   /* the physical worker lane */
         }
         Thread *ct = TH(S, k->epoch, k->tid);
         if (ct->st == T_WAIT_IO) {                     /* resume at pc */

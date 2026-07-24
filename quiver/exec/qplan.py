@@ -600,61 +600,64 @@ def recompress_zst_push(src_path: str, out_path: str, qvm_exe: str,
 def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
                               window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
                               level: int = 6, npool: int = 4, nworkers: int = 8,
-                              predicate: pl.Expr | None = None) -> int:
-    """BOUNDED-memory push recompress: like recompress_zst_push, but the VM decodes
-    ONE member-aligned window at a time. OP_SRC_SCAN decodes the next `window_bytes`
-    into a pool buffer, cuts at the last complete member (carrying the partial tail
-    in the source), and PUSHES that window's member rows + a done flag on the DATA
-    channel. We plan the window's gather from the rows (buffer-relative), then PUSH
-    a batch that gathers it (a deflate per frame reading the window buffer), frees
-    the buffer, and decodes+scans the NEXT window. Lock-step: push a window's batch,
-    read its rows, push the next — peak memory ~one window. `window_bytes` must
-    exceed the largest single member. Works on multi-frame sources (no size hint).
-    Returns the member count."""
+                              predicate: pl.Expr | None = None, depth: int = 3) -> int:
+    """BOUNDED-memory push recompress: the VM decodes ONE member-aligned window at
+    a time (OP_SRC_SCAN — cut at the last complete member, partial tail carried in
+    the source) and pushes that window's rows + a done flag on the DATA channel.
+
+    PIPELINED over a ring of `depth` buffers: the SCAN of a window and the GATHER
+    of the previous one are separate pushed batches, so they run concurrently, and
+    Python plans+pushes window k's gather WHILE the VM is still compressing window
+    k-1 — decode ‖ compress ‖ plan all overlap. Peak memory is ~`depth` windows;
+    buffer-slot backpressure keeps it there. `window_bytes` must exceed the largest
+    single member. Works on multi-frame sources (no size hint). Returns member count."""
+    R = max(2, depth)                                # buffer-ring size = pipeline depth
     cap = window_bytes
     members: list[pl.DataFrame] = []
     frame_base = [0]
 
-    def scan_ops(sub0):                              # alloc buf 0, decode+scan a window
-        return [{"tid": 0, "_sub": sub0, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
-                {"tid": 0, "_sub": sub0 + 1, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0,
-                 "len": cap}]
+    def scan_batch(slot, first=False):               # ALLOC buf[slot] + SRC_SCAN
+        rows = ([{"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path}]
+                if first else [])
+        b = 1 if first else 0
+        rows += [{"tid": 0, "_sub": b, "op": OP_ALLOC, "buf_id": slot, "cap": cap},
+                 {"tid": 0, "_sub": b + 1, "op": OP_SRC_SCAN, "lo": 0, "buf_id": slot,
+                  "len": cap}]
+        return _finalize([pl.DataFrame(rows)])
 
-    def plan_gather(rows):                           # (deflate_df|None, nframes)
+    def gather_batch(rows, slot, last):              # deflate window[slot], free it
+        gd, nf = None, 0
         if predicate is not None and rows.height:
             rows = rows.filter(predicate)
-        if rows.height == 0:
-            return None, 0
-        df = rows.with_columns(boff=pl.col("offset"))   # offsets are window-relative
-        df, frames, payloads = _gather_frames(df, frame_bytes, 0)
-        members.append(_gather_members(df, frame_base[0]))
-        gd = _gather_deflate(frames, payloads, 0, level, frame_base[0])
-        frame_base[0] += frames.height
-        return gd, frames.height
-
-    def window_batch(rows, done):
-        gd, nf = plan_gather(rows)
+        if rows.height:
+            df = rows.with_columns(boff=pl.col("offset"))   # window-relative offsets
+            df, frames, payloads = _gather_frames(df, frame_bytes, slot)
+            members.append(_gather_members(df, frame_base[0]))
+            gd = _gather_deflate(frames, payloads, slot, level, frame_base[0])
+            frame_base[0] += frames.height; nf = frames.height
         head = ([{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
                  {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}] if nf else [])
-        tail = [{"tid": 0, "_sub": 2, "op": OP_FREE, "buf_id": 0}]
-        tail += ([{"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0}] if done
-                 else scan_ops(3))                   # finish, or decode the next window
+        tail = [{"tid": 0, "_sub": 2, "op": OP_FREE, "buf_id": slot}]
+        if last:
+            tail += [{"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0}]
         parts = [pl.DataFrame(head + tail)] + ([gd] if gd is not None else [])
         return _finalize(parts)
 
     def driver(vm):
-        vm.push(_finalize([pl.DataFrame(                # open + scan the first window
-            [{"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path}]
-            + scan_ops(1))]))
+        vm.push(scan_batch(0, first=True))           # open + scan window 0
         rows = vm.read_rows(); done = vm.read_done()
+        k = 0
         while True:
-            vm.push(window_batch(rows, done))           # gather this window + scan next
-            if done:
+            if done:                                  # last window: just gather it
+                vm.push(gather_batch(rows, k % R, last=True))
                 break
-            rows = vm.read_rows(); done = vm.read_done()
+            vm.push(scan_batch((k + 1) % R))          # S_{k+1}: decode next window …
+            vm.push(gather_batch(rows, k % R, False))  # … ‖ G_k: compress this one
+            rows = vm.read_rows(); done = vm.read_done()   # rows_{k+1}, while G_k runs
+            k += 1
 
     open(out_path, "wb").close()
-    comp = push_exec(driver, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 2),
+    comp = push_exec(driver, qvm_exe, "-", sinks=(out_path,), npool=max(npool, R + 1),
                      nworkers=nworkers, want_comp=True)
     if not members:
         members.append(pl.DataFrame(schema={"frame": pl.Int64}))
