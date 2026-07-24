@@ -865,6 +865,64 @@ def pack(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
     return total
 
 
+# ---------------------------------------------------------------- WAL / resume
+def _wal_read(wal_path: str) -> dict:
+    """Committed frames from a qvm WAL: {frame: (coff, clen, digest)} from the
+    32-byte (i64×4) records qvm appends as each deflate lands."""
+    if not os.path.exists(wal_path):
+        return {}
+    raw = open(wal_path, "rb").read()
+    n = len(raw) // 32
+    if not n:
+        return {}
+    a = np.frombuffer(raw, dtype="<i8", count=n*4).reshape(n, 4)
+    return {int(f): (int(co), int(cl), int(dg)) for f, co, cl, dg in a}
+
+
+def pack_wal(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
+             wal_path: str, frame_bytes: int = 1 << 20, level: int = 6,
+             npool: int = 16, nworkers: int = 8,
+             predicate: pl.Expr | None = None) -> int:
+    """WAL-resumable pack (single archive): qvm fsyncs each committed frame's
+    (frame,coff,clen,digest) to `wal_path` as it lands. The plan is
+    deterministic, so on resume we replan, DROP every already-committed frame
+    (remapping the survivors to a contiguous thread range), truncate the sink to
+    its committed high-water, and append only the un-committed tail — re-doing
+    just the work the crash lost. The footer is built from the full WAL. Returns
+    the file-member count."""
+    instr, members, _ = plan_pack(scan, root, frame_bytes, level, npool, predicate)
+    committed = _wal_read(wal_path)
+    allframes = sorted(int(f) for f in members["frame"].unique()) if members.height else []
+    remaining = [f for f in allframes if f not in committed]
+    hw = max((co + cl for co, cl, _ in committed.values()), default=0)
+
+    if committed and remaining:                   # resume: keep only un-committed
+        newtid = {f + 1: i + 1 for i, f in enumerate(remaining)}  # old tid → new
+        body = (instr.filter(pl.col("tid") >= 1)
+                     .filter(pl.col("tid").is_in(list(newtid)))
+                     .with_columns(pl.col("tid").replace(newtid)))
+        root_df = _finalize([pl.DataFrame([
+            {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": len(remaining)},
+            {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": len(remaining)}])])
+        instr = pl.concat([root_df, body])
+    elif committed:                               # everything already durable
+        instr = _empty_batch()
+    else:                                         # fresh run
+        open(out_path, "wb").close()
+
+    run(instr, qvm_exe, "-", sinks=(out_path,), npool=npool, nworkers=nworkers,
+        env={"QVM_WAL": wal_path, "QVM_SINK_STARTS": str(hw)})
+
+    allc = _wal_read(wal_path)                     # committed + newly appended
+    comp = pl.DataFrame(
+        {"frame": list(allc), "frame_coff": [v[0] for v in allc.values()],
+         "frame_clen": [v[1] for v in allc.values()],
+         "digest": [v[2] for v in allc.values()]},
+        schema={"frame": pl.Int64, "frame_coff": pl.Int64,
+                "frame_clen": pl.Int64, "digest": pl.Int64})
+    return _stream_footer(out_path, [members], comp, dirs=_dir_footer_rows(scan))
+
+
 # --------------------------------------------------------------------- unpack
 def plan_unpack(archive: str, dest: str, npool: int = 16,
                 idx: pl.DataFrame | None = None) -> pl.DataFrame:
@@ -1179,17 +1237,17 @@ def build_qvm(dest: str, src: str | None = None, uring: bool = False):
 
 def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
         sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-        want_comp: bool = False):
+        want_comp: bool = False, env: dict | None = None):
     """Encode and drive the C `qvm` executor. `sinks` are deflate output files;
     `want_comp` collects the {frame, coff, clen} completions (via a temp fd) and
     returns them as a DataFrame."""
     return run_calls(lambda cid: instr, qvm_exe, arch_path, sinks, npool,
-                     nworkers, want_comp)
+                     nworkers, want_comp, env=env)
 
 
 def run_calls(handler, qvm_exe: str, arch_path: str = "-",
               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-              want_comp: bool = False):
+              want_comp: bool = False, env: dict | None = None):
     """CALL is qvm's SOLE entry point: qvm boots with one CALL(-1) and pulls
     every instruction batch by CALLing into Python. `handler(call_id)` answers
     each CALL — id -1 is the entry program; a driver's own CALLs pass their
@@ -1203,7 +1261,8 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
     argv = [qvm_exe, "qvm", arch_path, str(npool), str(nworkers), comp_path,
             str(cr_w), *sinks]
     pass_fds = [cr_w] + [int(s[3:]) for s in sinks if s.startswith("fd:")]
-    p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds)
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds,
+                         env={**os.environ, **env} if env else None)
     os.close(cr_w)                                # qvm holds its own copy
     try:
         while True:

@@ -435,6 +435,7 @@ typedef struct {
     int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
     PW *pw_head, *pw_tail; int pw_count;   /* CALLs awaiting responses */
     pthread_t reader_th; int has_reader;   /* off-thread CALL-response reader */
+    int wal_fd, wal_n;                     /* WAL: append each committed frame */
 #ifdef QVM_URING
     int use_uring, qd; TQ ring_tasks; pthread_t ring_th; struct io_uring ring;
 #endif
@@ -746,12 +747,24 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     S->arch_fd = arch_fd; S->npool = npool; S->call_fd = call_fd;
     S->pool = calloc(npool, sizeof(BufSlot));
     S->nsinks = nsinks;
+    /* WAL: resume-after-crash. QVM_WAL=<path> → append (frame,coff,clen,digest)
+     * per committed deflate, fsync'd periodically. QVM_SINK_STARTS=off0,off1,...
+     * positions each sink's cursor at its committed high-water and truncates the
+     * torn tail, so the run continues exactly where it stopped. */
+    S->wal_fd = -1;
+    const char *walp = getenv("QVM_WAL");
+    if (walp) S->wal_fd = open(walp, O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0644);
+    const char *starts = getenv("QVM_SINK_STARTS");
     S->sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
     for (int i = 0; i < nsinks; i++) {
-        S->sinks[i].fd = sink_fds[i]; S->sinks[i].cursor = 0;
+        int64_t st0 = 0;
+        if (starts) { st0 = atoll(starts); const char *c = strchr(starts, ',');
+                      starts = c ? c+1 : ""; }
+        S->sinks[i].fd = sink_fds[i]; S->sinks[i].cursor = st0;
         struct stat st;                          /* pipe/socket → hold-through-write */
         S->sinks[i].is_pipe = (fstat(sink_fds[i], &st) == 0
                                && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)));
+        if (!S->sinks[i].is_pipe) { if (ftruncate(sink_fds[i], st0)) {} }  /* 0=fresh */
         pthread_mutex_init(&S->sinks[i].mu, NULL);
     }
     tq_init(&S->tasks); tq_init(&S->comps);
@@ -807,9 +820,14 @@ static void run_sched(Sched *S){
         }
         S->inflight--;
         if (k->res < 0 && !S->failed) S->failed = k->res;
-        if (k->res == 0 && k->kind == TK_DEFLATE)
+        if (k->res == 0 && k->kind == TK_DEFLATE) {
             comp_add(S, k->frame_id, k->coff, k->clen, k->digest);
-        else if (k->res == 0 && k->kind == TK_INFLATE && k->digest_on)
+            if (S->wal_fd >= 0) {           /* durable record: bytes are in the sink */
+                int64_t rec[4] = {k->frame_id, k->coff, k->clen, k->digest};
+                if (write(S->wal_fd, rec, 32) != 32) S->failed = S->failed ? S->failed : -EIO;
+                if (++S->wal_n >= 256) { fsync(S->wal_fd); S->wal_n = 0; }
+            }
+        } else if (k->res == 0 && k->kind == TK_INFLATE && k->digest_on)
             comp_add(S, k->frame_id, -1, -1, k->digest);   /* verify: report digest */
         S->cur_epoch = k->epoch;
         {   /* op params for the viz: mov→(arch_off, endpoint-kind), */
@@ -831,6 +849,7 @@ static void run_sched(Sched *S){
 }
 
 static void qvm_close(Sched *S){
+    if (S->wal_fd >= 0) { fsync(S->wal_fd); close(S->wal_fd); S->wal_fd = -1; }
     if (S->has_reader) {                         /* close the request pipe → Python
                                                   * closes stdin → reader hits EOF */
         if (S->call_fd >= 0) { close(S->call_fd); S->call_fd = -1; }
@@ -1335,7 +1354,8 @@ int main(int argc, char **argv){
     for (int i = 0; i < nsinks; i++) {
         const char *sa = argv[7 + i];
         if (strncmp(sa, "fd:", 3) == 0) sink_fds[i] = atoi(sa + 3);  /* inherited pipe */
-        else sink_fds[i] = open(sa, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        else sink_fds[i] = open(sa, O_RDWR | O_CREAT, 0644);   /* qvm_open truncates
+                                                * to the (resume) start offset */
         if (sink_fds[i] < 0) { perror("open sink"); return 2; }
     }
     int arch_fd = -1;

@@ -1311,6 +1311,30 @@ def test_qvm(tmp):
     qplan.run(qplan.plan_fbarrier([str(mr / "keep"), str(mr)]), qvm, "-")   # fsync
     ok("qvm teardown+durability: unlink/rmdir deepest-first + fbarrier fsync")
 
+    # WAL crash-resume: simulate a crash after half the frames (run a partial
+    # plan writing the WAL), then resume — re-doing only the un-committed tail.
+    wsrc = tmp / "qvm_walsrc"; make_tree(wsrc, n=120)
+    ws = qplan.scan(str(wsrc), qvm, 4)
+    warc = str(tmp / "qvm_wal.nock"); wal = str(tmp / "qvm_wal.log")
+    winstr, wmembers, _ = qplan.plan_pack(ws, str(wsrc), frame_bytes=16 << 10, npool=8)
+    wframes = sorted(wmembers["frame"].unique()); wnf = len(wframes); wh = wnf // 2
+    open(warc, "wb").close()
+    partial = pl.concat([
+        qplan._finalize([pl.DataFrame([
+            {"tid": 0, "_sub": 0, "op": qplan.OP_SPAWN, "lo": 1, "cap": wh},
+            {"tid": 0, "_sub": 1, "op": qplan.OP_JOIN, "lo": 1, "cap": wh}])]),
+        winstr.filter(pl.col("tid").is_in([f + 1 for f in wframes[:wh]]))])
+    qplan.run(partial, qvm, "-", sinks=(warc,), npool=8, env={"QVM_WAL": wal})
+    assert len(qplan._wal_read(wal)) == wh              # crash: half committed
+    qplan.pack_wal(ws, str(wsrc), warc, qvm, wal, frame_bytes=16 << 10, npool=8)
+    assert len(qplan._wal_read(wal)) == wnf             # resume: all committed
+    qplan.unpack(warc, str(tmp / "qvm_wal_x"), qvm, npool=8)
+    for p in wsrc.rglob("*"):
+        if p.is_file():
+            assert (tmp / "qvm_wal_x" / p.relative_to(wsrc)).read_bytes() == p.read_bytes()
+    assert qplan.verify(warc, qvm, npool=8)[1] == []    # integrity intact across crash
+    ok("qvm WAL: crash after N frames → resume re-does only the tail, byte-exact")
+
     # S3 content-addressed sync: qvm-computed ETags (put_object + multipart),
     # upload only what differs, re-sync a no-op. Exercised against moto.
     try:
