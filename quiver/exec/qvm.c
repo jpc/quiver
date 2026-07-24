@@ -36,6 +36,7 @@
 #include <zstd.h>
 #include <zlib.h>                  /* gzip source codec (xz would add <lzma.h>) */
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
 #include "qvm_scan.h"           /* Arrow-emit template for the fs-scan schema */
 #include "qvm_etag.h"           /* Arrow-emit template for the S3-etag schema */
@@ -156,7 +157,7 @@ static uint64_t xxh_digest(XXH *s){
  * tar-container scanning (OP_SRC_SCAN) a separate concern layered on top. */
 enum { CODEC_ZSTD, CODEC_GZIP /* , CODEC_XZ */ };
 typedef struct Source {
-    int fd; int codec;
+    int fd; int codec; pid_t child;   /* child: a spawned downloader (curl/gsutil) */
     uint8_t *in; size_t incap, inpos, inlen; int eof;
     ZSTD_DStream *ds;            /* CODEC_ZSTD */
     z_stream *gz;                /* CODEC_GZIP (zlib, gzip-wrapped) */
@@ -164,13 +165,46 @@ typedef struct Source {
     uint8_t *carry; size_t carry_len, carry_cap;  /* member-aligned window carry */
 } Source;
 
+/* Spawn `argv` (e.g. curl / gsutil) with its stdout on a pipe we read from — so
+ * Python only generates the command line (Range headers and all) and the VM pulls
+ * the bytes. Returns the read fd, sets *pid, or -errno. */
+static int spawn_reader(char *const argv[], pid_t *pid){
+    int pfd[2];
+    if (pipe(pfd)) return -errno;
+    pid_t c = fork();
+    if (c < 0) { int e = -errno; close(pfd[0]); close(pfd[1]); return e; }
+    if (c == 0) {                                /* child: stdout → pipe */
+        dup2(pfd[1], 1); close(pfd[0]); close(pfd[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(pfd[1]); *pid = c;
+    return pfd[0];
+}
+
 /* Open + sniff the codec from the leading magic bytes (the primed bytes stay in
- * `in` for the first pull, so nothing is lost). */
-static int source_open(Source *s, const char *path){
-    memset(s, 0, sizeof *s);
-    if (strncmp(path, "fd:", 3) == 0) s->fd = atoi(path + 3);   /* inherited pipe/socket
-                                       * (e.g. an HTTP stream Python pumps in) */
-    else { s->fd = open(path, O_RDONLY | O_CLOEXEC); if (s->fd < 0) return -errno; }
+ * `in` for the first pull, so nothing is lost). `path` is a file, "fd:N" (an
+ * inherited pipe), or "exec:" — then `argv` (NUL-separated in `argvbuf`) is spawned
+ * (curl/gsutil/...) and we read its stdout. */
+static int source_open(Source *s, const char *path,
+                       const uint8_t *argvbuf, int64_t argvlen){
+    memset(s, 0, sizeof *s); s->child = -1;
+    if (strncmp(path, "exec:", 5) == 0) {        /* spawn a downloader */
+        char *buf = malloc((size_t)argvlen + 1);  /* NUL-separated argv, NUL-terminated */
+        memcpy(buf, argvbuf, (size_t)argvlen); buf[argvlen] = 0;
+        char *argv[64]; int n = 0;                /* split on NULs */
+        for (int64_t i = 0; i < argvlen && n < 63; ) {
+            argv[n++] = buf + i;
+            while (i < argvlen && buf[i]) i++;
+            i++;                                  /* skip the NUL */
+        }
+        argv[n] = NULL;
+        int fd = spawn_reader(argv, &s->child); free(buf);
+        if (fd < 0) return fd;
+        s->fd = fd;
+    } else if (strncmp(path, "fd:", 3) == 0) {
+        s->fd = atoi(path + 3);                   /* inherited pipe/socket */
+    } else { s->fd = open(path, O_RDONLY | O_CLOEXEC); if (s->fd < 0) return -errno; }
     s->incap = 1 << 20; s->in = malloc(s->incap);
     ssize_t r = read(s->fd, s->in, s->incap);
     if (r < 0) { int e = -errno; close(s->fd); free(s->in); return e; }
@@ -219,7 +253,8 @@ static int64_t source_pull(Source *s, uint8_t *dst, int64_t max){
 static void source_close(Source *s){
     if (s->ds) ZSTD_freeDStream(s->ds);
     if (s->gz) { inflateEnd(s->gz); free(s->gz); }
-    if (s->fd > 0) close(s->fd);
+    if (s->fd > 0) close(s->fd);                  /* closing our read end ends the child */
+    if (s->child > 0) { int st; waitpid(s->child, &st, 0); }
     free(s->in); free(s->carry);
     memset(s, 0, sizeof *s);
 }
@@ -801,7 +836,7 @@ static void run_thread(Sched *S, Thread *t){
             pool_free(S, I->buf_id); t->pc++; break;
         case OP_SRC_OPEN: {                      /* open src[lo]; codec sniffed from magic */
             int64_t tt = tr_now();
-            int rc = source_open(&S->src[I->lo], I->path);
+            int rc = source_open(&S->src[I->lo], I->path, I->payload, I->payload_len);
             if (rc) S->failed = S->failed ? S->failed : rc;
             tr_log(S, tt, tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
             t->pc++; break;

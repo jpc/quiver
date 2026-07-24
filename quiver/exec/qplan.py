@@ -754,17 +754,27 @@ def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
                        prefix: str = "shard", window_bytes: int = 8 << 20,
                        frame_bytes: int = 1 << 20, level: int = 6,
                        shard_bytes: int = 5 << 30, nworkers: int = 8,
-                       source_fd: int | None = None) -> list[tuple]:
-    """VM-NATIVE sharded recompress: the VM decodes the source (a tar / .tar.gz — a
-    file path OR an inherited pipe fd, e.g. an HTTP stream Python pumps in),
-    member-aligns it (OP_SRC_SCAN), and PUSHES member rows; Python routes each by
-    `shard_key(path)` and pushes a gather that deflates that group's members STRAIGHT
-    to the group's dynamic output sink (OP_SINK_OPEN/CLOSE). The member bytes never
-    leave the VM — Python only sees metadata to route on. Each group rotates to a new
-    shard past ~shard_bytes. Returns a manifest of (shard, group, index, members, bytes)."""
+                       source_fd: int | None = None,
+                       source_cmd: list[str] | None = None) -> list[tuple]:
+    """VM-NATIVE sharded recompress. The VM decodes the source and member-aligns it
+    (OP_SRC_SCAN); Python routes each member by `shard_key(path)` and pushes a gather
+    that deflates that group's members STRAIGHT to its dynamic sink — the member bytes
+    never leave the VM, only metadata does. The source is a tar/.tar.gz given as a
+    file path, an inherited pipe fd (`source_fd`), or a COMMAND (`source_cmd`, e.g.
+    ['curl','-sS','--range','12345-', url] or ['gsutil','cat',gs_uri]) that the VM
+    SPAWNS itself and reads — so Python only generates the argv (Range headers for
+    resume included). Groups rotate to a new shard past ~shard_bytes. Returns a
+    manifest of (shard, group, index, members, bytes)."""
     os.makedirs(out_dir, exist_ok=True)
     cap = window_bytes
-    src = f"fd:{source_fd}" if source_fd is not None else os.path.abspath(src_path)
+    src_payload = b""
+    if source_cmd is not None:
+        src = "exec:"
+        src_payload = b"\0".join(a.encode() for a in source_cmd)   # NUL-separated argv
+    elif source_fd is not None:
+        src = f"fd:{source_fd}"
+    else:
+        src = os.path.abspath(src_path)
     G: dict[str, dict] = {}                          # group → live shard state
     frame_base = [0]
     manifest: list[tuple] = []
@@ -833,7 +843,8 @@ def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
 
     def driver(vm):
         vm.push(_finalize([pl.DataFrame([
-            {"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src},
+            {"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src,
+             "payload": src_payload},
             {"tid": 0, "_sub": 1, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
             {"tid": 0, "_sub": 2, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0, "len": cap}])]))
         rows = vm.read_rows(); done = vm.read_done()
