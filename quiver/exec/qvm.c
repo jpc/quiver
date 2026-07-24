@@ -935,7 +935,8 @@ static void comp_add(Sched *S, int64_t f, int64_t co, int64_t cl, int64_t dg){
 /* Persistent scheduler: the pool, worker pool, sinks, completions and trace
  * live across incrementally-fed instruction batches, so a buffer allocated in
  * one batch survives into the next (the discovery→plan→execute feedback loop). */
-static pthread_t g_wt[64]; static int g_nworkers;
+#define MAXW 256
+static pthread_t g_wt[MAXW]; static int g_nworkers;
 
 /* reader thread: fetch framed CALL responses off stdin so the scheduler never
  * blocks on the read. Each response (and a NULL sentinel at EOF) is delivered as
@@ -992,7 +993,8 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
                pthread_create(&S->ring_th, 0, ring_worker, S); }
     }
 #endif
-    static Worker g_wa[64];
+    static Worker g_wa[MAXW];
+    if (nworkers > MAXW) nworkers = MAXW;            /* cap the worker pool */
     g_nworkers = nworkers;
     for (int k = 0; k < nworkers; k++) {
         g_wa[k] = (Worker){ &S->tasks, &S->comps, k };
@@ -1090,8 +1092,11 @@ static void qvm_close(Sched *S){
     if (trp && S->t_base) {                       /* dump the trace */
         int tf = open(trp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (tf >= 0) {
+            int64_t tb = S->t_base;               /* absolute CLOCK_MONOTONIC base,
+                                                   * so a Python trace can align */
             int64_t span = tr_now() - S->t_base; uint32_t nt = (uint32_t)S->ntr;
-            if (write(tf, &span, 8) != 8 || write(tf, &nt, 4) != 4)
+            if (write(tf, &tb, 8) != 8 || write(tf, &span, 8) != 8 ||
+                write(tf, &nt, 4) != 4)
                 S->failed = S->failed ? S->failed : -EIO;
             if (S->ntr && write(tf, S->tr, (size_t)S->ntr * sizeof(TraceEv))
                 != (ssize_t)(S->ntr * sizeof(TraceEv)))

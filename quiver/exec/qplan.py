@@ -19,6 +19,7 @@ import os
 import struct
 import subprocess
 import tempfile
+import time
 
 import numpy as np
 import polars as pl
@@ -600,7 +601,7 @@ def recompress_zst_push(src_path: str, out_path: str, qvm_exe: str,
 def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
                               window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
                               level: int = 6, npool: int = 4, nworkers: int = 8,
-                              predicate: pl.Expr | None = None, depth: int = 3) -> int:
+                              predicate: pl.Expr | None = None, depth: int = 6) -> int:
     """BOUNDED-memory push recompress: the VM decodes ONE member-aligned window at
     a time (OP_SRC_SCAN — cut at the last complete member, partial tail carried in
     the source) and pushes that window's rows + a done flag on the DATA channel.
@@ -1166,6 +1167,7 @@ class _PushVM:
     def __init__(self, proc):
         self.p = proc
         self.out = proc.stdout.fileno()
+        self.waits = []                          # (t0_ns, t1_ns) blocked-on-read spans
 
     def push(self, instr: pl.DataFrame) -> None:
         data = encode_stream(instr)
@@ -1173,13 +1175,17 @@ class _PushVM:
         self.p.stdin.flush()
 
     def _msg(self):                              # one DATA message → (kind, payload)
+        t0 = time.monotonic_ns()                 # a read BLOCKS here until the VM emits
         tag = _readn(self.out, 1)
         if not tag:
+            self.waits.append((t0, time.monotonic_ns()))
             return None                          # VM closed stdout
         assert tag[0] == 1, f"unexpected stdout tag {tag[0]}"
         kind = _readn(self.out, 1)[0]
         (n,) = struct.unpack("<I", _readn(self.out, 4))
-        return kind, _readn(self.out, n)
+        m = (kind, _readn(self.out, n))
+        self.waits.append((t0, time.monotonic_ns()))
+        return m
 
     def read_rows(self) -> pl.DataFrame:         # kind 0: a member-row batch
         m = self._msg(); assert m and m[0] == 0, m
@@ -1208,6 +1214,7 @@ def push_exec(driver, qvm_exe: str, arch_path: str = "-",
     argv = (transport or []) + [qvm_exe, "qvm", arch_path, str(npool),
             str(nworkers), comp_path, "1", *sinks]      # call_fd = 1 (stdout DATA)
     pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # local pipe sinks
+    t_spawn = time.monotonic_ns()                 # ~qvm start (for the Python trace)
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          bufsize=0, pass_fds=pass_fds, env=penv)
     vm = _PushVM(p)
@@ -1223,6 +1230,17 @@ def push_exec(driver, qvm_exe: str, arch_path: str = "-",
     while vm._msg() is not None:                   # drain any trailing stdout
         pass
     rc = p.wait()
+    pytr = os.environ.get("QVM_PYTRACE")          # optional Python-side trace
+    if pytr:                                       # plan spans (CPU) between reads,
+        spans, cursor = [], t_spawn                # wait spans = blocked on the VM
+        for w0, w1 in vm.waits:
+            if w0 > cursor:
+                spans.append((cursor, w0, 0))     # 0 = plan (Python computing a batch)
+            spans.append((w0, w1, 1)); cursor = w1  # 1 = wait (blocked on VM)
+        with open(pytr, "wb") as tf:
+            tf.write(struct.pack("<I", len(spans)))
+            for a, b, k in spans:
+                tf.write(struct.pack("<qqq", a, b, k))
     if err is not None:
         if want_comp:
             os.unlink(comp_path)
