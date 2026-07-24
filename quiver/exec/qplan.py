@@ -56,14 +56,19 @@ _DEFAULTS = {
 
 def _finalize(parts: list[pl.DataFrame]) -> pl.DataFrame:
     """Concat instruction fragments (diagonal — each sets only its columns),
-    fill defaults, order by (tid, _sub), and cast to the instruction schema."""
-    df = pl.concat(parts, how="diagonal_relaxed").sort(["tid", "_sub"])
-    df = df.with_columns(
-        *[pl.col(c).fill_null(v) for c, v in _DEFAULTS.items() if c in df.columns],
-        *[pl.lit(v).alias(c) for c, v in _DEFAULTS.items() if c not in df.columns])
+    fill defaults, order by (tid, _sub), and cast to the instruction schema. The
+    sort → fill → cast is one lazy pipeline, collected once."""
+    cat = pl.concat(parts, how="diagonal_relaxed")
+    have = set(cat.columns)
+    df = (cat.lazy().sort(["tid", "_sub"])
+            .with_columns(
+              *[pl.col(c).fill_null(v) for c, v in _DEFAULTS.items() if c in have],
+              *[pl.lit(v).alias(c) for c, v in _DEFAULTS.items() if c not in have])
+            .select(*[pl.col(c).cast(t) for c, t in INSTR_COLS.items()])
+            .collect())
     # rechunk so the stream serialises as ONE Arrow record batch (the C reader
     # takes the first batch); column order = INSTR_COLS drives the buffer map.
-    return df.select(*[pl.col(c).cast(t) for c, t in INSTR_COLS.items()]).rechunk()
+    return df.rechunk()
 
 
 def _ancestors(rel: str):
@@ -441,26 +446,30 @@ def _gather_frames(df: pl.DataFrame, frame_bytes: int, buf_id: int = 0):
     order (window order, tar order within), so no re-sort. Otherwise all runs use
     the single `buf_id` and rows are sorted by offset."""
     multi = "buf" in df.columns
+    # ONE lazy pipeline → a single collect (compile+optimize+execute once per
+    # batch), instead of ~12 eager collects. `_new` marks a run boundary: the
+    # buffer offset jumps, the frame changes, or (coalesced) the buffer changes.
+    lf = df.lazy()
     if not multi:
-        df = df.sort("boff")
-    df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
-    df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
-    df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
-    df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
-    df = df.with_columns(_pe=(pl.col("boff") + pl.col("range")).shift(1),
-                         _pf=pl.col("frame").shift(1))     # a new run when the frame
-    new = ((pl.col("boff") != pl.col("_pe"))              # changes, the buffer is
-           | (pl.col("frame") != pl.col("_pf")))           # non-contiguous, or (multi)
-    if multi:                                              # the run crosses buffers
+        lf = lf.sort("boff")
+    new = ((pl.col("boff") != (pl.col("boff") + pl.col("range")).shift(1))
+           | (pl.col("frame") != pl.col("frame").shift(1)))
+    if multi:
         new = new | (pl.col("buf") != pl.col("buf").shift(1))
-    df = df.with_columns(_new=new.fill_null(True))
-    df = df.with_columns(run=pl.col("_new").cum_sum())
+    df = (lf.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
+            .with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
+            .with_columns(_fs=pl.col("_c").min().over("frame"),
+                          _new=new.fill_null(True))
+            .with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"),
+                          run=pl.col("_new").cum_sum())
+            .collect())
     aggs = [pl.col("frame").first(), pl.col("boff").min().alias("off"),
             pl.col("range").sum().alias("rlen")]
     if multi:
         aggs.append(pl.col("buf").first().alias("rbuf"))
-    runs = df.group_by("run", maintain_order=True).agg(*aggs)   # keep gather order
-    frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
+    runs, frames = pl.collect_all([                       # both aggregations, one call
+        df.lazy().group_by("run", maintain_order=True).agg(*aggs),
+        df.lazy().group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")])
     gc = ["off", "rlen"] + (["rbuf"] if multi else [])
     rbf = runs.group_by("frame", maintain_order=True).agg(*(pl.col(c) for c in gc))
     payloads = {}
