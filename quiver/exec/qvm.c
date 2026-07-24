@@ -34,9 +34,11 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include <sys/mman.h>
 #include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
 #include "qvm_scan.h"           /* Arrow-emit template for the fs-scan schema */
 #include "qvm_etag.h"           /* Arrow-emit template for the S3-etag schema */
+#include "qvm_tar.h"            /* Arrow-emit template for the tar-scan schema */
 #include "md5.h"                /* vendored MD5 (shared with quiver-exec.c) */
 #ifdef QVM_URING
 #include <liburing.h>           /* optional io_uring backend for per-file read/write */
@@ -1102,6 +1104,119 @@ static void emit_completions(int fd, Sched *S){
     uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(fd, eos, 8);
 }
 
+/* ------------------------------------------------------- tar scan (in C) */
+/* Parse an UNCOMPRESSED tar in C — the same member rows Python's tar_scan built
+ * with tarfile (path,size,mode,mtime_ns,uid,gid,offset,header_len,range), but
+ * without the per-member Python. Handles ustar + PAX ('x') + GNU long-name ('L')
+ * extension headers; offset/header_len span any extension headers so the range
+ * is byte-exact for the gather. This is what lets recompress scan in C and gather
+ * from qvm's own buffer instead of shipping decoded windows through the pipe. */
+static int64_t tar_oct(const uint8_t *p, int len){
+    int64_t v = 0; int i = 0;
+    while (i < len && p[i] == ' ') i++;
+    while (i < len && p[i] >= '0' && p[i] <= '7') v = v*8 + (p[i++] - '0');
+    return v;
+}
+static void tar_parse_pax(const uint8_t *b, int64_t n, char *path, int *hp, int64_t *psize){
+    int64_t i = 0;
+    while (i < n) {
+        int64_t s = i;
+        while (i < n && b[i] != ' ') i++;
+        i++;                                       /* "LEN key=value\n" */
+        const uint8_t *kv = b + i;
+        int64_t end = s + strtol((const char*)b + s, NULL, 10);
+        if (end <= s || end > n) break;
+        int64_t kl = 0;
+        while (b + i + kl < b + end && kv[kl] != '=') kl++;
+        if (kl == 4 && !memcmp(kv, "path", 4)) {
+            int64_t vl = end - (i + kl + 1) - 1; if (vl < 0) vl = 0; if (vl > 4094) vl = 4094;
+            memcpy(path, kv + kl + 1, vl); path[vl] = 0; *hp = 1;
+        } else if (kl == 4 && !memcmp(kv, "size", 4)) {
+            *psize = strtoll((const char*)kv + kl + 1, NULL, 10);
+        }
+        i = end;
+    }
+}
+typedef struct { char *pd; int64_t plen, pcap, *poff;
+                 int64_t *sz, *mt, *off, *hl, *rng; int32_t *mode, *uid, *gid;
+                 int64_t n, cap; } TAcc;
+static void tacc_add(TAcc *a, const char *nm, int64_t sz, int64_t mode, int64_t mt,
+                     int64_t uid, int64_t gid, int64_t off, int64_t hl, int64_t rng){
+    if (a->n == a->cap) { a->cap = a->cap ? a->cap*2 : 4096; int64_t c = a->cap;
+        a->poff=realloc(a->poff,(c+1)*8); a->sz=realloc(a->sz,c*8);
+        a->mt=realloc(a->mt,c*8); a->off=realloc(a->off,c*8); a->hl=realloc(a->hl,c*8);
+        a->rng=realloc(a->rng,c*8); a->mode=realloc(a->mode,c*4);
+        a->uid=realloc(a->uid,c*4); a->gid=realloc(a->gid,c*4);
+        if (a->n == 0) a->poff[0] = 0; }
+    size_t nl = strlen(nm);
+    if (a->plen + (int64_t)nl > a->pcap) { a->pcap = a->pcap ? a->pcap : 1<<16;
+        while (a->plen + (int64_t)nl > a->pcap) a->pcap *= 2;
+        a->pd = realloc(a->pd, a->pcap); }
+    memcpy(a->pd + a->plen, nm, nl); a->plen += nl; a->poff[a->n+1] = a->plen;
+    int64_t i = a->n;
+    a->sz[i]=sz; a->mode[i]=(int32_t)mode; a->mt[i]=mt; a->uid[i]=(int32_t)uid;
+    a->gid[i]=(int32_t)gid; a->off[i]=off; a->hl[i]=hl; a->rng[i]=rng; a->n++;
+}
+static int qvm_tarscan(const char *tar_path, int outfd){
+    int fd = open(tar_path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "qvm tarscan: %s: %s\n", tar_path, strerror(errno)); return 1; }
+    struct stat st; if (fstat(fd, &st)) { close(fd); return 1; }
+    int64_t sz = st.st_size;
+    uint8_t *m = sz ? mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+    if (sz && m == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
+    TAcc a; memset(&a, 0, sizeof a);
+    char pax[4096], gnu[4096]; int has_pax = 0, has_gnu = 0; int64_t pax_sz = -1, mstart = -1;
+    for (int64_t off = 0; off + 512 <= sz; ) {
+        const uint8_t *h = m + off;
+        int zero = 1; for (int i = 0; i < 512; i++) if (h[i]) { zero = 0; break; }
+        if (zero) break;                           /* end-of-archive */
+        char tf = (char)h[156];
+        int64_t fsz = tar_oct(h + 124, 12);
+        int64_t pad = ((fsz + 511) / 512) * 512;
+        if (tf == 'x' || tf == 'g') {              /* PAX extended header */
+            tar_parse_pax(m + off + 512, fsz, pax, &has_pax, &pax_sz);
+            if (mstart < 0) mstart = off; off += 512 + pad; continue;
+        }
+        if (tf == 'L' || tf == 'K') {              /* GNU long name/link */
+            int64_t nl = fsz < 4095 ? fsz : 4095; memcpy(gnu, m + off + 512, nl);
+            while (nl > 0 && gnu[nl-1] == 0) nl--; gnu[nl] = 0; has_gnu = 1;
+            if (mstart < 0) mstart = off; off += 512 + pad; continue;
+        }
+        int64_t real = (has_pax && pax_sz >= 0) ? pax_sz : fsz;
+        if (tf == '0' || tf == 0) {                /* a regular file → emit */
+            char name[4200];
+            if (has_pax) snprintf(name, sizeof name, "%s", pax);
+            else if (has_gnu) snprintf(name, sizeof name, "%s", gnu);
+            else { char nm[101], pfx[156]; memcpy(nm, h, 100); nm[100] = 0;
+                   memcpy(pfx, h + 345, 155); pfx[155] = 0;
+                   if (pfx[0]) snprintf(name, sizeof name, "%s/%s", pfx, nm);
+                   else snprintf(name, sizeof name, "%s", nm); }
+            int64_t ms = mstart >= 0 ? mstart : off, doff = off + 512;
+            tacc_add(&a, name, real, tar_oct(h+100,8), tar_oct(h+136,12)*1000000000,
+                     tar_oct(h+108,8), tar_oct(h+116,8), ms, doff - ms,
+                     (doff - ms) + ((real + 511) / 512) * 512);
+        }
+        off = (off + 512) + ((real + 511) / 512) * 512;
+        has_pax = has_gnu = 0; pax_sz = -1; mstart = -1;
+    }
+    int64_t n = a.n;
+    emit_schema(outfd, QTAR_SCHEMA_META, QTAR_SCHEMA_LEN);
+    struct WBuf b[QTAR_N_BUFS] = {
+        {NULL,0},{a.poff, 8*(n+1)},{a.pd, a.plen},
+        {NULL,0},{a.sz, 8*n},   {NULL,0},{a.mode, 4*n}, {NULL,0},{a.mt, 8*n},
+        {NULL,0},{a.uid, 4*n},  {NULL,0},{a.gid, 4*n},  {NULL,0},{a.off, 8*n},
+        {NULL,0},{a.hl, 8*n},   {NULL,0},{a.rng, 8*n}};
+    if (n == 0) b[1] = (struct WBuf){NULL,0};
+    emit_batch(outfd, QTAR_BATCH_TMPL, QTAR_TMPL_LEN, QTAR_OFF_BODYLEN,
+               QTAR_OFF_RBLEN, QTAR_NODE_OFF, QTAR_N_NODES, QTAR_BUF_OFF,
+               QTAR_N_BUFS, n, b);
+    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
+    if (m) munmap(m, sz); close(fd);
+    free(a.pd); free(a.poff); free(a.sz); free(a.mt); free(a.off); free(a.hl);
+    free(a.rng); free(a.mode); free(a.uid); free(a.gid);
+    return 0;
+}
+
 /* --------------------------------------------------------- filesystem scan */
 /* A parallel directory walk (a dir queue drained by N worker threads; each dir
  * is opened relative to its parent's fd, so no path re-walk and no PATH_MAX
@@ -1343,6 +1458,8 @@ int main(int argc, char **argv){
         return qvm_scan(argv[2], argc > 3 ? atoi(argv[3]) : 8, 1);
     if (argc >= 3 && strcmp(argv[1], "etag") == 0)   /* qvm etag <part_size> [threads] <stdin paths */
         return qvm_etag(atoll(argv[2]), argc > 3 ? atoi(argv[3]) : 8, 1);
+    if (argc >= 3 && strcmp(argv[1], "tarscan") == 0)   /* qvm tarscan <tar> */
+        return qvm_tarscan(argv[2], 1);
     if (argc < 2 || strcmp(argv[1], "qvm") != 0) {
         fprintf(stderr, "usage: %s qvm <arch|-> [npool] [nworkers] [comp|-] "
                         "[callfd|-] [sink ...]\n  or:  %s scan <root> [threads]\n",

@@ -399,11 +399,17 @@ def pack_pipe(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
     return _stream_footer(out_path, [members], comp)
 
 
-def tar_scan(tar_path: str) -> pl.DataFrame:
-    """Decode a (uncompressed) tar into a member-row stream — the same schema as
-    the filesystem scan (path, is_dir, size, mode, mtime_ns, uid, gid) plus the
-    member's location in the archive (offset, header_len, range = header + padded
-    body). So tar decode and fs scan are interchangeable discovery front-ends."""
+def tar_scan(tar_path: str, qvm_exe: str | None = None) -> pl.DataFrame:
+    """Decode a (uncompressed) tar into a member-row stream — path, size, mode,
+    mtime_ns, uid, gid, plus the member's location (offset, header_len, range =
+    header + padded body). With `qvm_exe`, the parse runs in C (`qvm tarscan`,
+    ustar/PAX/GNU, no per-member Python) — far faster for many-member tars, so
+    recompress can scan in C and gather from qvm's own buffer instead of shipping
+    decoded windows through the pipe. Without it, the tarfile fallback."""
+    if qvm_exe is not None:
+        p = subprocess.run([qvm_exe, "tarscan", os.path.abspath(tar_path)],
+                           stdout=subprocess.PIPE, check=True)
+        return ipc.read_all(p.stdout)
     import tarfile
     rows = []
     with tarfile.open(tar_path, "r:") as tf:
@@ -411,7 +417,7 @@ def tar_scan(tar_path: str) -> pl.DataFrame:
             if not m.isfile():
                 continue
             hl = m.offset_data - m.offset
-            rows.append({"path": m.name, "is_dir": False, "size": m.size,
+            rows.append({"path": m.name, "size": m.size,
                          "mode": m.mode, "mtime_ns": int(m.mtime) * 1_000_000_000,
                          "uid": m.uid, "gid": m.gid, "offset": m.offset,
                          "header_len": hl,
@@ -495,7 +501,7 @@ def recompress(tar_path: str, out_path: str, qvm_exe: str,
                nworkers: int = 8, predicate: pl.Expr | None = None) -> int:
     """Plan + run a tar->nock recompress (multi-run gather), then write the
     footer from the completions. Returns the member count."""
-    instr, members = plan_recompress(tar_scan(tar_path), tar_path, frame_bytes,
+    instr, members = plan_recompress(tar_scan(tar_path, qvm_exe), tar_path, frame_bytes,
                                      level, predicate)
     open(out_path, "wb").close()
     comp = run(instr, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
@@ -656,7 +662,7 @@ def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
     pool's alloc backpressure keeps at most `depth` resident. This needs the
     caller batch to have in-flight work at the CALL — hence epoch-routed
     completions in the C scheduler."""
-    members = tar_scan(tar_path)
+    members = tar_scan(tar_path, qvm_exe)
     if predicate is not None:
         members = members.filter(predicate)
     members = members.sort("offset").with_columns(
