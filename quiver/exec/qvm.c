@@ -779,9 +779,10 @@ static void run_thread(Sched *S, Thread *t){
             tr_log(S, tr_now(), tr_now(), t->tid, OP_FREE, I->buf_id, 0, 0, 0);
             pool_free(S, I->buf_id); t->pc++; break;
         case OP_SRC_OPEN: {                      /* open src[lo]; codec sniffed from magic */
+            int64_t tt = tr_now();
             int rc = source_open(&S->src[I->lo], I->path);
             if (rc) S->failed = S->failed ? S->failed : rc;
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
+            tr_log(S, tt, tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
             t->pc++; break;
         }
         case OP_SRC_CLOSE: {
@@ -797,6 +798,7 @@ static void run_thread(Sched *S, Thread *t){
             return;
         }
         case OP_TARSCAN: {                       /* parse tar → DATA rows */
+            int64_t tt = tr_now();
             if (I->buf_id < 0 && I->path && I->path[0]) {   /* file mode: mmap + scan */
                 int rc = emit_tarscan_file(S, I->path);
                 if (rc) S->failed = S->failed ? S->failed : rc;
@@ -805,19 +807,21 @@ static void run_thread(Sched *S, Thread *t){
                 int64_t len = I->len ? I->len : (m ? S->pool[I->buf_id].cap : 0);
                 emit_tarscan(S, m ? m + I->buf_off : NULL, len);
             }
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, I->len, 0);
+            tr_log(S, tt, tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, I->len, 0);
             t->pc++; break;
         }
         case OP_SCANDIR: {                       /* parallel fs walk → STAT rows */
+            int64_t tt = tr_now();
             int rc = emit_scandir(S, I->path, I->level > 0 ? I->level : 8);
             if (rc) S->failed = S->failed ? S->failed : rc;
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_SCANDIR, 0, 0, 0, 0);
+            tr_log(S, tt, tr_now(), t->tid, OP_SCANDIR, 0, 0, 0, 0);
             t->pc++; break;
         }
         case OP_CKSUM: {                         /* S3 ETag + CRC64 per path → DATA */
+            int64_t tt = tr_now();
             emit_cksum(S, (const char *)I->payload, (size_t)I->payload_len,
                        I->cap, I->level > 0 ? I->level : 8);
-            tr_log(S, tr_now(), tr_now(), t->tid, OP_CKSUM, 0, 0, 0, 0);
+            tr_log(S, tt, tr_now(), t->tid, OP_CKSUM, 0, 0, 0, 0);
             t->pc++; break;
         }
         case OP_SRC_NEXT: {                      /* decode next window → buf/sink (task) */
