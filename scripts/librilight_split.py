@@ -93,6 +93,76 @@ def librilight_split(root: str, out_dir: str, qvm_exe: str, subset: str = "large
     return manifest
 
 
+def librilight_split_http(url: str, out_dir: str, qvm_exe: str, subset: str = "large",
+                          big_speaker: str = "6454", shard_bytes: int = 5 << 30,
+                          speaker_depth: int = 1, level: int = 3, frame_bytes: int = 1 << 20,
+                          nworkers: int = 8, on_shard=None, _stream=None) -> list[tuple]:
+    """STREAM-download a subset tar(.gz) over HTTP and repack it on the fly — never
+    landing the full archive (or the extracted files) on disk. The `large` subset is
+    a single tar.gz; `r|*` streams AND gzip-decompresses it sequentially (no seek),
+    so only the HTTP stream flows and gzip runs once over it. Each member (path
+    {subset}/{speaker}/{book}/*.flac → speaker at `speaker_depth`) is routed to its
+    group's OPEN shard tar; when a group hits ~`shard_bytes` that shard tar is
+    recompressed to a nock shard and a fresh one begins. Peak disk is ~one shard per
+    group. `_stream` overrides the source (a file object) for testing. Returns the
+    same manifest as librilight_split.
+
+    Note: a single tar.gz is ONE gzip stream, so decompression is single-threaded
+    (network- and gzip-bound); swap in isal/igzip for the fastest zlib path."""
+    import io
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    os.makedirs(out_dir, exist_ok=True)
+    big_g, rest_g = f"{subset}-{big_speaker}", f"{subset}-wo{big_speaker}"
+    open_tar: dict[str, tuple] = {}                   # group → (tarfile, temp path, bytes)
+    idx = {big_g: 0, rest_g: 0}
+    manifest: list[tuple] = []
+
+    def shard_open(g: str):
+        fd, tmp = tempfile.mkstemp(prefix=f"ll_{g}_", suffix=".tar", dir=out_dir)
+        os.close(fd)
+        open_tar[g] = (tarfile.open(tmp, "w"), tmp, 0)
+
+    def shard_close(g: str) -> None:                  # recompress the group's shard tar
+        tf, tmp, nbytes = open_tar.pop(g)
+        tf.close()
+        if nbytes == 0:
+            os.unlink(tmp); return
+        shard = os.path.join(out_dir, f"librilight-{g}-flac-{idx[g]:06d}.nock")
+        n = qplan.recompress(tmp, shard, qvm_exe, frame_bytes=frame_bytes,
+                             level=level, nworkers=nworkers)
+        os.unlink(tmp)
+        rec = (shard, g, idx[g], n, nbytes)
+        manifest.append(rec)
+        if on_shard:
+            on_shard(rec)
+        idx[g] += 1
+
+    src = _stream if _stream is not None else urllib.request.urlopen(url)
+    with tarfile.open(fileobj=src, mode="r|*") as tar:  # STREAM + gunzip, no seek
+        for m in tar:
+            if not m.isfile():
+                continue
+            parts = m.name.split("/")
+            spk = parts[speaker_depth] if len(parts) > speaker_depth else parts[0]
+            g = big_g if spk == big_speaker else rest_g
+            if g not in open_tar:
+                shard_open(g)
+            data = tar.extractfile(m).read()          # this member's bytes, in order
+            tf, tmp, nbytes = open_tar[g]
+            mi = tarfile.TarInfo(m.name); mi.size = m.size; mi.mode = m.mode
+            mi.mtime = m.mtime; mi.uid = m.uid; mi.gid = m.gid
+            tf.addfile(mi, io.BytesIO(data))
+            nbytes += m.size; open_tar[g] = (tf, tmp, nbytes)
+            if nbytes >= shard_bytes:
+                shard_close(g)
+    for g in list(open_tar):                           # tail shards
+        shard_close(g)
+    return manifest
+
+
 # --------------------------------------------------------------------- self-test
 def _selftest(qvm_exe: str) -> None:
     import shutil, tempfile
@@ -149,9 +219,37 @@ def _selftest(qvm_exe: str) -> None:
     for p in _zf.read_index(s0).filter(pl.col("frame") >= 0)["path"]:
         assert open(os.path.join(xd, p), "rb").read() == \
             open(os.path.join(root, p), "rb").read()
-    print(f"PASS: {len(files)} files → {big_shards} large-6454 + {rest_shards} "
+    print(f"PASS (fs): {len(files)} files → {big_shards} large-6454 + {rest_shards} "
           f"large-wo6454 shards, groups pure, complete, byte-exact round-trip")
-    for d in (root, out, xd):
+
+    # ---- HTTP path: tar up the tree as .tar.gz, serve it, stream-download + repack ----
+    import gzip, http.server, socketserver, tarfile, threading
+    tgz = os.path.join(tempfile.mkdtemp(), "large.tar.gz")
+    with tarfile.open(tgz, "w:gz") as tf:             # single tar.gz, like the real large
+        tf.add(root, arcname="large", recursive=True)
+    srvdir = os.path.dirname(tgz)
+    os.chdir(srvdir)
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    out2 = tempfile.mkdtemp(prefix="ll_http_")
+    # paths in the tar are large/{speaker}/... → speaker at depth 1
+    man2 = librilight_split_http(f"http://127.0.0.1:{port}/large.tar.gz", out2, qvm_exe,
+                                 subset="large", big_speaker="6454",
+                                 shard_bytes=total_big // 3, speaker_depth=1,
+                                 level=3, frame_bytes=64 << 10, nworkers=4)
+    httpd.shutdown()
+    seen2, pure = set(), True
+    for shard, g, i, n, sb in man2:
+        for p in _zf.read_index(shard).filter(pl.col("frame") >= 0)["path"]:
+            spk = p.split("/")[1]                     # large/{speaker}/...
+            pure = pure and ((spk == "6454") != g.endswith("wo6454"))
+            seen2.add(p[len("large/"):])
+    assert pure, "HTTP split leaked a speaker across groups"
+    assert seen2 == set(files), f"HTTP coverage {len(seen2)} vs {len(files)}"
+    print(f"PASS (http): streamed .tar.gz → {len(man2)} shards, groups pure, complete "
+          f"(never staged the full archive)")
+    for d in (root, out, xd, srvdir, out2):
         shutil.rmtree(d, ignore_errors=True)
 
 
