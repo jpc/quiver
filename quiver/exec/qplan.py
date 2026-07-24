@@ -155,12 +155,15 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
 
 
 # ------------------------------------------------------------------------ scan
-def scan(root: str, qvm_exe: str, threads: int = 8) -> pl.DataFrame:
+def scan(root: str, qvm_exe: str, threads: int = 8,
+         transport: list | None = None) -> pl.DataFrame:
     """Parallel filesystem scan by qvm itself (no dependency on the old scanner):
     `qvm scan <root>` walks the tree with a worker pool and emits one Arrow batch
     — relative path, is_dir, size, mode, mtime_ns, uid, gid (root excluded, dirs +
-    files incl. empty). Drop-in for wire.scan for the columns the planner uses."""
-    p = subprocess.run([qvm_exe, "scan", os.path.abspath(root), str(threads)],
+    files incl. empty). Drop-in for wire.scan for the columns the planner uses.
+    `transport=["ssh", host]` runs the scan on a node (root is a remote path)."""
+    root2 = root if transport else os.path.abspath(root)
+    p = subprocess.run((transport or []) + [qvm_exe, "scan", root2, str(threads)],
                        stdout=subprocess.PIPE, check=True)
     df = ipc.read_all(p.stdout)
     return df.with_columns(pl.col("is_dir").cast(pl.Boolean))
@@ -1053,23 +1056,31 @@ def unpack_merged(manifest: str, dest: str, qvm_exe: str, npool: int = 16,
 
 def unpack_distributed(path: str, dest: str, qvm_exe: str, executors: int = 4,
                        npool: int = 16, nworkers: int = 8,
-                       predicate: pl.Expr | None = None) -> int:
-    """Distributed unpack — partition the FRAME set across `executors` and decode
-    in parallel with NO reduce, since each member scatters to its own dest file
+                       predicate: pl.Expr | None = None,
+                       transports: list | None = None) -> int:
+    """Distributed unpack — partition the FRAME set across executors and decode in
+    parallel with NO reduce, since each member scatters to its own dest file
     (disjoint outputs on shared storage). Frames are the unit (a decode group
     can't split). A merged manifest round-robins whole SHARDS; a single archive
-    round-robins its frames, each executor a separate qvm process over its subset
-    (+ all dir rows, so every executor materializes the tree). Executors here are
-    local processes; prefixing their argv with ["ssh", host] would place them on
-    nodes. Returns the file-member count decoded."""
+    round-robins its frames, each executor a separate qvm over its subset (+ all
+    dir rows, so every executor materializes the tree). With `transports` (a list
+    of argv prefixes, e.g. [["ssh","n1"],["ssh","n2"]]) each executor runs on a
+    node via the direct (fd-passing-free) path over shared storage; without it,
+    executors are `executors` local processes. Returns the file-member count."""
     import concurrent.futures
+    n = len(transports) if transports else executors
+    tp = (lambda i: transports[i % len(transports)]) if transports else (lambda i: None)
+    os.makedirs(dest, exist_ok=True)
     if path.endswith(".nockm"):                   # merged: distribute whole shards
         shards, _ = read_merged(path)
-        os.makedirs(dest, exist_ok=True)
-        groups = [shards[i::executors] for i in range(executors)]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=executors) as ex:
-            list(ex.map(lambda g: [unpack(s, dest, qvm_exe, npool, nworkers)
-                                   for s in g], groups))
+        groups = [shards[i::n] for i in range(n)]
+
+        def run_group(i):
+            for sh in groups[i]:
+                run_direct(plan_unpack(sh, dest, npool), qvm_exe, sh,
+                           npool=npool, nworkers=nworkers, transport=tp(i))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+            list(ex.map(run_group, range(n)))
         return sum(_zf.read_index(s).filter(pl.col("frame") >= 0).height
                    for s in shards)
     idx = _zf.read_index(path)
@@ -1077,20 +1088,19 @@ def unpack_distributed(path: str, dest: str, qvm_exe: str, executors: int = 4,
         idx = idx.filter(predicate)
     dirs = idx.filter(pl.col("frame") < 0)
     files = idx.filter(pl.col("frame") >= 0)
-    os.makedirs(dest, exist_ok=True)
     fids = sorted(files["frame"].unique().to_list())
-    node = {f: i % executors for i, f in enumerate(fids)}   # round-robin frames
+    node = {f: i % n for i, f in enumerate(fids)}   # round-robin frames
 
     def run_one(i):
         keep = [f for f in fids if node[f] == i]
         if not keep:
             return
         sub = pl.concat([files.filter(pl.col("frame").is_in(keep)), dirs])
-        run(plan_unpack(path, dest, npool, idx=sub), qvm_exe, path,
-            npool=npool, nworkers=nworkers)
+        run_direct(plan_unpack(path, dest, npool, idx=sub), qvm_exe, path,
+                   npool=npool, nworkers=nworkers, transport=tp(i))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=executors) as ex:
-        list(ex.map(run_one, range(executors)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(run_one, range(n)))
     return files.height
 
 
@@ -1243,6 +1253,36 @@ def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
     returns them as a DataFrame."""
     return run_calls(lambda cid: instr, qvm_exe, arch_path, sinks, npool,
                      nworkers, want_comp, env=env)
+
+
+def run_direct(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
+               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
+               want_comp: bool = False, transport: list | None = None,
+               env: dict | None = None):
+    """Run a SINGLE instruction batch WITHOUT the CALL fd-channel — the batch is
+    streamed on stdin, so it needs no fd-passing and runs over any argv-prefix
+    transport. `transport=["ssh", host]` places it on a node (arch/sinks/comp
+    must be shared-fs PATHS, not fd: pipes — weka). Local (transport=None) it is
+    the direct path, exercising the same code. Returns completions if want_comp."""
+    comp_path = "-"
+    if want_comp:
+        fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
+    argv = (transport or []) + [qvm_exe, "qvm", arch_path, str(npool),
+                                str(nworkers), comp_path, "-", *sinks]   # callfd = "-"
+    data = encode_stream(instr)
+    p = subprocess.run(argv, input=struct.pack("<I", len(data)) + data,
+                       stdout=subprocess.DEVNULL,
+                       env={**os.environ, **env} if env else None)
+    if p.returncode != 0:
+        if want_comp:
+            os.unlink(comp_path)
+        raise RuntimeError(f"qvm exited {p.returncode}")
+    if not want_comp:
+        return None
+    with open(comp_path, "rb") as cf:
+        raw = cf.read()
+    os.unlink(comp_path)
+    return ipc.read_all(raw).rename({"coff": "frame_coff", "clen": "frame_clen"})
 
 
 def run_calls(handler, qvm_exe: str, arch_path: str = "-",
