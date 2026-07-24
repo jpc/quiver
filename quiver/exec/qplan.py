@@ -755,7 +755,9 @@ def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
                        frame_bytes: int = 1 << 20, level: int = 6,
                        shard_bytes: int = 5 << 30, nworkers: int = 8,
                        source_fd: int | None = None,
-                       source_cmd: list[str] | None = None) -> list[tuple]:
+                       source_cmd: list[str] | None = None,
+                       ckpt_path: str | None = None, resume: bool = False,
+                       ckpt_interval: int = 64 << 20) -> list[tuple]:
     """VM-NATIVE sharded recompress. The VM decodes the source and member-aligns it
     (OP_SRC_SCAN); Python routes each member by `shard_key(path)` and pushes a gather
     that deflates that group's members STRAIGHT to its dynamic sink — the member bytes
@@ -844,7 +846,8 @@ def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
     def driver(vm):
         vm.push(_finalize([pl.DataFrame([
             {"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src,
-             "payload": src_payload},
+             "payload": src_payload, "dpath": ckpt_path or "",   # gzip resume index
+             "mode": 1 if resume else 0, "cap": ckpt_interval},
             {"tid": 0, "_sub": 1, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
             {"tid": 0, "_sub": 2, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0, "len": cap}])]))
         rows = vm.read_rows(); done = vm.read_done()

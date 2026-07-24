@@ -163,7 +163,17 @@ typedef struct Source {
     z_stream *gz;                /* CODEC_GZIP (zlib, gzip-wrapped) */
     int64_t produced;
     uint8_t *carry; size_t carry_len, carry_cap;  /* member-aligned window carry */
+    int ckpt_fd;                 /* gzip resume index (zran): append checkpoints here */
+    int64_t ckpt_ivl, ckpt_last; /* compressed-byte interval, last checkpointed total_in */
 } Source;
+
+/* A gzip resume checkpoint (zran-style), fixed size so the LAST one is a tail read.
+ * `comp_off` is the compressed byte offset of a deflate block boundary; `bits` is
+ * the unused bits in the byte at comp_off (0..7); `win` is the 32 KiB inflate
+ * dictionary at that point. Resume = Range-GET from comp_off, inflatePrime(bits),
+ * inflateSetDictionary(win), continue. */
+typedef struct { int64_t comp_off, uncomp_off; int32_t bits, winlen;
+                 uint8_t win[32768]; } GzCkpt;
 
 /* Spawn `argv` (e.g. curl / gsutil) with its stdout on a pipe we read from — so
  * Python only generates the command line (Range headers and all) and the VM pulls
@@ -187,8 +197,9 @@ static int spawn_reader(char *const argv[], pid_t *pid){
  * inherited pipe), or "exec:" — then `argv` (NUL-separated in `argvbuf`) is spawned
  * (curl/gsutil/...) and we read its stdout. */
 static int source_open(Source *s, const char *path,
-                       const uint8_t *argvbuf, int64_t argvlen){
-    memset(s, 0, sizeof *s); s->child = -1;
+                       const uint8_t *argvbuf, int64_t argvlen,
+                       const char *ckpt_path, int resume, int64_t ckpt_ivl){
+    memset(s, 0, sizeof *s); s->child = -1; s->ckpt_fd = -1;
     if (strncmp(path, "exec:", 5) == 0) {        /* spawn a downloader */
         char *buf = malloc((size_t)argvlen + 1);  /* NUL-separated argv, NUL-terminated */
         memcpy(buf, argvbuf, (size_t)argvlen); buf[argvlen] = 0;
@@ -210,14 +221,52 @@ static int source_open(Source *s, const char *path,
     if (r < 0) { int e = -errno; close(s->fd); free(s->in); return e; }
     s->inpos = 0; s->inlen = (size_t)(r > 0 ? r : 0);
     const uint8_t *m = s->in;
-    if (r >= 4 && m[0]==0x28 && m[1]==0xB5 && m[2]==0x2F && m[3]==0xFD) {
+    if (resume) {                                /* RESUME a gzip stream mid-way (zran):
+                                       * the input already starts at a block boundary
+                                       * (the downloader Range-GET'd from comp_off). */
+        GzCkpt ck;
+        int cf = ckpt_path ? open(ckpt_path, O_RDONLY) : -1;
+        if (cf < 0) { close(s->fd); free(s->in); return -EINVAL; }
+        off_t end = lseek(cf, 0, SEEK_END);       /* read the last checkpoint */
+        if (end < (off_t)sizeof ck || pread(cf, &ck, sizeof ck, end - sizeof ck)
+                != (ssize_t)sizeof ck) { close(cf); close(s->fd); free(s->in); return -EIO; }
+        close(cf);
+        s->codec = CODEC_GZIP; s->gz = calloc(1, sizeof *s->gz);
+        if (inflateInit2(s->gz, -15) != Z_OK) {   /* -15: RAW inflate (no gzip header) */
+            close(s->fd); free(s->in); free(s->gz); return -EIO; }
+        if (ck.bits) {                            /* boundary is mid-byte: prime the tail */
+            inflatePrime(s->gz, ck.bits, s->in[0] >> (8 - ck.bits));
+            s->inpos = 1;                         /* consume the boundary byte */
+        }
+        inflateSetDictionary(s->gz, ck.win, (uInt)ck.winlen);
+        s->gz->total_in = ck.comp_off; s->produced = ck.uncomp_off;
+        s->ckpt_last = ck.comp_off;
+    } else if (r >= 4 && m[0]==0x28 && m[1]==0xB5 && m[2]==0x2F && m[3]==0xFD) {
         s->codec = CODEC_ZSTD; s->ds = ZSTD_createDStream(); ZSTD_initDStream(s->ds);
     } else if (r >= 2 && m[0]==0x1F && m[1]==0x8B) {
         s->codec = CODEC_GZIP; s->gz = calloc(1, sizeof *s->gz);
         if (inflateInit2(s->gz, 15 + 16) != Z_OK) {   /* +16: gzip wrapper */
             close(s->fd); free(s->in); free(s->gz); return -EIO; }
     } else { close(s->fd); free(s->in); return -EINVAL; }   /* unknown magic */
+    if (ckpt_path && !resume) {                   /* fresh + checkpointing: (re)create it */
+        s->ckpt_fd = open(ckpt_path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    } else if (ckpt_path) {                        /* resume: append further checkpoints */
+        s->ckpt_fd = open(ckpt_path, O_WRONLY|O_APPEND);
+    }
+    s->ckpt_ivl = ckpt_ivl > 0 ? ckpt_ivl : (16 << 20);
     return 0;
+}
+
+/* Append a resume checkpoint at the current (block-boundary) position. */
+static void gz_checkpoint(Source *s, z_stream *z, size_t pos){
+    GzCkpt ck; memset(&ck, 0, sizeof ck);
+    int bits = z->data_type & 7;
+    ck.comp_off = (int64_t)z->total_in - (bits ? 1 : 0);
+    ck.uncomp_off = s->produced + (int64_t)pos;
+    ck.bits = bits;
+    uInt wl = 32768; inflateGetDictionary(z, ck.win, &wl); ck.winlen = (int32_t)wl;
+    if (write(s->ckpt_fd, &ck, sizeof ck) != (ssize_t)sizeof ck) { /* best-effort */ }
+    s->ckpt_last = z->total_in;
 }
 
 /* Decompress up to `max` plaintext bytes into dst; returns bytes produced (0 at
@@ -241,8 +290,13 @@ static int64_t source_pull(Source *s, uint8_t *dst, int64_t max){
             z_stream *z = s->gz;
             z->next_in = s->in + s->inpos; z->avail_in = (uInt)(s->inlen - s->inpos);
             z->next_out = dst + pos; z->avail_out = (uInt)((size_t)max - pos);
-            int rc = inflate(z, Z_NO_FLUSH);
+            /* Z_BLOCK stops at deflate block boundaries so we can checkpoint; the
+             * flag `data_type & 128` marks a boundary, `& 64` the final block. */
+            int rc = inflate(z, s->ckpt_fd >= 0 ? Z_BLOCK : Z_NO_FLUSH);
             s->inpos = s->inlen - z->avail_in; pos = (size_t)max - z->avail_out;
+            if (s->ckpt_fd >= 0 && (z->data_type & 128) && !(z->data_type & 64)
+                && (int64_t)z->total_in - s->ckpt_last >= s->ckpt_ivl)
+                gz_checkpoint(s, z, pos);            /* zran access point */
             if (rc == Z_STREAM_END) { s->eof = 1; break; }   /* single-member gzip */
             if (rc != Z_OK && rc != Z_BUF_ERROR) return -1;
         }
@@ -255,6 +309,7 @@ static void source_close(Source *s){
     if (s->gz) { inflateEnd(s->gz); free(s->gz); }
     if (s->fd > 0) close(s->fd);                  /* closing our read end ends the child */
     if (s->child > 0) { int st; waitpid(s->child, &st, 0); }
+    if (s->ckpt_fd >= 0) close(s->ckpt_fd);
     free(s->in); free(s->carry);
     memset(s, 0, sizeof *s);
 }
@@ -836,7 +891,9 @@ static void run_thread(Sched *S, Thread *t){
             pool_free(S, I->buf_id); t->pc++; break;
         case OP_SRC_OPEN: {                      /* open src[lo]; codec sniffed from magic */
             int64_t tt = tr_now();
-            int rc = source_open(&S->src[I->lo], I->path, I->payload, I->payload_len);
+            const char *ckpt = (I->dpath && I->dpath[0]) ? I->dpath : NULL;
+            int rc = source_open(&S->src[I->lo], I->path, I->payload, I->payload_len,
+                                 ckpt, I->mode > 0, I->cap);   /* mode=resume, cap=interval */
             if (rc) S->failed = S->failed ? S->failed : rc;
             tr_log(S, tt, tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
             t->pc++; break;
