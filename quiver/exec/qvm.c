@@ -1105,41 +1105,52 @@ static void emit_completions(int fd, Sched *S){
 /* --------------------------------------------------------- filesystem scan */
 /* A parallel directory walk (a dir queue drained by N worker threads; each dir
  * is opened relative to its parent's fd, so no path re-walk and no PATH_MAX
- * limit). Emits ONE Arrow batch — relative path, is_dir, size, mode, mtime_ns,
- * uid, gid — the same rows the planner consumes from wire.scan (root excluded,
- * dirs + files, incl. empty dirs). Makes qvm self-sufficient for discovery. */
-typedef struct SDir { int dfd; char *rel; struct SDir *next; } SDir;
+ * limit). Emits ONE Arrow batch in the FULL STAT schema — path, is_dir, size,
+ * mode, mtime_ns, uid, gid, ino, parent_ino, dev, blocks, nlink, atime_ns,
+ * ctime_ns, depth (root excluded, dirs + files incl. empty). Superset of what
+ * the planner needs; also feeds pwalk2/ducl (disk-usage, inode graph). */
+typedef struct SDir { int dfd; char *rel; uint64_t ino; struct SDir *next; } SDir;
 typedef struct {
     pthread_mutex_t qmu; pthread_cond_t qcv;
     SDir *qh, *qt; int64_t pending; int done;
     pthread_mutex_t amu;                          /* shared row accumulator */
     char *pdata; int64_t plen, pcap;              /* large_utf8 path data */
-    int64_t *poff; uint8_t *isdir; int64_t *size, *mtime;
-    int32_t *mode, *uid, *gid; int64_t n, cap;
+    int64_t *poff; uint8_t *isdir; int64_t *size, *mtime, *atime, *ctime, *blocks;
+    int32_t *mode, *uid, *gid, *nlink, *depth;
+    uint64_t *ino, *pino, *dev;
+    int64_t n, cap;
 } Scan;
 
-static void sacc_add(Scan *s, const char *rel, size_t rl, int isdir, int64_t sz,
-                     int32_t md, int64_t mt, int32_t uid, int32_t gid){
+static void sacc_add(Scan *s, const char *rel, size_t rl, int isdir,
+                     const struct stat *st, uint64_t pino, int32_t depth){
     pthread_mutex_lock(&s->amu);
-    if (s->n == s->cap) { s->cap = s->cap ? s->cap*2 : 4096;
-        s->poff  = realloc(s->poff, (s->cap+1)*8);
-        s->isdir = realloc(s->isdir, s->cap);
-        s->size  = realloc(s->size, s->cap*8); s->mtime = realloc(s->mtime, s->cap*8);
-        s->mode  = realloc(s->mode, s->cap*4); s->uid = realloc(s->uid, s->cap*4);
-        s->gid   = realloc(s->gid, s->cap*4);
+    if (s->n == s->cap) { s->cap = s->cap ? s->cap*2 : 4096; int64_t c = s->cap;
+        s->poff=realloc(s->poff,(c+1)*8); s->isdir=realloc(s->isdir,c);
+        s->size=realloc(s->size,c*8); s->mtime=realloc(s->mtime,c*8);
+        s->atime=realloc(s->atime,c*8); s->ctime=realloc(s->ctime,c*8);
+        s->blocks=realloc(s->blocks,c*8); s->mode=realloc(s->mode,c*4);
+        s->uid=realloc(s->uid,c*4); s->gid=realloc(s->gid,c*4);
+        s->nlink=realloc(s->nlink,c*4); s->depth=realloc(s->depth,c*4);
+        s->ino=realloc(s->ino,c*8); s->pino=realloc(s->pino,c*8); s->dev=realloc(s->dev,c*8);
         if (s->n == 0) s->poff[0] = 0; }
     if (s->plen + (int64_t)rl > s->pcap) {
         s->pcap = s->pcap ? s->pcap : 1<<16;
         while (s->plen + (int64_t)rl > s->pcap) s->pcap *= 2;
         s->pdata = realloc(s->pdata, s->pcap); }
-    memcpy(s->pdata + s->plen, rel, rl); s->plen += rl;
-    s->poff[s->n+1] = s->plen;
-    s->isdir[s->n]=(uint8_t)isdir; s->size[s->n]=sz; s->mode[s->n]=md;
-    s->mtime[s->n]=mt; s->uid[s->n]=uid; s->gid[s->n]=gid; s->n++;
+    memcpy(s->pdata + s->plen, rel, rl); s->plen += rl; s->poff[s->n+1] = s->plen;
+    int64_t i = s->n;
+    s->isdir[i]=(uint8_t)isdir; s->size[i]=(int64_t)st->st_size; s->mode[i]=(int32_t)st->st_mode;
+    s->mtime[i]=(int64_t)st->st_mtim.tv_sec*1000000000 + st->st_mtim.tv_nsec;
+    s->atime[i]=(int64_t)st->st_atim.tv_sec*1000000000 + st->st_atim.tv_nsec;
+    s->ctime[i]=(int64_t)st->st_ctim.tv_sec*1000000000 + st->st_ctim.tv_nsec;
+    s->blocks[i]=(int64_t)st->st_blocks; s->uid[i]=(int32_t)st->st_uid; s->gid[i]=(int32_t)st->st_gid;
+    s->nlink[i]=(int32_t)st->st_nlink; s->depth[i]=depth;
+    s->ino[i]=(uint64_t)st->st_ino; s->pino[i]=pino; s->dev[i]=(uint64_t)st->st_dev;
+    s->n++;
     pthread_mutex_unlock(&s->amu);
 }
-static void sq_push(Scan *s, int dfd, char *rel){   /* takes ownership of rel */
-    SDir *d = malloc(sizeof *d); d->dfd = dfd; d->rel = rel; d->next = NULL;
+static void sq_push(Scan *s, int dfd, char *rel, uint64_t ino){  /* owns rel */
+    SDir *d = malloc(sizeof *d); d->dfd=dfd; d->rel=rel; d->ino=ino; d->next=NULL;
     pthread_mutex_lock(&s->qmu);
     if (s->qt) s->qt->next = d; else s->qh = d; s->qt = d; s->pending++;
     pthread_cond_signal(&s->qcv); pthread_mutex_unlock(&s->qmu);
@@ -1155,6 +1166,7 @@ static void *scan_worker(void *arg){
 
         DIR *dp = fdopendir(d->dfd);                /* takes ownership of dfd */
         if (dp) { struct dirent *e; size_t pl = strlen(d->rel);
+            int32_t pdepth = 1; for (const char *c=d->rel; *c; c++) if (*c=='/') pdepth++;
             while ((e = readdir(dp))) {
                 const char *nm = e->d_name;
                 if (nm[0]=='.' && (!nm[1] || (nm[1]=='.' && !nm[2]))) continue;
@@ -1166,12 +1178,11 @@ static void *scan_worker(void *arg){
                 struct stat st;
                 if (fstatat(dirfd(dp), nm, &st, AT_SYMLINK_NOFOLLOW) < 0) { free(cr); continue; }
                 int isdir = S_ISDIR(st.st_mode) ? 1 : 0;
-                sacc_add(s, cr, crl, isdir, (int64_t)st.st_size, (int32_t)st.st_mode,
-                         (int64_t)st.st_mtim.tv_sec*1000000000 + st.st_mtim.tv_nsec,
-                         (int32_t)st.st_uid, (int32_t)st.st_gid);
+                /* child depth = parent-path components + 1 (root's children = 1) */
+                sacc_add(s, cr, crl, isdir, &st, d->ino, pl ? pdepth + 1 : 1);
                 if (isdir) { int cfd = openat(dirfd(dp), nm,
                                  O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-                    if (cfd >= 0) sq_push(s, cfd, cr); else free(cr); }
+                    if (cfd >= 0) sq_push(s, cfd, cr, (uint64_t)st.st_ino); else free(cr); }
                 else free(cr);
             }
             closedir(dp);
@@ -1186,10 +1197,11 @@ static void *scan_worker(void *arg){
 static int qvm_scan(const char *root, int nthreads, int outfd){
     int rfd = open(root, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     if (rfd < 0) { fprintf(stderr, "qvm scan: open %s: %s\n", root, strerror(errno)); return 1; }
+    struct stat rst; uint64_t rino = fstat(rfd, &rst) == 0 ? (uint64_t)rst.st_ino : 0;
     Scan s; memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.qmu,0); pthread_cond_init(&s.qcv,0); pthread_mutex_init(&s.amu,0);
     if (nthreads < 1) nthreads = 1;
-    sq_push(&s, rfd, strdup(""));                   /* seed: root, rel "" */
+    sq_push(&s, rfd, strdup(""), rino);             /* seed: root, rel "" */
     pthread_t *th = malloc(nthreads*sizeof *th);
     for (int i=0;i<nthreads;i++) pthread_create(&th[i],0,scan_worker,&s);
     for (int i=0;i<nthreads;i++) pthread_join(th[i],0);
@@ -1198,16 +1210,22 @@ static int qvm_scan(const char *root, int nthreads, int outfd){
     int64_t n = s.n;
     struct WBuf b[QSCAN_N_BUFS] = {
         {NULL,0},{s.poff, 8*(n+1)},{s.pdata, s.plen},
-        {NULL,0},{s.isdir, n},   {NULL,0},{s.size, 8*n},
-        {NULL,0},{s.mode, 4*n},  {NULL,0},{s.mtime, 8*n},
-        {NULL,0},{s.uid, 4*n},   {NULL,0},{s.gid, 4*n}};
+        {NULL,0},{s.isdir, n},     {NULL,0},{s.size, 8*n},
+        {NULL,0},{s.mode, 4*n},    {NULL,0},{s.mtime, 8*n},
+        {NULL,0},{s.uid, 4*n},     {NULL,0},{s.gid, 4*n},
+        {NULL,0},{s.ino, 8*n},     {NULL,0},{s.pino, 8*n},
+        {NULL,0},{s.dev, 8*n},     {NULL,0},{s.blocks, 8*n},
+        {NULL,0},{s.nlink, 4*n},   {NULL,0},{s.atime, 8*n},
+        {NULL,0},{s.ctime, 8*n},   {NULL,0},{s.depth, 4*n}};
     if (n == 0) b[1] = (struct WBuf){NULL,0};       /* no offsets when empty */
     emit_batch(outfd, QSCAN_BATCH_TMPL, QSCAN_TMPL_LEN, QSCAN_OFF_BODYLEN,
                QSCAN_OFF_RBLEN, QSCAN_NODE_OFF, QSCAN_N_NODES,
                QSCAN_BUF_OFF, QSCAN_N_BUFS, n, b);
     uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
     free(s.poff); free(s.pdata); free(s.isdir); free(s.size); free(s.mtime);
-    free(s.mode); free(s.uid); free(s.gid); free(th);
+    free(s.atime); free(s.ctime); free(s.blocks); free(s.mode); free(s.uid);
+    free(s.gid); free(s.nlink); free(s.depth); free(s.ino); free(s.pino);
+    free(s.dev); free(th);
     return 0;
 }
 

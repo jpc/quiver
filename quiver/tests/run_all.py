@@ -1086,11 +1086,24 @@ def test_qvm(tmp):
         os.utime(src / d0, (ts, ts))              # distinctive dir mtimes
     s = wire.scan(str(src), "uring", 4)
 
-    # qvm's own parallel scanner == the old C scanner (self-sufficient discovery)
-    _c7 = ["path", "is_dir", "size", "mode", "mtime_ns", "uid", "gid"]
-    _qs = qplan.scan(str(src), qvm, 4).select(_c7).sort("path")
-    assert _qs.equals(s.select(_c7).sort("path")), "qvm scan must match wire.scan"
-    ok("qvm scan: parallel fs walk == wire.scan (self-sufficient discovery)")
+    # qvm's own parallel scanner == the old C scanner (self-sufficient discovery),
+    # full STAT schema (ino/parent_ino/dev/blocks/nlink/depth) so ducl can consume it
+    _qf = qplan.scan(str(src), qvm, 4)
+    _shared = [c for c in _qf.columns if c in s.columns and c != "atime_ns"]  # atime
+    assert set(_shared) >= {"path", "is_dir", "size", "mode", "mtime_ns", "uid",  # bumped
+                            "gid", "ino", "parent_ino", "dev", "blocks", "nlink", "depth"}
+    assert _qf.select(_shared).sort("path").equals(s.select(_shared).sort("path")), \
+        "qvm scan must match wire.scan on the full STAT schema"
+    from quiver import tools as _tools                    # ducl consumes qvm's scan
+    _orig = _tools.scan
+    _tools.scan = lambda root, engine="auto", threads=8: qplan.scan(root, qvm, threads)
+    try:
+        _duc = _tools.ducl_frame(str(src))
+    finally:
+        _tools.scan = _orig
+    assert {"inode_id", "parent_inode_id", "depth", "blocks", "nlink",
+            "child_count"} <= set(_duc.columns) and _duc.height == _qf.height
+    ok("qvm scan: full STAT schema == wire.scan, feeds pwalk2/ducl")
 
     def _dirs_ok(root):                            # dir mode+mtime restored?
         return all((root / d0).is_dir()
