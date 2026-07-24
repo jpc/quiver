@@ -32,7 +32,7 @@ from ..nock import nockidx as _zf     # the nock footer-index layer (no old-engi
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
  OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER,
  OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE, OP_TARSCAN, OP_SRC_SCAN,
- OP_SCANDIR, OP_CKSUM) = range(1, 21)
+ OP_SCANDIR, OP_CKSUM, OP_SINK_OPEN, OP_SINK_CLOSE) = range(1, 23)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
@@ -750,6 +750,117 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
     return _stream_footer(out_path, members, comp)
 
 
+def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
+                       prefix: str = "shard", window_bytes: int = 8 << 20,
+                       frame_bytes: int = 1 << 20, level: int = 6,
+                       shard_bytes: int = 5 << 30, nworkers: int = 8,
+                       source_fd: int | None = None) -> list[tuple]:
+    """VM-NATIVE sharded recompress: the VM decodes the source (a tar / .tar.gz — a
+    file path OR an inherited pipe fd, e.g. an HTTP stream Python pumps in),
+    member-aligns it (OP_SRC_SCAN), and PUSHES member rows; Python routes each by
+    `shard_key(path)` and pushes a gather that deflates that group's members STRAIGHT
+    to the group's dynamic output sink (OP_SINK_OPEN/CLOSE). The member bytes never
+    leave the VM — Python only sees metadata to route on. Each group rotates to a new
+    shard past ~shard_bytes. Returns a manifest of (shard, group, index, members, bytes)."""
+    os.makedirs(out_dir, exist_ok=True)
+    cap = window_bytes
+    src = f"fd:{source_fd}" if source_fd is not None else os.path.abspath(src_path)
+    G: dict[str, dict] = {}                          # group → live shard state
+    frame_base = [0]
+    manifest: list[tuple] = []
+
+    def gstate(gk):
+        if gk not in G:
+            G[gk] = {"slot": len(G), "idx": 0, "bytes": 0, "open": False,
+                     "members": [], "frames": [], "comp": None}
+        return G[gk]
+
+    def shard_path(gk, i):
+        return os.path.join(out_dir, f"{prefix}-{gk}-flac-{i:06d}.nock")
+
+    def _deflate_rows(frames, payloads, sink, fb, tb):   # like _gather_deflate, tid/sink offset
+        return frames.with_columns(
+            payload=pl.col("frame").replace_strict(payloads, return_dtype=pl.Binary)).select(
+            tid=pl.col("frame") + tb, _sub=pl.lit(0), op=pl.lit(OP_DEFLATE),
+            buf_id=pl.lit(0), buf_off=pl.lit(0), len=pl.col("clen"), sink=pl.lit(sink),
+            level=pl.lit(level), mode=pl.lit(1),
+            frame_id=pl.col("frame") + fb, payload=pl.col("payload"))
+
+    def build(rows, done, scan_next):
+        r = rows.with_columns(boff=pl.col("offset"),
+                              _g=pl.col("path").map_elements(shard_key, return_dtype=pl.Utf8))
+        opens, gds, subs, tid = [], [], [], 1
+        closes, rotated = [], []                      # SINK_CLOSE + shards to footer
+        for (gk,), part in r.partition_by("_g", as_dict=True).items():
+            st = gstate(gk)
+            if not st["open"]:                        # first members → open the shard file
+                opens.append({"op": OP_SINK_OPEN, "sink": st["slot"],
+                              "path": shard_path(gk, st["idx"])})
+                st["open"] = True
+            df, frames, pays = _gather_frames(part.drop("_g"), frame_bytes, 0)
+            nf = frames.height
+            gds.append(_deflate_rows(frames, pays, st["slot"], frame_base[0], tid))
+            st["members"].append(_gather_members(df, frame_base[0]))
+            st["frames"].extend(range(frame_base[0], frame_base[0] + nf))
+            st["bytes"] += int(part["size"].sum())
+            frame_base[0] += nf; tid += nf
+            if st["bytes"] >= shard_bytes:            # shard full → close + rotate
+                rotated.append((gk, st["slot"], st["idx"], pl.concat(st["members"]),
+                                list(st["frames"])))
+                closes.append(st["slot"])
+                st.update(idx=st["idx"] + 1, bytes=0, open=False, members=[], frames=[])
+        ntot = tid - 1
+        # thread 0, in order: OPEN new shard sinks → spawn/join the deflates → free the
+        # window buffer → CLOSE any filled shards → alloc + scan the next window.
+        rowset, sub = [], 0
+        for o in opens:
+            rowset.append({"tid": 0, "_sub": sub, "op": OP_SINK_OPEN,
+                           "sink": o["sink"], "path": o["path"]}); sub += 1
+        if ntot:
+            rowset += [{"tid": 0, "_sub": sub, "op": OP_SPAWN, "lo": 1, "cap": ntot},
+                       {"tid": 0, "_sub": sub + 1, "op": OP_JOIN, "lo": 1, "cap": ntot}]
+            sub += 2
+        rowset.append({"tid": 0, "_sub": sub, "op": OP_FREE, "buf_id": 0}); sub += 1
+        for slot in closes:
+            rowset.append({"tid": 0, "_sub": sub, "op": OP_SINK_CLOSE, "sink": slot}); sub += 1
+        if scan_next:
+            rowset += [{"tid": 0, "_sub": sub, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
+                       {"tid": 0, "_sub": sub + 1, "op": OP_SRC_SCAN, "lo": 0,
+                        "buf_id": 0, "len": cap}]
+        else:
+            rowset.append({"tid": 0, "_sub": sub, "op": OP_SRC_CLOSE, "lo": 0})
+        return _finalize([pl.DataFrame(rowset), *gds]), rotated
+
+    def driver(vm):
+        vm.push(_finalize([pl.DataFrame([
+            {"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src},
+            {"tid": 0, "_sub": 1, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
+            {"tid": 0, "_sub": 2, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0, "len": cap}])]))
+        rows = vm.read_rows(); done = vm.read_done()
+        while True:
+            batch, rotated = build(rows, done, scan_next=not done)
+            for gk, slot, idx, mem, frames in rotated:
+                manifest.append([shard_path(gk, idx), gk, idx, mem, frames])
+            vm.push(batch)
+            if done:
+                break
+            rows = vm.read_rows(); done = vm.read_done()
+        for gk, st in G.items():                     # final open shards
+            if st["members"]:
+                manifest.append([shard_path(gk, st["idx"]), gk, st["idx"],
+                                 pl.concat(st["members"]), list(st["frames"])])
+
+    comp = push_exec(driver, qvm_exe, "-", npool=max(16, len(G) + 2),
+                     nworkers=nworkers, want_comp=True,
+                     extra_fds=(source_fd,) if source_fd is not None else ())
+    out = []
+    for shard, gk, idx, mem, frames in manifest:     # per-shard footer from its frames
+        c = comp.filter(pl.col("frame").is_in(frames)) if comp is not None else None
+        n = _stream_footer(shard, [mem], c)
+        out.append((shard, gk, idx, n, int(mem["size"].sum())))
+    return out
+
+
 def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
                    dirs: pl.DataFrame | None = None, force_sidecar: bool = False,
                    chunk_rows: int = 1 << 20) -> int:
@@ -1291,7 +1402,7 @@ class _PushVM:
 def push_exec(driver, qvm_exe: str, arch_path: str = "-",
               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
               want_comp: bool = False, env: dict | None = None,
-              transport: list | None = None):
+              transport: list | None = None, extra_fds: tuple[int, ...] = ()):
     """Run a PUSH driver against qvm. Python PUSHES instruction batches on the
     VM's stdin; the VM streams member rows on stdout and exits when stdin closes
     (Python-initiated termination). `driver(vm)` orchestrates the pushes/reads via
@@ -1306,6 +1417,7 @@ def push_exec(driver, qvm_exe: str, arch_path: str = "-",
     argv = (transport or []) + [qvm_exe, "qvm", arch_path, str(npool),
             str(nworkers), comp_path, "1", *sinks]      # call_fd = 1 (stdout DATA)
     pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # local pipe sinks
+    pass_fds += list(extra_fds)                                    # e.g. a source pipe
     t_spawn = time.monotonic_ns()                 # ~qvm start (for the Python trace)
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          bufsize=0, pass_fds=pass_fds, env=penv)

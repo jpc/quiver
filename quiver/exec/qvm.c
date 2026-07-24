@@ -71,6 +71,7 @@ enum {
     OP_SRC_SCAN,                             /* decode window + member-aligned scan → DATA */
     OP_SCANDIR,                              /* parallel fs walk → STAT rows on DATA */
     OP_CKSUM,                                /* S3 ETag + CRC64 per path → DATA rows */
+    OP_SINK_OPEN, OP_SINK_CLOSE,             /* dynamic output shards (open/close a sink) */
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -167,8 +168,9 @@ typedef struct Source {
  * `in` for the first pull, so nothing is lost). */
 static int source_open(Source *s, const char *path){
     memset(s, 0, sizeof *s);
-    s->fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (s->fd < 0) return -errno;
+    if (strncmp(path, "fd:", 3) == 0) s->fd = atoi(path + 3);   /* inherited pipe/socket
+                                       * (e.g. an HTTP stream Python pumps in) */
+    else { s->fd = open(path, O_RDONLY | O_CLOEXEC); if (s->fd < 0) return -errno; }
     s->incap = 1 << 20; s->in = malloc(s->incap);
     ssize_t r = read(s->fd, s->in, s->incap);
     if (r < 0) { int e = -errno; close(s->fd); free(s->in); return e; }
@@ -808,6 +810,18 @@ static void run_thread(Sched *S, Thread *t){
             source_close(&S->src[I->lo]);
             t->pc++; break;
         }
+        case OP_SINK_OPEN: {                     /* open sink[sink] = path (a new shard) */
+            Sink *sk = &S->sinks[I->sink];
+            sk->fd = open(I->path, O_RDWR|O_CREAT|O_TRUNC, 0644);
+            if (sk->fd < 0) S->failed = S->failed ? S->failed : -errno;
+            sk->cursor = 0; sk->is_pipe = 0;
+            t->pc++; break;
+        }
+        case OP_SINK_CLOSE: {                    /* finalize a shard's data file */
+            Sink *sk = &S->sinks[I->sink];
+            if (sk->fd >= 0) { fsync(sk->fd); close(sk->fd); sk->fd = -1; }
+            t->pc++; break;
+        }
         case OP_SRC_SCAN: {                      /* decode window + member scan → DATA */
             Task *k = calloc(1, sizeof *k);
             k->tid = t->tid; k->epoch = t->epoch; k->op = I->op; k->kind = TK_SRC_SCAN;
@@ -977,7 +991,13 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
     const char *walp = getenv("QVM_WAL");
     if (walp) S->wal_fd = open(walp, O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0644);
     const char *starts = getenv("QVM_SINK_STARTS");
-    S->sinks = calloc(nsinks ? nsinks : 1, sizeof(Sink));
+    /* room to OPEN more sinks at runtime (OP_SINK_OPEN) — dynamic shards whose
+     * count isn't known up front. Slots past the argv sinks start closed (fd=-1). */
+    int scap = nsinks < 256 ? 256 : nsinks;
+    S->nsinks = scap;
+    S->sinks = calloc(scap, sizeof(Sink));
+    for (int i = 0; i < scap; i++) { S->sinks[i].fd = -1;
+        pthread_mutex_init(&S->sinks[i].mu, NULL); }
     for (int i = 0; i < nsinks; i++) {
         int64_t st0 = 0;
         if (starts) { st0 = atoll(starts); const char *c = strchr(starts, ',');
@@ -987,7 +1007,6 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
         S->sinks[i].is_pipe = (fstat(sink_fds[i], &st) == 0
                                && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)));
         if (!S->sinks[i].is_pipe) { if (ftruncate(sink_fds[i], st0)) {} }  /* 0=fresh */
-        pthread_mutex_init(&S->sinks[i].mu, NULL);
     }
     tq_init(&S->tasks); tq_init(&S->comps);
     if (getenv("QVM_TRACE")) S->t_base = tr_now();
