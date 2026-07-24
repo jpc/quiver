@@ -25,7 +25,7 @@ import polars as pl
 
 from .. import ipc
 from ..nock.format import TarFormat, plan_layout
-from ..nock import zframe as _zf
+from ..nock import nockidx as _zf     # the nock footer-index layer (no old-engine dep)
 
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
