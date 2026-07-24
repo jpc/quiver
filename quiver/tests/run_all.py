@@ -1257,19 +1257,6 @@ def test_qvm(tmp):
         assert (tmp / "qvm_stream_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm streaming: incremental instruction batches, persistent scheduler")
 
-    # OP_CALL: windowed streaming recompress — bounded to ONE window buffer; the
-    # driver CALLs into Python per window, running the returned gather nested
-    wa = str(tmp / "qvm_win.nock")
-    nw = qplan.recompress_windowed(tarp, wa, qvm, window_bytes=32 << 10,
-                                   frame_bytes=8 << 10,
-                                   predicate=pl.col("path").str.ends_with(".keep"))
-    widx = _zf.read_index(wa)
-    assert nw == 2 and all(pth.endswith(".keep") for pth in widx["path"])
-    qplan.unpack(wa, str(tmp / "qvm_win_x"), qvm, npool=8)
-    for pth in widx["path"]:
-        assert (tmp / "qvm_win_x" / pth).read_bytes() == (src / pth).read_bytes()
-    ok("qvm OP_CALL: windowed streaming recompress, bounded memory, byte-exact")
-
     # optional io_uring backend: per-file reads/writes go to the ring; the result
     # must be byte-identical to the worker-pool path
     qvu = str(tmp / "qvm_uring")
@@ -1301,22 +1288,9 @@ def test_qvm(tmp):
         assert (tmp / "qvm_zre_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm recompress .tar.zstd: compressed foreign source, byte-exact")
 
-    # fully-streaming recompress: decode the .tar.zstd ONCE, window-at-a-time,
-    # never materializing the whole decompressed tar (bytes carried inline)
-    zs = str(tmp / "qvm_zrestream.nock")
-    ns = qplan.recompress_zst_stream(tzst, zs, qvm, window_bytes=64 << 10,
-                                     frame_bytes=16 << 10, chunk=8)
-    sidx = _zf.read_index(zs).filter(pl.col("frame") >= 0)
-    qplan.unpack(zs, str(tmp / "qvm_zrs_x"), qvm, npool=8)
-    for pth in sidx["path"]:
-        assert (tmp / "qvm_zrs_x" / pth).read_bytes() == (src / pth).read_bytes()
-    assert ns == nz, (ns, nz)                      # same members as decode-scan
-    ok("qvm recompress streaming: .tar.zstd decoded once, bounded, byte-exact")
-
     # DATA channel: OP_TARSCAN parses a decoded tar IN A POOL BUFFER and PUSHES
-    # member rows to Python (tagged stdout, [1][len][ipc]) — no CALL round-trip.
-    # The rows must equal the reference `tar_scan`, and CALL (entry program) must
-    # still drive the same run on the shared stdout, tag-multiplexed.
+    # member rows to Python (tagged stdout, [1][kind][len][ipc]). Push a program
+    # that movs a tar into a buffer + scans it, read the rows == tar_scan.
     tsz = os.path.getsize(tarp)
     dref = qplan.tar_scan(tarp, qvm_exe=qvm).sort("path")
     dprog = qplan._finalize([pl.DataFrame([
@@ -1326,12 +1300,15 @@ def test_qvm(tmp):
         {"tid": 0, "_sub": 2, "op": qplan.OP_TARSCAN, "buf_id": 0, "buf_off": 0,
          "len": tsz}])])
     dgot = []
-    qplan.run_calls(lambda cid: dprog, qvm, "-",
-                    on_data=lambda kind, df: dgot.append(df))
+
+    def _ddrv(vm):
+        vm.push(dprog); dgot.append(vm.read_rows())
+
+    qplan.push_exec(_ddrv, qvm, "-")
     assert dgot, "OP_TARSCAN pushed no DATA batch"
     dscan = pl.concat(dgot).sort("path")
     assert dscan.select(dref.columns).equals(dref), "DATA rows != tar_scan"
-    ok("qvm DATA channel: OP_TARSCAN pushes member rows == tar_scan, tag-muxed")
+    ok("qvm DATA channel: OP_TARSCAN pushes member rows == tar_scan")
 
     # PUSH recompress: the VM decodes the .tar.zstd into a buffer, scans it, and
     # pushes member rows on the DATA channel; Python plans the gather and hands it

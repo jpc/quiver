@@ -421,8 +421,10 @@ static void run_task(Task *t){
          * progress (e==0) on a non-final window ⟹ a member larger than the window. */
         int64_t nmemb = scan_window_emit(t->sched, buf, M, &e, &zero);
         int fin = zero || s->eof;                    /* zero-block or source EOF */
-        if (nmemb == 0 && e == 0 && !fin) { t->res = -EMSGSIZE; break; }
-        if (fin) emit_data(t->sched, 2, NULL, 0);    /* end-of-stream marker */
+        int oversized = (nmemb == 0 && e == 0 && !fin);  /* member > window buffer */
+        uint8_t done = (fin || oversized) ? 1 : 0;   /* control: always 1 byte after rows */
+        emit_data(t->sched, 2, &done, 1);
+        if (oversized) { t->res = -EMSGSIZE; break; }
         int64_t clen = M - e;                        /* carry the trailing partial */
         if (clen > (int64_t)s->carry_cap) {
             s->carry = realloc(s->carry, (size_t)clen); s->carry_cap = (size_t)clen; }
@@ -552,7 +554,7 @@ typedef struct Thread {
     uint32_t tid; int epoch;
     Instr *prog; int nprog, pc;
     enum { T_INERT, T_READY, T_WAIT_IO, T_WAIT_JOIN, T_WAIT_ALLOC,
-           T_WAIT_CALL, T_DONE } st;
+           T_DONE } st;
     int64_t join_lo, join_hi;    /* range this thread is joining on */
     int      last_res;
     struct Thread *wnext;        /* buffer-waiter list link */
@@ -565,7 +567,6 @@ typedef struct { Thread *th; int nth, ndone; int wep, wtid, hasw;
                  void *pm, *ap, *ad, *raw; } Batch;
 
 /* a CALL awaiting its response (FIFO, scheduler-thread only) */
-typedef struct PW { int ep, tid; int64_t t0, cid; struct PW *next; } PW;
 
 typedef struct Sched_ {
     Batch *bat; int nbat, batcap; int cur_epoch;   /* batch registry */
@@ -579,10 +580,10 @@ typedef struct Sched_ {
     int failed;                  /* first -errno seen */
     int64_t *cf, *cc, *cl, *cd; int ncomp, ccap;  /* completions: frame,coff,clen,digest */
     TraceEv *tr; int ntr, trcap; int64_t t_base;   /* execution trace (opt) */
-    int call_fd;                 /* OP_CALL request channel (qvm -> Python) */
-    pthread_mutex_t call_mu;     /* serializes CALL + DATA writes on call_fd */
-    PW *pw_head, *pw_tail; int pw_count;   /* CALLs awaiting responses */
-    pthread_t reader_th; int has_reader;   /* off-thread CALL-response reader */
+    int call_fd;                 /* DATA channel (qvm -> Python): member rows */
+    pthread_mutex_t call_mu;     /* serializes DATA writes on call_fd */
+    int reader_eof;              /* Python closed stdin: no more pushed batches */
+    pthread_t reader_th; int has_reader;   /* off-thread pushed-batch reader */
     int wal_fd, wal_n;                     /* WAL: append each committed frame */
 #ifdef QVM_URING
     int use_uring, qd; TQ ring_tasks; pthread_t ring_th; struct io_uring ring;
@@ -672,19 +673,6 @@ static Thread *ready_pop(Sched *S){
     return t;
 }
 
-/* pending-CALL FIFO (scheduler thread only): a CALL enqueues its waiter; the
- * matching response (read in order by the reader thread) dequeues it. */
-static void pw_push(Sched *S, int ep, int tid, int64_t t0, int64_t cid){
-    PW *w = malloc(sizeof *w);
-    w->ep = ep; w->tid = tid; w->t0 = t0; w->cid = cid; w->next = NULL;
-    if (S->pw_tail) S->pw_tail->next = w; else S->pw_head = w;
-    S->pw_tail = w; S->pw_count++;
-}
-static PW *pw_pop(Sched *S){
-    PW *w = S->pw_head;
-    if (w) { S->pw_head = w->next; if (!S->pw_head) S->pw_tail = NULL; S->pw_count--; }
-    return w;
-}
 
 static int pool_alloc(Sched *S, Thread *t, int id, int64_t cap, int zero){
     BufSlot *b = &S->pool[id];
@@ -866,24 +854,7 @@ static void run_thread(Sched *S, Thread *t){
             tr_log(S, tr_now(), tr_now(), t->tid, OP_JOIN, I->lo, I->cap, 0, 0);
             t->join_lo = I->lo; t->join_hi = I->cap; t->st = T_WAIT_JOIN;
             return;
-        case OP_CALL:
-            /* Call into Python: emit the call id and SUSPEND. The READER THREAD
-             * fetches the response (so the scheduler never blocks on the read)
-             * and delivers it as a TK_BATCH_READY event; run_sched then adds the
-             * returned batch's threads and wakes us when it completes. Meanwhile
-             * this batch's other work (a prefetch loader) AND any prior batch's
-             * compression keep running concurrently. pc advances on wake. */
-            {   /* tagged: [0][int64 id] — shares stdout with DATA rows ([1]...) */
-                uint8_t msg[9]; msg[0] = 0; memcpy(msg + 1, &I->frame_id, 8);
-                int w = -1;
-                if (S->call_fd >= 0) { pthread_mutex_lock(&S->call_mu);
-                    w = write(S->call_fd, msg, 9); pthread_mutex_unlock(&S->call_mu); }
-                if (w != 9) { S->failed = S->failed ? S->failed : -EIO; t->pc++; break; }
-            }
-            pw_push(S, t->epoch, t->tid, tr_now(), I->frame_id);
-            t->st = T_WAIT_CALL;
-            return;
-        default: t->pc++; break;
+        default: t->pc++; break;   /* OP_CALL retired: Python PUSHES batches now */
         }
     }
     thread_done(S, t);
@@ -1000,22 +971,19 @@ static void run_sched(Sched *S){
     for (;;) {
         Thread *t;
         while ((t = ready_pop(S))) run_thread(S, t);
-        if (S->inflight == 0 && S->pw_count == 0) break;  /* nothing left to do */
-        Task *k = tq_pop(&S->comps);         /* one event: completion OR response */
-        if (k->kind == TK_BATCH_READY) {     /* Python sent a batch (reader thread) */
+        /* PUSH model: run until Python closes stdin (reader EOF) AND all work
+         * drained. When idle but stdin still open, tq_pop blocks for the next
+         * pushed batch — so an empty ready queue is a pause, not termination. */
+        if (S->inflight == 0 && S->reader_eof) break;
+        Task *k = tq_pop(&S->comps);         /* one event: completion OR pushed batch */
+        if (k->kind == TK_BATCH_READY) {     /* Python PUSHED a batch (reader thread) */
             uint8_t *raw = k->buf; size_t rawlen = (size_t)k->len; free(k);
-            if (!raw) {                      /* reader EOF: no more batches will come */
-                if (S->pw_count == 0 && S->inflight == 0) break; else continue;
-            }
-            PW *w = pw_pop(S);               /* a CALL response? else a PUSHED batch */
-            if (w) { S->cur_epoch = w->ep;
-                tr_log(S, w->t0, tr_now(), w->tid, OP_CALL, w->cid, 0, 0, 0); }
+            if (!raw) { S->reader_eof = 1; continue; }   /* stdin closed */
             int nn; char *nap, *nad;
             Instr *nins = qvm_decode_arrow(raw, rawlen, &nn, &nap, &nad);
             int ne = build_batch(S, nins, nn);
             Batch *B = &S->bat[ne];
-            if (w) { B->wep = w->ep; B->wtid = w->tid; B->hasw = 1; free(w); }
-            else B->hasw = 0;                /* pushed batch: independent, no waiter */
+            B->hasw = 0;                     /* independent, self-retiring */
             B->pm = nins; B->ap = nap; B->ad = nad; B->raw = raw;  /* freed at retire */
             ready_push(S, &B->th[0]);
             continue;
@@ -1052,17 +1020,17 @@ static void run_sched(Sched *S){
 
 static void qvm_close(Sched *S){
     if (S->wal_fd >= 0) { fsync(S->wal_fd); close(S->wal_fd); S->wal_fd = -1; }
-    if (S->has_reader) {                         /* close the request pipe → Python
-                                                  * closes stdin → reader hits EOF */
+    if (S->has_reader) {                         /* stdin already EOF'd (that ended
+                                                  * run_sched); close stdout so Python's
+                                                  * final read sees EOF, then reap. */
         if (S->call_fd >= 0) { close(S->call_fd); S->call_fd = -1; }
         pthread_join(S->reader_th, 0);
-        Task *k;                                 /* drain leftover response events */
+        Task *k;                                 /* drain leftover batch events */
         while ((k = tq_trypop(&S->comps))) {
             if (k->kind == TK_BATCH_READY) free(k->buf);
             free(k);
         }
     }
-    while (S->pw_head) free(pw_pop(S));
 #ifdef QVM_URING
     if (S->use_uring) {
         S->ring_tasks.stop = 1; pthread_cond_broadcast(&S->ring_tasks.cv);
@@ -1799,16 +1767,10 @@ int main(int argc, char **argv){
     }
     Sched out;
     qvm_open(&out, arch_fd, sink_fds, nsinks, npool, nworkers, call_fd);
-    /* CALL is the sole entry point: a single bootstrap CALL fetches the entry
-     * batch from Python (call id -1); that batch may itself CALL (drivers loop;
-     * windows fetch per-window gathers). The CALL channel is the process's own
-     * stdout (requests) + stdin (responses) — no fd-passing — so this runs
-     * identically local or behind ["ssh", host] (call_fd is typically 1). */
-    Instr boot; memset(&boot, 0, sizeof boot);
-    boot.op = OP_CALL; boot.frame_id = -1; boot.buf_id = -1;
-    boot.path = ""; boot.dpath = "";
-    int ep = build_batch(&out, &boot, 1);        /* bootstrap: one CALL(-1) */
-    ready_push(&out, &out.bat[ep].th[0]);
+    /* PUSH model: no bootstrap. Python PUSHES instruction batches on stdin (the
+     * reader thread delivers them); the VM streams member rows on stdout (call_fd)
+     * and runs until stdin closes. Just stdin+stdout, so it runs identically local
+     * or behind ["ssh", host]. run_sched blocks for the first pushed batch. */
     run_sched(&out);
     qvm_close(&out);
     int rc = out.failed;

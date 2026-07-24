@@ -341,30 +341,27 @@ def pack_stream(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
                 chunk_rows: int = 64, frame_bytes: int = 1 << 20, level: int = 6,
                 npool: int = 16, nworkers: int = 8,
                 transport: list | None = None) -> int:
-    """Streaming pack with Python feedback: scan is split into chunks, each
-    planned into its own instruction batch (frame ids offset by a running base)
-    and STREAMED to the one persistent qvm — batch k+1 is planned while qvm packs
-    batch k. The generator plans lazily, so discovery/planning overlaps
-    execution. Completions accumulate; one footer at the end. Member count."""
+    """Streaming pack: scan is split into chunks, each planned into its own batch
+    (frame ids offset by a running base) and PUSHED to the one persistent qvm —
+    chunk k+1 is planned + pushed while qvm packs chunk k (push is async), so
+    discovery/planning overlaps execution. Completions accumulate; one footer at
+    the end. Returns the member count."""
     files = scan.filter(~pl.col("is_dir")).sort("path")
     chunks = [files.slice(i, chunk_rows)
               for i in range(0, files.height, chunk_rows)]
     collected: list[pl.DataFrame] = []
-    state = {"base": 0}
 
-    def handler(cid):
-        if cid == -1:                             # entry: a driver of K CALLs
-            rows = [{"tid": 0, "_sub": k, "op": OP_CALL, "frame_id": k}
-                    for k in range(len(chunks))]
-            return _finalize([pl.DataFrame(rows)]) if rows else _empty_batch()
-        instr, members, _ = plan_pack(chunks[cid], root, frame_bytes, level,
-                                      npool, frame_base=state["base"])
-        collected.append(members)
-        state["base"] += members["frame"].n_unique() if members.height else 0
-        return instr
+    def driver(vm):                               # push each chunk; no feedback needed
+        base = 0
+        for ch in chunks:
+            instr, members, _ = plan_pack(ch, root, frame_bytes, level, npool,
+                                          frame_base=base)
+            collected.append(members)
+            base += members["frame"].n_unique() if members.height else 0
+            vm.push(instr)
 
     open(out_path, "wb").close()
-    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
+    comp = push_exec(driver, qvm_exe, "-", sinks=(out_path,), npool=npool,
                      nworkers=nworkers, want_comp=True, transport=transport)
     return _stream_footer(out_path, collected, comp)   # stream per-chunk parts
 
@@ -517,9 +514,9 @@ def recompress(tar_path: str, out_path: str, qvm_exe: str,
 def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
                        frame_bytes: int, level: int, frame_base: int
                        ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """The gather batch a window's OP_CALL returns: thread 0 spawns a child per
-    frame, each multi-run `deflate`s its members' WINDOW-RELATIVE ranges from the
-    window buffer `buf_id` (the driver holds it). No alloc/free here — the driver
+    """The gather batch for a window (used by recompress_zst_push): thread 0 spawns
+    a child per frame, each multi-run `deflate`s its members' WINDOW-RELATIVE ranges
+    from the buffer `buf_id` (the driver holds it). No alloc/free here — the driver
     owns the buffer. Returns (instr_df, members_df)."""
     df = wdf.with_columns(boff=pl.col("offset") - win_start)   # relative to window
     df, frames, payloads = _gather_frames(df, frame_bytes, buf_id)
@@ -529,197 +526,6 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
         {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}])
     instr = _finalize([root_df, _gather_deflate(frames, payloads, buf_id, level, frame_base)])
     return instr, _gather_members(df, frame_base)
-
-
-def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
-                              frame_bytes: int, level: int, frame_base: int,
-                              predicate: pl.Expr | None = None
-                              ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """A self-contained window gather whose bytes arrive INLINE (no seekable
-    source): thread 0 allocs buf 0, inline-`mov`s the whole window into it, spawns
-    a `deflate` child per frame (multi-run gather of window-relative ranges), and
-    frees. Used by the fully-streaming compressed recompress, where each window's
-    raw bytes are decoded in Python and carried in the instruction stream. Returns
-    (instr_df, members_df); an all-filtered window yields an empty no-op batch."""
-    df = pl.DataFrame(rows)
-    if predicate is not None:
-        df = df.filter(predicate)
-    if df.height == 0:
-        return _empty_batch(), pl.DataFrame(schema={"frame": pl.Int64})
-    df = df.with_columns(boff=pl.col("offset") - win_start)    # relative to window
-    df, frames, payloads = _gather_frames(df, frame_bytes, 0)
-    nf = frames.height
-    root = pl.concat([
-        pl.DataFrame([{"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": len(win_bytes)}]),
-        pl.DataFrame({"tid": [0], "_sub": [1], "op": [OP_MOV], "src": [E_INLINE],
-                      "dst": [E_BUF], "buf_id": [0], "buf_off": [0],
-                      "payload": [win_bytes]}),
-        pl.DataFrame([
-            {"tid": 0, "_sub": 2, "op": OP_SPAWN, "lo": 1, "cap": nf},
-            {"tid": 0, "_sub": 3, "op": OP_JOIN, "lo": 1, "cap": nf},
-            {"tid": 0, "_sub": 4, "op": OP_FREE, "buf_id": 0}]),
-    ], how="diagonal_relaxed")
-    instr = _finalize([root, _gather_deflate(frames, payloads, 0, level, frame_base)])
-    return instr, _gather_members(df, frame_base)
-
-
-def _tar_window_stream(src_path: str, window_bytes: int):
-    """Stream-decode a .tar.zstd ONCE and yield (win_start, raw_window_bytes,
-    member_rows) windows cut on cumulative member footprint — never materializing
-    the whole decompressed tar. A tee records the decoded bytes as tarfile reads
-    them (bounded to the current window, trimmed as windows are emitted); a
-    member's padding lands in the tee only once tarfile advances past it, so a
-    closed window is sliced one member late."""
-    import zstandard, tarfile
-
-    class _Tee:
-        def __init__(self, src): self.src = src; self.buf = bytearray(); self.base = 0
-        def read(self, n):
-            c = self.src.read(n); self.buf.extend(c); return c
-        def end(self): return self.base + len(self.buf)
-        def sl(self, a, b): return bytes(self.buf[a - self.base:b - self.base])
-        def trim(self, upto): del self.buf[:upto - self.base]; self.base = upto
-
-    zr = zstandard.ZstdDecompressor().stream_reader(open(src_path, "rb"))
-    tee = _Tee(zr)
-    tf = tarfile.open(fileobj=tee, mode="r|")
-    acc, wc, wstart, pend = [], 0, None, None
-    for m in tf:
-        if pend and tee.end() >= pend[1]:         # prior window's bytes now complete
-            yield pend[0], tee.sl(pend[0], pend[1]), pend[2]
-            tee.trim(pend[1]); pend = None
-        if not m.isfile():
-            continue
-        hl = m.offset_data - m.offset
-        rng = hl + ((m.size + 511) // 512) * 512
-        row = {"path": m.name, "size": m.size, "mode": m.mode,
-               "mtime_ns": int(m.mtime) * 1_000_000_000, "uid": m.uid, "gid": m.gid,
-               "offset": m.offset, "header_len": hl, "range": rng}
-        if wstart is None:
-            wstart = m.offset
-        acc.append(row); wc += rng
-        if wc >= window_bytes:
-            pend = (wstart, m.offset + rng, acc); acc, wc, wstart = [], 0, None
-    if pend:                                       # EOF: trailing bytes all in tee
-        yield pend[0], tee.sl(pend[0], pend[1]), pend[2]; tee.trim(pend[1])
-    if acc:
-        we = acc[-1]["offset"] + acc[-1]["range"]
-        yield acc[0]["offset"], tee.sl(acc[0]["offset"], we), acc
-
-
-def recompress_zst_stream(src_path: str, out_path: str, qvm_exe: str,
-                          window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
-                          level: int = 6, npool: int = 4, nworkers: int = 8,
-                          predicate: pl.Expr | None = None, chunk: int = 32,
-                          transport: list | None = None) -> int:
-    """Fully-streaming recompress of a COMPRESSED foreign source (.tar.zstd) into
-    a nock (ISA2 §5.5 feedback mode): decode the source ONCE with a streaming
-    decompressor, cutting windows on the fly, and recompress each as it is
-    produced — NEVER materializing the whole decompressed tar (bounded to one
-    window of raw bytes, carried inline in the instruction stream). Windows are
-    driven by a chunked non-recursive driver: thread 0 issues `chunk` window
-    CALLs sequentially (each window batch retires, freeing its inline bytes),
-    then a continuation CALL fetches the next chunk — so peak memory is one
-    window, not the archive. Returns the member count."""
-    gen = _tar_window_stream(src_path, window_bytes)
-    collected: list[pl.DataFrame] = []
-    st = {"base": 0, "next": 0, "done": False}
-    CONT = -2
-
-    def driver_chunk():
-        start = st["next"]; st["next"] += chunk
-        rows = [{"tid": 0, "_sub": i, "op": OP_CALL, "frame_id": start + i}
-                for i in range(chunk)]
-        rows.append({"tid": 0, "_sub": chunk, "op": OP_CALL, "frame_id": CONT})
-        return _finalize([pl.DataFrame(rows)])
-
-    def handler(cid):
-        if cid == -1 or cid == CONT:              # entry / continuation: next chunk
-            return _empty_batch() if st["done"] else driver_chunk()
-        if st["done"]:                            # a filler CALL past end-of-stream
-            return _empty_batch()
-        try:
-            win_start, win_bytes, rows = next(gen)
-        except StopIteration:
-            st["done"] = True
-            return _empty_batch()
-        instr, members = plan_window_gather_inline(
-            rows, win_start, win_bytes, frame_bytes, level, st["base"], predicate)
-        collected.append(members)
-        st["base"] += members["frame"].n_unique() if members.height else 0
-        return instr
-
-    open(out_path, "wb").close()
-    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
-                     nworkers=nworkers, want_comp=True, transport=transport)
-    return _stream_footer(out_path, collected, comp)   # stream per-window parts
-
-
-def recompress_windowed(tar_path: str, out_path: str, qvm_exe: str,
-                        window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
-                        level: int = 6, nworkers: int = 8, depth: int = 2,
-                        predicate: pl.Expr | None = None) -> int:
-    """Windowed streaming recompress via OP_CALL — bounded to `depth` windows.
-    The driver fiber PREFETCHES: before CALLing Python to gather window k, it
-    spawns a loader fiber that reads window k+1 into the next buffer, so the load
-    of the next window overlaps Python's planning and the current window's
-    compression. `depth` window buffers ring the pool (2 = double-buffer); the
-    pool's alloc backpressure keeps at most `depth` resident. This needs the
-    caller batch to have in-flight work at the CALL — hence epoch-routed
-    completions in the C scheduler."""
-    members = tar_scan(tar_path, qvm_exe)
-    if predicate is not None:
-        members = members.filter(predicate)
-    members = members.sort("offset").with_columns(
-        _c=pl.col("range").cum_sum() - pl.col("range"))
-    members = members.with_columns(win=(pl.col("_c") // window_bytes))
-    windows = members.partition_by("win", maintain_order=True)
-
-    win_info = []
-    for wdf in windows:
-        ws = int(wdf["offset"].min())
-        we = int((wdf["offset"] + wdf["range"]).max())
-        win_info.append((ws, we - ws, wdf))
-    K = len(win_info)
-
-    # One window-fiber per window (tid w+1): alloc a buffer, load the window,
-    # CALL Python to plan+gather it, free. The driver spawns them ALL at once; the
-    # pool's alloc backpressure admits at most `depth` at a time (buf[w%depth]).
-    # Because OP_CALL is async and its response is read OFF the scheduler thread,
-    # window w+1's load and its Python planning run concurrently with window w's
-    # compression — a genuine load ‖ plan ‖ compress pipeline. depth==1 degrades
-    # to sequential (all fibers contend for buf 0) with no deadlock.
-    fibers = []
-    for w, (ws, wlen, _w) in enumerate(win_info):
-        fibers += [
-            {"tid": w + 1, "_sub": 0, "op": OP_ALLOC, "buf_id": w % depth,
-             "cap": wlen},
-            {"tid": w + 1, "_sub": 1, "op": OP_MOV, "src": E_FS, "dst": E_BUF,
-             "buf_id": w % depth, "buf_off": 0, "path": tar_path,
-             "arch_off": ws, "len": wlen},
-            {"tid": w + 1, "_sub": 2, "op": OP_CALL, "frame_id": w},
-            {"tid": w + 1, "_sub": 3, "op": OP_FREE, "buf_id": w % depth}]
-    drv = ([{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": K},
-            {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": K}] if K else [])
-    driver = _finalize([pl.DataFrame(drv + fibers)]) if fibers else _empty_batch()
-
-    collected: list[pl.DataFrame] = []
-    state = {"base": 0}
-
-    def handler(cid):
-        if cid == -1:                                # entry: the window driver
-            return driver
-        ws, wlen, wdf = win_info[cid]
-        g, wmem = plan_window_gather(wdf, ws, cid % depth, frame_bytes, level,
-                                     state["base"])
-        collected.append(wmem)
-        state["base"] += wmem["frame"].n_unique() if wmem.height else 0
-        return g
-
-    open(out_path, "wb").close()
-    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=depth,
-                     nworkers=nworkers, want_comp=True)
-    return _stream_footer(out_path, collected, comp)   # stream per-window parts
 
 
 def recompress_zst(src_path: str, out_path: str, qvm_exe: str,
@@ -752,45 +558,40 @@ def recompress_zst_push(src_path: str, out_path: str, qvm_exe: str,
     decode, NO temp file, and NO shipped bytes. The VM streaming-decompresses the
     source straight into ONE pool buffer, scans the tar there (OP_TARSCAN), and
     PUSHES the member rows to us on the DATA channel; we plan the multi-run gather
-    from those rows and hand it back via a single CALL, so only member metadata
-    crosses the pipe. Bounded-memory windowing is the remaining optimization; for
-    a multi-frame or size-unknown source, falls back to the decode-scan path.
-    Returns the member count."""
+    from those rows and push it back, so only member metadata crosses the pipe.
+    Bounded-memory windowing is recompress_zst_window_push; for a multi-frame or
+    size-unknown source, falls back to the decode-scan path. Member count."""
     import zstandard
     with open(src_path, "rb") as f:
         dsize = zstandard.get_frame_parameters(f.read(64)).content_size
     if not dsize or dsize == (1 << 64) - 1:        # size not stored → can't size buf
         return recompress_zst(src_path, out_path, qvm_exe, frame_bytes, level,
                               npool, nworkers, predicate)
-    # entry: decode whole tar into buf 0, scan it (→ DATA rows), then CALL for the
-    # gather. buf 0 stays allocated across the CALL so the gather can read it.
+    # entry: decode whole tar into buf 0, scan it (→ DATA rows). buf 0 stays
+    # allocated across batches (the pool persists) so the pushed gather can read it.
     entry = _finalize([pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path},
         {"tid": 0, "_sub": 1, "op": OP_ALLOC, "buf_id": 0, "cap": dsize},
         {"tid": 0, "_sub": 2, "op": OP_SRC_NEXT, "lo": 0, "buf_id": 0,
          "buf_off": 0, "len": dsize},
         {"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0},
-        {"tid": 0, "_sub": 4, "op": OP_TARSCAN, "buf_id": 0, "buf_off": 0, "len": 0},
-        {"tid": 0, "_sub": 5, "op": OP_CALL, "frame_id": 0}])])
-    st = {"rows": [], "members": None}
+        {"tid": 0, "_sub": 4, "op": OP_TARSCAN, "buf_id": 0, "buf_off": 0, "len": 0}])])
+    st = {"members": pl.DataFrame(schema={"frame": pl.Int64})}
 
-    def handler(cid):
-        if cid == -1:
-            return entry
-        wdf = pl.concat(st["rows"]) if st["rows"] else pl.DataFrame()
+    def driver(vm):
+        vm.push(entry)                             # decode + scan → pushes rows
+        wdf = vm.read_rows()                        # OP_TARSCAN's member rows
         if predicate is not None and wdf.height:
             wdf = wdf.filter(predicate)
         if wdf.height == 0:
-            st["members"] = pl.DataFrame(schema={"frame": pl.Int64})
-            return _empty_batch()
+            return
         instr, members = plan_window_gather(wdf, 0, 0, frame_bytes, level, 0)
         st["members"] = members
-        return instr
+        vm.push(instr)                             # gather reads the still-live buf 0
 
     open(out_path, "wb").close()
-    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
-                     nworkers=nworkers, want_comp=True,
-                     on_data=lambda kind, df: st["rows"].append(df))
+    comp = push_exec(driver, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
+                     nworkers=nworkers, want_comp=True)
     return _stream_footer(out_path, [st["members"]], comp)
 
 
@@ -801,63 +602,61 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
     """BOUNDED-memory push recompress: like recompress_zst_push, but the VM decodes
     ONE member-aligned window at a time. OP_SRC_SCAN decodes the next `window_bytes`
     into a pool buffer, cuts at the last complete member (carrying the partial tail
-    in the source), and PUSHES that window's member rows on the DATA channel; the VM
-    then CALLs us for the window's gather, which we plan from the rows (buffer-
-    relative) and hand back — spawning a deflate per frame that reads the window
-    buffer, then freeing it before the next window. Peak memory is ~one window, not
-    the whole tar. A 0-row window is the end-of-stream signal. `window_bytes` must
-    exceed the largest single member. Works on multi-frame sources too (no size
-    hint needed). Returns the member count."""
+    in the source), and PUSHES that window's member rows + a done flag on the DATA
+    channel. We plan the window's gather from the rows (buffer-relative), then PUSH
+    a batch that gathers it (a deflate per frame reading the window buffer), frees
+    the buffer, and decodes+scans the NEXT window. Lock-step: push a window's batch,
+    read its rows, push the next — peak memory ~one window. `window_bytes` must
+    exceed the largest single member. Works on multi-frame sources (no size hint).
+    Returns the member count."""
     cap = window_bytes
-    st = {"rows": None, "done": False, "members": [], "frame_base": 0}
+    members: list[pl.DataFrame] = []
+    frame_base = [0]
 
-    def on_data(kind, df):
-        if kind == 2:                                # end-of-stream marker
-            st["done"] = True
-        else:
-            st["rows"] = df                          # this window's file rows
-
-    def scan_thread0(sub0):                          # alloc buf0, decode+scan a window
+    def scan_ops(sub0):                              # alloc buf 0, decode+scan a window
         return [{"tid": 0, "_sub": sub0, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
                 {"tid": 0, "_sub": sub0 + 1, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0,
                  "len": cap}]
 
-    def handler(cid):
-        if cid == -1:                                # open + decode/scan the first window
-            rows = [{"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path}]
-            rows += scan_thread0(1)
-            rows += [{"tid": 0, "_sub": 3, "op": OP_CALL, "frame_id": 0}]
-            return _finalize([pl.DataFrame(rows)])
-        wdf = st["rows"]                             # window `cid`'s rows (pushed pre-CALL)
-        st["rows"] = None
-        if predicate is not None and wdf is not None and wdf.height:
-            wdf = wdf.filter(predicate)
-        gather, nf = [], 0
-        if wdf is not None and wdf.height:           # plan this window's gather (buf 0)
-            df = wdf.with_columns(boff=pl.col("offset"))   # offsets are window-relative
-            df, frames, payloads = _gather_frames(df, frame_bytes, 0)
-            nf = frames.height
-            st["members"].append(_gather_members(df, st["frame_base"]))
-            gather = [_gather_deflate(frames, payloads, 0, level, st["frame_base"])]
-            st["frame_base"] += nf
-        # thread 0: run the gather (if any), free buf 0, then either finish (source
-        # drained) or decode+scan the NEXT window and CALL again.
-        head = [{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
-                {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}] if nf else []
+    def plan_gather(rows):                           # (deflate_df|None, nframes)
+        if predicate is not None and rows.height:
+            rows = rows.filter(predicate)
+        if rows.height == 0:
+            return None, 0
+        df = rows.with_columns(boff=pl.col("offset"))   # offsets are window-relative
+        df, frames, payloads = _gather_frames(df, frame_bytes, 0)
+        members.append(_gather_members(df, frame_base[0]))
+        gd = _gather_deflate(frames, payloads, 0, level, frame_base[0])
+        frame_base[0] += frames.height
+        return gd, frames.height
+
+    def window_batch(rows, done):
+        gd, nf = plan_gather(rows)
+        head = ([{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
+                 {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}] if nf else [])
         tail = [{"tid": 0, "_sub": 2, "op": OP_FREE, "buf_id": 0}]
-        if st["done"]:
-            tail += [{"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0}]
-        else:
-            tail += scan_thread0(3) + [{"tid": 0, "_sub": 5, "op": OP_CALL,
-                                        "frame_id": cid + 1}]
-        return _finalize([pl.DataFrame(head + tail), *gather])
+        tail += ([{"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0}] if done
+                 else scan_ops(3))                   # finish, or decode the next window
+        parts = [pl.DataFrame(head + tail)] + ([gd] if gd is not None else [])
+        return _finalize(parts)
+
+    def driver(vm):
+        vm.push(_finalize([pl.DataFrame(                # open + scan the first window
+            [{"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path}]
+            + scan_ops(1))]))
+        rows = vm.read_rows(); done = vm.read_done()
+        while True:
+            vm.push(window_batch(rows, done))           # gather this window + scan next
+            if done:
+                break
+            rows = vm.read_rows(); done = vm.read_done()
 
     open(out_path, "wb").close()
-    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 2),
-                     nworkers=nworkers, want_comp=True, on_data=on_data)
-    if not st["members"]:
-        st["members"].append(pl.DataFrame(schema={"frame": pl.Int64}))
-    return _stream_footer(out_path, st["members"], comp)
+    comp = push_exec(driver, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 2),
+                     nworkers=nworkers, want_comp=True)
+    if not members:
+        members.append(pl.DataFrame(schema={"frame": pl.Int64}))
+    return _stream_footer(out_path, members, comp)
 
 
 def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
@@ -1335,21 +1134,9 @@ def build_qvm(dest: str, src: str | None = None, uring: bool = False):
     return dest
 
 
-def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
-        sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-        want_comp: bool = False, env: dict | None = None,
-        transport: list | None = None):
-    """Encode and drive the C `qvm` executor for a single batch. `sinks` are
-    deflate output files; `want_comp` returns the {frame, coff, clen} completions.
-    `transport=["ssh", host]` runs it on a node (CALL over stdin/stdout, no
-    fd-passing — arch/sinks/comp are shared-fs paths)."""
-    return run_calls(lambda cid: instr, qvm_exe, arch_path, sinks, npool,
-                     nworkers, want_comp, env=env, transport=transport)
-
-
 def _readn(fd: int, n: int) -> bytes:
-    """Read exactly n bytes (a CALL request), tolerating short reads (ssh may
-    fragment the back-channel). Returns < n only at EOF."""
+    """Read exactly n bytes, tolerating short reads (ssh may fragment the
+    back-channel). Returns < n only at EOF."""
     buf = b""
     while len(buf) < n:
         c = os.read(fd, n - len(buf))
@@ -1359,52 +1146,77 @@ def _readn(fd: int, n: int) -> bytes:
     return buf
 
 
-def run_calls(handler, qvm_exe: str, arch_path: str = "-",
+class _PushVM:
+    """Handle a push driver uses to talk to the running qvm: PUSH instruction
+    batches on the VM's stdin, and READ the DATA the VM streams back on stdout
+    (member rows, kind 0; a 1-byte done flag, kind 2). Lock-step — the driver
+    reads a batch's rows before pushing the next — so no reader thread and no
+    full-duplex deadlock: the VM's reader always drains stdin."""
+
+    def __init__(self, proc):
+        self.p = proc
+        self.out = proc.stdout.fileno()
+
+    def push(self, instr: pl.DataFrame) -> None:
+        data = encode_stream(instr)
+        self.p.stdin.write(struct.pack("<I", len(data)) + data)
+        self.p.stdin.flush()
+
+    def _msg(self):                              # one DATA message → (kind, payload)
+        tag = _readn(self.out, 1)
+        if not tag:
+            return None                          # VM closed stdout
+        assert tag[0] == 1, f"unexpected stdout tag {tag[0]}"
+        kind = _readn(self.out, 1)[0]
+        (n,) = struct.unpack("<I", _readn(self.out, 4))
+        return kind, _readn(self.out, n)
+
+    def read_rows(self) -> pl.DataFrame:         # kind 0: a member-row batch
+        m = self._msg(); assert m and m[0] == 0, m
+        return ipc.read_all(m[1])
+
+    def read_done(self) -> bool:                 # kind 2: the window done flag
+        m = self._msg(); assert m and m[0] == 2, m
+        return bool(m[1][0]) if m[1] else True
+
+
+def push_exec(driver, qvm_exe: str, arch_path: str = "-",
               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
               want_comp: bool = False, env: dict | None = None,
-              transport: list | None = None, on_data=None):
-    """CALL is qvm's SOLE entry point: qvm boots with one CALL(-1) and pulls
-    every instruction batch by CALLing into Python. `handler(call_id)` answers
-    each CALL — id -1 is the entry program; a driver's own CALLs pass their
-    frame_id. Completions accumulate across every (nested) batch.
-
-    The CALL channel is ONE pair of pipes qvm inherits with no fd-passing:
-    requests come back on qvm's STDOUT (call_fd=1), responses go on its stdin —
-    exactly the two channels ssh forwards. So `transport=["ssh", host]` runs the
-    full CALL-driven set (windowed / streaming recompress) on a node over shared
-    storage, identically to local. (fd: pipe sinks still need pass_fds, so those
-    stay local.)"""
+              transport: list | None = None):
+    """Run a PUSH driver against qvm. Python PUSHES instruction batches on the
+    VM's stdin; the VM streams member rows on stdout and exits when stdin closes
+    (Python-initiated termination). `driver(vm)` orchestrates the pushes/reads via
+    a `_PushVM`; when it returns, stdin is closed and the VM drains. Just stdin +
+    stdout, so `transport=["ssh", host]` runs it on a node unchanged (fd: pipe
+    sinks still need pass_fds → local). Returns the {frame, coff, clen} completions
+    if want_comp."""
     penv = {**os.environ, **env} if env else None
     comp_path = "-"
     if want_comp:
         fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
     argv = (transport or []) + [qvm_exe, "qvm", arch_path, str(npool),
-            str(nworkers), comp_path, "1", *sinks]      # call_fd = 1 (stdout)
+            str(nworkers), comp_path, "1", *sinks]      # call_fd = 1 (stdout DATA)
     pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # local pipe sinks
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          bufsize=0, pass_fds=pass_fds, env=penv)
+    vm = _PushVM(p)
+    err = None
     try:
-        out = p.stdout.fileno()
-        while True:
-            tag = _readn(out, 1)                 # tagged stdout: [0]=CALL [1]=DATA
-            if not tag:
-                break                            # qvm closed stdout → done
-            if tag[0] == 1:                      # DATA: rows the VM pushed to us
-                kind = _readn(out, 1)[0]         # 0 = member rows, 2 = control (no batch)
-                (n,) = struct.unpack("<I", _readn(out, 4))
-                batch = _readn(out, n)
-                if on_data is not None:
-                    on_data(kind, ipc.read_all(batch) if n else None)
-                continue
-            (cid,) = struct.unpack("<q", _readn(out, 8))  # CALL request
-            data = encode_stream(handler(cid))
-            p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
-    finally:
-        try:
-            p.stdin.close()
-        except BrokenPipeError:
-            pass
+        driver(vm)
+    except Exception as e:                        # surface after the VM is reaped
+        err = e
+    try:
+        p.stdin.close()                           # EOF → VM drains + exits
+    except BrokenPipeError:
+        pass
+    while vm._msg() is not None:                   # drain any trailing stdout
+        pass
     rc = p.wait()
+    if err is not None:
+        if want_comp:
+            os.unlink(comp_path)
+        raise err
     if rc != 0:
         if want_comp:
             os.unlink(comp_path)
@@ -1414,12 +1226,22 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
     with open(comp_path, "rb") as cf:
         raw = cf.read()
     os.unlink(comp_path)
-    comp = ipc.read_all(raw)                      # Arrow-IPC (frame, coff, clen)
+    comp = ipc.read_all(raw)                       # Arrow-IPC (frame, coff, clen)
     return comp.rename({"coff": "frame_coff", "clen": "frame_clen"})
+
+
+def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
+        sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
+        want_comp: bool = False, env: dict | None = None,
+        transport: list | None = None):
+    """Drive the C `qvm` for a SINGLE batch: push it, close stdin, collect the
+    {frame, coff, clen} completions if want_comp. `sinks` are deflate outputs."""
+    return push_exec(lambda vm: vm.push(instr), qvm_exe, arch_path, sinks, npool,
+                     nworkers, want_comp, env=env, transport=transport)
 
 
 def _empty_batch() -> pl.DataFrame:
     # a 0-instruction batch: qvm builds one thread with an empty program that
-    # completes immediately, resuming the CALLer. Fully typed so encode_stream
+    # completes immediately (a no-op pushed batch). Fully typed so encode_stream
     # emits a valid (empty) Arrow batch.
     return pl.DataFrame(schema=INSTR_COLS)
