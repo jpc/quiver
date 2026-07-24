@@ -446,40 +446,56 @@ def _gather_frames(df: pl.DataFrame, frame_bytes: int, buf_id: int = 0):
     order (window order, tar order within), so no re-sort. Otherwise all runs use
     the single `buf_id` and rows are sorted by offset."""
     multi = "buf" in df.columns
-    # ONE lazy pipeline → a single collect (compile+optimize+execute once per
-    # batch), instead of ~12 eager collects. `_new` marks a run boundary: the
-    # buffer offset jumps, the frame changes, or (coalesced) the buffer changes.
-    lf = df.lazy()
     if not multi:
-        lf = lf.sort("boff")
-    new = ((pl.col("boff") != (pl.col("boff") + pl.col("range")).shift(1))
-           | (pl.col("frame") != pl.col("frame").shift(1)))
-    if multi:
-        new = new | (pl.col("buf") != pl.col("buf").shift(1))
-    df = (lf.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
-            .with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
-            .with_columns(_fs=pl.col("_c").min().over("frame"),
-                          _new=new.fill_null(True))
-            .with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"),
-                          run=pl.col("_new").cum_sum())
-            .collect())
-    aggs = [pl.col("frame").first(), pl.col("boff").min().alias("off"),
-            pl.col("range").sum().alias("rlen")]
-    if multi:
-        aggs.append(pl.col("buf").first().alias("rbuf"))
-    runs, frames = pl.collect_all([                       # both aggregations, one call
-        df.lazy().group_by("run", maintain_order=True).agg(*aggs),
-        df.lazy().group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")])
-    gc = ["off", "rlen"] + (["rbuf"] if multi else [])
-    rbf = runs.group_by("frame", maintain_order=True).agg(*(pl.col(c) for c in gc))
-    payloads = {}
-    for r in rbf.iter_rows(named=True):
-        k = len(r["off"])
-        a = np.empty(3 * k, dtype="<i8")
-        a[0::3] = r["rbuf"] if multi else buf_id
-        a[1::3] = r["off"]; a[2::3] = r["rlen"]
-        payloads[int(r["frame"])] = a.tobytes()
+        df = df.sort("boff")                    # single-buffer gather order (one op)
+    # the gather MATH runs in a fixed numpy kernel (no per-batch query plan); polars
+    # only carries the string columns (path etc.) and, upstream, the predicate.
+    frame, in_off, uf, clen, payloads = _np_gather(
+        df["boff"].to_numpy(), df["range"].to_numpy(), df["header_len"].to_numpy(),
+        frame_bytes, buf_id, df["buf"].to_numpy() if multi else None)
+    df = df.with_columns(frame=pl.Series("frame", frame, pl.Int64),
+                         in_off=pl.Series("in_off", in_off, pl.Int64))
+    frames = pl.DataFrame({"frame": pl.Series(uf, dtype=pl.Int64),
+                           "clen": pl.Series(clen, dtype=pl.Int64)})
     return df, frames, payloads
+
+
+def _np_gather(boff, rng, hl, frame_bytes, buf_id, buf=None):
+    """The gather kernel: from member (offset, footprint, header_len[, buffer])
+    arrays IN GATHER ORDER, produce each member's frame + in-frame offset, each
+    frame's compressed length, and the {frame: (buf,off,len) i64 triples} runs.
+    Pure numpy — cumsum / floor-div / reduceat / boundary masks; no query plan."""
+    n = len(boff)
+    if n == 0:
+        z = np.zeros(0, np.int64)
+        return z, z, z, z, {}
+    boff = np.asarray(boff, np.int64); rng = np.asarray(rng, np.int64)
+    hl = np.asarray(hl, np.int64)
+    c = np.cumsum(rng) - rng                            # footprint start (non-decreasing)
+    frame = c // frame_bytes
+    first = np.empty(n, bool); first[0] = True; first[1:] = frame[1:] != frame[:-1]
+    fstart = np.flatnonzero(first)                      # first member index per frame
+    fs = np.repeat(c[fstart], np.diff(np.append(fstart, n)))   # frame's min c, broadcast
+    in_off = c - fs + hl
+    uf = frame[fstart]                                  # unique frames (sorted)
+    clen = np.add.reduceat(rng, fstart)                 # per-frame Σ footprint
+    new = np.empty(n, bool); new[0] = True              # run boundary: offset jump,
+    new[1:] = (boff[1:] != boff[:-1] + rng[:-1]) | (frame[1:] != frame[:-1])  # frame,
+    if buf is not None:                                 # or (coalesced) buffer change
+        buf = np.asarray(buf, np.int64); new[1:] |= buf[1:] != buf[:-1]
+    rs = np.flatnonzero(new)                            # run starts
+    r_frame = frame[rs]; r_off = boff[rs]
+    r_len = np.add.reduceat(rng, rs)                    # per-run Σ footprint
+    r_buf = buf[rs] if buf is not None else None
+    frc = np.empty(len(rs), bool); frc[0] = True; frc[1:] = r_frame[1:] != r_frame[:-1]
+    grp = np.flatnonzero(frc); gend = np.append(grp[1:], len(rs))
+    payloads = {}
+    for a, b in zip(grp, gend):                         # per frame, pack its runs
+        t = np.empty(3 * (b - a), dtype="<i8")
+        t[0::3] = r_buf[a:b] if r_buf is not None else buf_id
+        t[1::3] = r_off[a:b]; t[2::3] = r_len[a:b]
+        payloads[int(r_frame[a])] = t.tobytes()
+    return frame, in_off, uf, clen, payloads
 
 
 def _gather_deflate(frames: pl.DataFrame, payloads: dict, buf_id: int,
