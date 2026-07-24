@@ -745,6 +745,54 @@ def recompress_zst(src_path: str, out_path: str, qvm_exe: str,
         os.unlink(tmp)
 
 
+def recompress_zst_push(src_path: str, out_path: str, qvm_exe: str,
+                       frame_bytes: int = 1 << 20, level: int = 6, npool: int = 16,
+                       nworkers: int = 8, predicate: pl.Expr | None = None) -> int:
+    """PUSH-driven recompress of a single-frame .tar.zstd → nock, with NO Python
+    decode, NO temp file, and NO shipped bytes. The VM streaming-decompresses the
+    source straight into ONE pool buffer, scans the tar there (OP_TARSCAN), and
+    PUSHES the member rows to us on the DATA channel; we plan the multi-run gather
+    from those rows and hand it back via a single CALL, so only member metadata
+    crosses the pipe. Bounded-memory windowing is the remaining optimization; for
+    a multi-frame or size-unknown source, falls back to the decode-scan path.
+    Returns the member count."""
+    import zstandard
+    with open(src_path, "rb") as f:
+        dsize = zstandard.get_frame_parameters(f.read(64)).content_size
+    if not dsize or dsize == (1 << 64) - 1:        # size not stored → can't size buf
+        return recompress_zst(src_path, out_path, qvm_exe, frame_bytes, level,
+                              npool, nworkers, predicate)
+    # entry: decode whole tar into buf 0, scan it (→ DATA rows), then CALL for the
+    # gather. buf 0 stays allocated across the CALL so the gather can read it.
+    entry = _finalize([pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path},
+        {"tid": 0, "_sub": 1, "op": OP_ALLOC, "buf_id": 0, "cap": dsize},
+        {"tid": 0, "_sub": 2, "op": OP_SRC_NEXT, "lo": 0, "buf_id": 0,
+         "buf_off": 0, "len": dsize},
+        {"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0},
+        {"tid": 0, "_sub": 4, "op": OP_TARSCAN, "buf_id": 0, "buf_off": 0, "len": 0},
+        {"tid": 0, "_sub": 5, "op": OP_CALL, "frame_id": 0}])])
+    st = {"rows": [], "members": None}
+
+    def handler(cid):
+        if cid == -1:
+            return entry
+        wdf = pl.concat(st["rows"]) if st["rows"] else pl.DataFrame()
+        if predicate is not None and wdf.height:
+            wdf = wdf.filter(predicate)
+        if wdf.height == 0:
+            st["members"] = pl.DataFrame(schema={"frame": pl.Int64})
+            return _empty_batch()
+        instr, members = plan_window_gather(wdf, 0, 0, frame_bytes, level, 0)
+        st["members"] = members
+        return instr
+
+    open(out_path, "wb").close()
+    comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=max(npool, 1),
+                     nworkers=nworkers, want_comp=True, on_data=st["rows"].append)
+    return _stream_footer(out_path, [st["members"]], comp)
+
+
 def _stream_footer(out_path: str, parts, comp: pl.DataFrame | None,
                    dirs: pl.DataFrame | None = None, force_sidecar: bool = False,
                    chunk_rows: int = 1 << 20) -> int:

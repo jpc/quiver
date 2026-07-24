@@ -1332,6 +1332,18 @@ def test_qvm(tmp):
     assert dscan.select(dref.columns).equals(dref), "DATA rows != tar_scan"
     ok("qvm DATA channel: OP_TARSCAN pushes member rows == tar_scan, tag-muxed")
 
+    # PUSH recompress: the VM decodes the .tar.zstd into a buffer, scans it, and
+    # pushes member rows on the DATA channel; Python plans the gather and hands it
+    # back in one CALL. No Python decode, no temp file, no shipped bytes.
+    pu = str(tmp / "qvm_push.nock")
+    pn = qplan.recompress_zst_push(tzst, pu, qvm, frame_bytes=16 << 10)
+    assert pn == nz, (pn, nz)                       # same members as decode-scan
+    pidx = _zf.read_index(pu).filter(pl.col("frame") >= 0)
+    qplan.unpack(pu, str(tmp / "qvm_push_x"), qvm, npool=8)
+    for pth in pidx["path"]:
+        assert (tmp / "qvm_push_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm PUSH recompress: DATA-driven scan → gather, byte-exact, no temp/ship")
+
     # teardown (unlink/rmdir deepest-first) + durability (fbarrier) — mirror tail
     mr = tmp / "qvm_rm"
     (mr / "a/b").mkdir(parents=True); (mr / "c").mkdir()

@@ -299,9 +299,12 @@ static void run_task(Task *t){
         if (t->path && t->path[0]) close(fd);        /* don't close the archive fd */
         break;
     }
-    case TK_SRC_NEXT: {          /* decode the next window (<= len) → sink; serial */
+    case TK_SRC_NEXT: {          /* decode the next window (<= len); serial */
         Source *s = t->source;
-        uint8_t *win = malloc((size_t)t->len);
+        /* destination: a pool buffer at t->detail (zero-copy), else a scratch
+         * window we append to the sink. buf-mode never materializes a temp. */
+        int owned = t->buf == NULL;
+        uint8_t *win = t->buf ? t->buf + t->detail : malloc((size_t)t->len);
         if (!win) { t->res = -ENOMEM; break; }
         ZSTD_outBuffer out = {win, (size_t)t->len, 0};
         while (out.pos < out.size && !s->eof) {
@@ -332,7 +335,7 @@ static void run_task(Task *t){
                 t->coff = coff; }
         }
         t->clen = (int64_t)n; t->digest = s->eof;   /* report decoded size + eof */
-        free(win); break;
+        if (owned) free(win); break;
     }
     case TK_DEFLATE: {
         /* compress and append to the sink. payload (if present) is a packed list
@@ -710,11 +713,13 @@ static void run_thread(Sched *S, Thread *t){
             tr_log(S, tr_now(), tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, len, 0);
             t->pc++; break;
         }
-        case OP_SRC_NEXT: {                      /* decode next window → sink (task) */
+        case OP_SRC_NEXT: {                      /* decode next window → buf/sink (task) */
             Task *k = calloc(1, sizeof *k);
             k->tid = t->tid; k->epoch = t->epoch; k->op = I->op; k->kind = TK_SRC_NEXT;
-            k->source = &S->src[I->lo]; k->sink = &S->sinks[I->sink];
-            k->len = I->len; k->buf_log = -1;
+            k->source = &S->src[I->lo]; k->len = I->len; k->buf_log = -1;
+            if (I->buf_id >= 0) {                /* zero-copy into a pool buffer */
+                k->buf = S->pool[I->buf_id].mem; k->detail = I->buf_off; k->buf_log = I->buf_id;
+            } else k->sink = &S->sinks[I->sink];  /* window-append to a sink */
             t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
             return;
         }
