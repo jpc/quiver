@@ -141,6 +141,7 @@ typedef struct Task {
     uint8_t  kind;               /* mirrors the mov case / namespace op */
     int      arch_fd;
     uint8_t *buf; int64_t buf_off, arch_off, len;
+    uint8_t **bufv;              /* deflate: pool[i].mem snapshot — a run's buf_id */
     const char *path, *dpath;
     const uint8_t *payload; int64_t payload_len;
     int32_t mode; int64_t mtime_ns;
@@ -296,11 +297,11 @@ static void run_task(Task *t){
          * critical section; a seekable file writes off-lock. Reports (coff,clen). */
         static __thread ZSTD_CCtx *cc = NULL;
         uint8_t *cb; size_t cl;
-        if (t->payload_len > 0) {                /* multi-run gather */
-            int nruns = (int)(t->payload_len / 16);
+        if (t->payload_len > 0) {                /* multi-run gather: (buf_id,off,len) */
+            int nruns = (int)(t->payload_len / 24);
             const int64_t *rn = (const int64_t *)t->payload;
             int64_t total = 0;
-            for (int i = 0; i < nruns; i++) total += rn[i*2 + 1];
+            for (int i = 0; i < nruns; i++) total += rn[i*3 + 2];
             size_t bound = ZSTD_compressBound((size_t)total);
             cb = malloc(bound ? bound : 1);
             if (!cb) { t->res = -ENOMEM; break; }
@@ -310,9 +311,10 @@ static void run_task(Task *t){
             ZSTD_CCtx_setPledgedSrcSize(cc, (unsigned long long)total);
             ZSTD_outBuffer out = {cb, bound, 0}; int err = 0;
             XXH xh; if (t->digest_on) xxh_reset(&xh);
-            for (int i = 0; i < nruns && !err; i++) {
-                ZSTD_inBuffer in = {t->buf + rn[i*2], (size_t)rn[i*2 + 1], 0};
-                if (t->digest_on) xxh_update(&xh, t->buf + rn[i*2], (size_t)rn[i*2+1]);
+            for (int i = 0; i < nruns && !err; i++) {   /* run i: pool[buf_id][off..+len] */
+                uint8_t *rb = t->bufv[rn[i*3]] + rn[i*3 + 1];
+                ZSTD_inBuffer in = {rb, (size_t)rn[i*3 + 2], 0};
+                if (t->digest_on) xxh_update(&xh, rb, (size_t)rn[i*3 + 2]);
                 while (in.pos < in.size)
                     if (ZSTD_isError(ZSTD_compressStream2(cc,&out,&in,ZSTD_e_continue)))
                         { err = 1; break; }
@@ -508,9 +510,17 @@ static Instr *qvm_decode_arrow(uint8_t *data, size_t sz, int *n_out,
 static Thread *TH(Sched *S, int ep, int tid){ return &S->bat[ep].th[tid]; }
 
 static void ready_push(Sched *S, Thread *t){
+    /* Priority = tid: lower tid is scheduled first, so a serial producer stage
+     * (decompress, given a low tid) preempts the parallel gather swarm and never
+     * starves. Fast-path an append when tid is >= the current tail (a spawned
+     * range arrives ascending, so this stays O(N)); only a lower-tid arrival
+     * walks to its sorted slot, and it stops early near the head. */
     t->st = T_READY; t->rnext = NULL;
-    if (S->ready_tail) S->ready_tail->rnext = t; else S->ready_head = t;
-    S->ready_tail = t;
+    if (!S->ready_head) { S->ready_head = S->ready_tail = t; return; }
+    if (t->tid >= S->ready_tail->tid) { S->ready_tail->rnext = t; S->ready_tail = t; return; }
+    Thread **pp = &S->ready_head;
+    while (*pp && (*pp)->tid <= t->tid) pp = &(*pp)->rnext;
+    t->rnext = *pp; *pp = t;                       /* inserted before a higher tid */
 }
 static Thread *ready_pop(Sched *S){
     Thread *t = S->ready_head;
@@ -649,6 +659,10 @@ static void run_thread(Sched *S, Thread *t){
             k->tid = t->tid; k->epoch = t->epoch; k->arch_fd = S->arch_fd;
             k->op = I->op; k->buf_log = I->buf_id; k->detail = I->len;
             k->buf = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
+            if (I->op == OP_DEFLATE && I->payload_len > 0) {   /* snapshot pool mems */
+                k->bufv = malloc(S->npool * sizeof(uint8_t*));  /* for cross-buffer runs */
+                for (int i = 0; i < S->npool; i++) k->bufv[i] = S->pool[i].mem;
+            }
             k->buf_off = I->buf_off; k->len = I->len; k->arch_off = I->arch_off;
             k->level = I->level; k->frame_id = I->frame_id;
             k->payload = I->payload; k->payload_len = I->payload_len;  /* runs */
@@ -846,7 +860,7 @@ static void run_sched(Sched *S){
                                  * must not see stale WAIT_IO */
             run_thread(S, ct);
         }
-        free(k);
+        free(k->bufv); free(k);
     }
 }
 

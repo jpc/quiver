@@ -431,8 +431,11 @@ def tar_scan(tar_path: str, qvm_exe: str | None = None) -> pl.DataFrame:
 # frame's contiguous (off,len) runs are packed for the in-place deflate. The three
 # planners differ ONLY in how the buffer is filled (whole tar / window load /
 # inline) — the gather itself is identical.
-def _gather_frames(df: pl.DataFrame, frame_bytes: int):
-    """Returns (df + frame/in_off, per-frame clen table, {frame: packed runs})."""
+def _gather_frames(df: pl.DataFrame, frame_bytes: int, buf_id: int = 0):
+    """Returns (df + frame/in_off, per-frame clen table, {frame: packed runs}).
+    Runs are (buf_id, off, len) i64 triples so a frame can gather across buffers
+    (a member straddling a pipeline ring boundary → two runs, two slots); here
+    every run carries the single `buf_id`."""
     df = df.sort("boff")
     df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
     df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
@@ -450,8 +453,9 @@ def _gather_frames(df: pl.DataFrame, frame_bytes: int):
     rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
     payloads = {}
     for r in rbf.iter_rows(named=True):
-        a = np.empty(2 * len(r["off"]), dtype="<i8")
-        a[0::2] = r["off"]; a[1::2] = r["rlen"]
+        k = len(r["off"])
+        a = np.empty(3 * k, dtype="<i8")
+        a[0::3] = buf_id; a[1::3] = r["off"]; a[2::3] = r["rlen"]
         payloads[int(r["frame"])] = a.tobytes()
     return df, frames, payloads
 
@@ -483,7 +487,7 @@ def plan_recompress(members: pl.DataFrame, tar_path: str,
     tarsize = os.path.getsize(tar_path)
     df = members if predicate is None else members.filter(predicate)
     df = df.with_columns(boff=pl.col("offset"))            # buffer = the whole tar
-    df, frames, payloads = _gather_frames(df, frame_bytes)
+    df, frames, payloads = _gather_frames(df, frame_bytes, 0)
     nf = frames.height
     root_df = pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": tarsize},
@@ -517,7 +521,7 @@ def plan_window_gather(wdf: pl.DataFrame, win_start: int, buf_id: int,
     window buffer `buf_id` (the driver holds it). No alloc/free here — the driver
     owns the buffer. Returns (instr_df, members_df)."""
     df = wdf.with_columns(boff=pl.col("offset") - win_start)   # relative to window
-    df, frames, payloads = _gather_frames(df, frame_bytes)
+    df, frames, payloads = _gather_frames(df, frame_bytes, buf_id)
     nf = frames.height
     root_df = pl.DataFrame([
         {"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
@@ -542,7 +546,7 @@ def plan_window_gather_inline(rows: list, win_start: int, win_bytes: bytes,
     if df.height == 0:
         return _empty_batch(), pl.DataFrame(schema={"frame": pl.Int64})
     df = df.with_columns(boff=pl.col("offset") - win_start)    # relative to window
-    df, frames, payloads = _gather_frames(df, frame_bytes)
+    df, frames, payloads = _gather_frames(df, frame_bytes, 0)
     nf = frames.height
     root = pl.concat([
         pl.DataFrame([{"tid": 0, "_sub": 0, "op": OP_ALLOC, "buf_id": 0, "cap": len(win_bytes)}]),
