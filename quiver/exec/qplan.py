@@ -434,29 +434,41 @@ def tar_scan(tar_path: str, qvm_exe: str | None = None) -> pl.DataFrame:
 # inline) — the gather itself is identical.
 def _gather_frames(df: pl.DataFrame, frame_bytes: int, buf_id: int = 0):
     """Returns (df + frame/in_off, per-frame clen table, {frame: packed runs}).
-    Runs are (buf_id, off, len) i64 triples so a frame can gather across buffers
-    (a member straddling a pipeline ring boundary → two runs, two slots); here
-    every run carries the single `buf_id`."""
-    df = df.sort("boff")
+    Runs are (buf_id, off, len) i64 triples so a frame can gather across buffers.
+    If `df` has a `buf` column (COALESCED windows — several member-aligned windows
+    in DIFFERENT ring buffers planned as one gather), each run carries its own
+    buffer id and a buffer change breaks the run; the rows are already in gather
+    order (window order, tar order within), so no re-sort. Otherwise all runs use
+    the single `buf_id` and rows are sorted by offset."""
+    multi = "buf" in df.columns
+    if not multi:
+        df = df.sort("boff")
     df = df.with_columns(_c=pl.col("range").cum_sum() - pl.col("range"))
     df = df.with_columns(frame=(pl.col("_c") // frame_bytes).cast(pl.Int64))
     df = df.with_columns(_fs=pl.col("_c").min().over("frame"))
     df = df.with_columns(in_off=pl.col("_c") - pl.col("_fs") + pl.col("header_len"))
     df = df.with_columns(_pe=(pl.col("boff") + pl.col("range")).shift(1),
                          _pf=pl.col("frame").shift(1))     # a new run when the frame
-    df = df.with_columns(_new=((pl.col("boff") != pl.col("_pe"))   # changes or the
-                               | (pl.col("frame") != pl.col("_pf"))).fill_null(True))
-    df = df.with_columns(run=pl.col("_new").cum_sum())     # buffer is non-contiguous
-    runs = (df.group_by("run").agg(frame=pl.col("frame").first(),
-                                   off=pl.col("boff").min(),
-                                   rlen=pl.col("range").sum()).sort("off"))
+    new = ((pl.col("boff") != pl.col("_pe"))              # changes, the buffer is
+           | (pl.col("frame") != pl.col("_pf")))           # non-contiguous, or (multi)
+    if multi:                                              # the run crosses buffers
+        new = new | (pl.col("buf") != pl.col("buf").shift(1))
+    df = df.with_columns(_new=new.fill_null(True))
+    df = df.with_columns(run=pl.col("_new").cum_sum())
+    aggs = [pl.col("frame").first(), pl.col("boff").min().alias("off"),
+            pl.col("range").sum().alias("rlen")]
+    if multi:
+        aggs.append(pl.col("buf").first().alias("rbuf"))
+    runs = df.group_by("run", maintain_order=True).agg(*aggs)   # keep gather order
     frames = df.group_by("frame").agg(clen=pl.col("range").sum()).sort("frame")
-    rbf = runs.group_by("frame", maintain_order=True).agg(pl.col("off"), pl.col("rlen"))
+    gc = ["off", "rlen"] + (["rbuf"] if multi else [])
+    rbf = runs.group_by("frame", maintain_order=True).agg(*(pl.col(c) for c in gc))
     payloads = {}
     for r in rbf.iter_rows(named=True):
         k = len(r["off"])
         a = np.empty(3 * k, dtype="<i8")
-        a[0::3] = buf_id; a[1::3] = r["off"]; a[2::3] = r["rlen"]
+        a[0::3] = r["rbuf"] if multi else buf_id
+        a[1::3] = r["off"]; a[2::3] = r["rlen"]
         payloads[int(r["frame"])] = a.tobytes()
     return df, frames, payloads
 
@@ -601,18 +613,22 @@ def recompress_zst_push(src_path: str, out_path: str, qvm_exe: str,
 def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
                               window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
                               level: int = 6, npool: int = 4, nworkers: int = 8,
-                              predicate: pl.Expr | None = None, depth: int = 6) -> int:
+                              predicate: pl.Expr | None = None, depth: int = 6,
+                              coalesce: int = 4) -> int:
     """BOUNDED-memory push recompress: the VM decodes ONE member-aligned window at
     a time (OP_SRC_SCAN — cut at the last complete member, partial tail carried in
     the source) and pushes that window's rows + a done flag on the DATA channel.
 
-    PIPELINED over a ring of `depth` buffers: the SCAN of a window and the GATHER
-    of the previous one are separate pushed batches, so they run concurrently, and
-    Python plans+pushes window k's gather WHILE the VM is still compressing window
-    k-1 — decode ‖ compress ‖ plan all overlap. Peak memory is ~`depth` windows;
-    buffer-slot backpressure keeps it there. `window_bytes` must exceed the largest
+    COALESCED + PIPELINED over a ring of buffers. `coalesce` windows are decoded
+    into distinct ring slots and their rows planned as ONE gather (the multi-run
+    triples carry a per-run buffer id, so a frame spans slots) — so Python compiles
+    the gather query once per `coalesce` windows instead of once per window,
+    amortizing the (fixed) per-batch polars cost. Scanning still runs ahead of the
+    gather, so decode ‖ compress ‖ plan overlap. Peak memory ≈ ring × window_bytes;
+    buffer-slot backpressure holds it there. `window_bytes` must exceed the largest
     single member. Works on multi-frame sources (no size hint). Returns member count."""
-    R = max(2, depth)                                # buffer-ring size = pipeline depth
+    C = max(1, coalesce)                             # windows planned per gather
+    R = max(depth, C + 2)                            # ring: a group + scan-ahead
     cap = window_bytes
     members: list[pl.DataFrame] = []
     frame_base = [0]
@@ -626,35 +642,42 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
                   "len": cap}]
         return _finalize([pl.DataFrame(rows)])
 
-    def gather_batch(rows, slot, last):              # deflate window[slot], free it
-        gd, nf = None, 0
+    def gather_group(group, last):                   # ONE gather over `group` windows
+        # group: [(slot, rows)]; tag each window's rows with its slot and coalesce.
+        rows = pl.concat([r.with_columns(buf=pl.lit(slot, pl.Int32),
+                                         boff=pl.col("offset")) for slot, r in group]) \
+            if group else pl.DataFrame()
         if predicate is not None and rows.height:
             rows = rows.filter(predicate)
+        gd, nf = None, 0
         if rows.height:
-            df = rows.with_columns(boff=pl.col("offset"))   # window-relative offsets
-            df, frames, payloads = _gather_frames(df, frame_bytes, slot)
+            df, frames, payloads = _gather_frames(rows, frame_bytes)   # per-run bufid
             members.append(_gather_members(df, frame_base[0]))
-            gd = _gather_deflate(frames, payloads, slot, level, frame_base[0])
+            gd = _gather_deflate(frames, payloads, 0, level, frame_base[0])
             frame_base[0] += frames.height; nf = frames.height
         head = ([{"tid": 0, "_sub": 0, "op": OP_SPAWN, "lo": 1, "cap": nf},
                  {"tid": 0, "_sub": 1, "op": OP_JOIN, "lo": 1, "cap": nf}] if nf else [])
-        tail = [{"tid": 0, "_sub": 2, "op": OP_FREE, "buf_id": slot}]
+        free = [{"tid": 0, "_sub": 2 + i, "op": OP_FREE, "buf_id": slot}
+                for i, (slot, _) in enumerate(group)]     # free every window's slot
         if last:
-            tail += [{"tid": 0, "_sub": 3, "op": OP_SRC_CLOSE, "lo": 0}]
-        parts = [pl.DataFrame(head + tail)] + ([gd] if gd is not None else [])
+            free.append({"tid": 0, "_sub": 2 + len(group), "op": OP_SRC_CLOSE, "lo": 0})
+        parts = [pl.DataFrame(head + free)] + ([gd] if gd is not None else [])
         return _finalize(parts)
 
     def driver(vm):
         vm.push(scan_batch(0, first=True))           # open + scan window 0
         rows = vm.read_rows(); done = vm.read_done()
-        k = 0
+        k, group = 0, []
         while True:
-            if done:                                  # last window: just gather it
-                vm.push(gather_batch(rows, k % R, last=True))
+            group.append((k % R, rows))              # this window's slot + rows
+            if not done:
+                vm.push(scan_batch((k + 1) % R))     # scan the next window (overlap)
+            if done or len(group) == C:              # group full → ONE coalesced gather
+                vm.push(gather_group(group, last=done))
+                group = []
+            if done:
                 break
-            vm.push(scan_batch((k + 1) % R))          # S_{k+1}: decode next window …
-            vm.push(gather_batch(rows, k % R, False))  # … ‖ G_k: compress this one
-            rows = vm.read_rows(); done = vm.read_done()   # rows_{k+1}, while G_k runs
+            rows = vm.read_rows(); done = vm.read_done()
             k += 1
 
     open(out_path, "wb").close()
