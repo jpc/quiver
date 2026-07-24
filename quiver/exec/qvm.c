@@ -63,6 +63,7 @@ enum {
     OP_SPAWN, OP_JOIN, OP_INFLATE, OP_DEFLATE, OP_CALL,
     OP_UNLINK, OP_RMDIR, OP_FBARRIER,     /* teardown + durability (mirror/sync) */
     OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE,  /* streaming decompress source */
+    OP_TARSCAN,                              /* parse decoded tar → DATA rows */
 };
 /* endpoint kinds for mov src/dst */
 enum { E_NONE = 0, E_FS, E_BUF, E_INLINE, E_ARCH };
@@ -670,6 +671,8 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
 }
 
 /* run a thread from pc until it suspends (task in flight / parked) or finishes */
+static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz);  /* defined below */
+
 static void run_thread(Sched *S, Thread *t){
     S->cur_epoch = t->epoch;                      /* for tr_log */
     while (t->pc < t->nprog) {
@@ -698,6 +701,13 @@ static void run_thread(Sched *S, Thread *t){
             Source *s = &S->src[I->lo];
             if (s->ds) ZSTD_freeDStream(s->ds);
             if (s->fd > 0) close(s->fd); free(s->in); memset(s, 0, sizeof *s);
+            t->pc++; break;
+        }
+        case OP_TARSCAN: {                       /* parse decoded tar → DATA rows */
+            uint8_t *m = I->buf_id >= 0 ? S->pool[I->buf_id].mem : NULL;
+            int64_t len = I->len ? I->len : (m ? S->pool[I->buf_id].cap : 0);
+            emit_tarscan(S, m ? m + I->buf_off : NULL, len);
+            tr_log(S, tr_now(), tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, len, 0);
             t->pc++; break;
         }
         case OP_SRC_NEXT: {                      /* decode next window → sink (task) */
@@ -761,8 +771,11 @@ static void run_thread(Sched *S, Thread *t){
              * returned batch's threads and wakes us when it completes. Meanwhile
              * this batch's other work (a prefetch loader) AND any prior batch's
              * compression keep running concurrently. pc advances on wake. */
-            if (S->call_fd < 0 || write(S->call_fd, &I->frame_id, 8) != 8) {
-                S->failed = S->failed ? S->failed : -EIO; t->pc++; break;
+            {   /* tagged: [0][int64 id] — shares stdout with DATA rows ([1]...) */
+                uint8_t msg[9]; msg[0] = 0; memcpy(msg + 1, &I->frame_id, 8);
+                if (S->call_fd < 0 || write(S->call_fd, msg, 9) != 9) {
+                    S->failed = S->failed ? S->failed : -EIO; t->pc++; break;
+                }
             }
             pw_push(S, t->epoch, t->tid, tr_now(), I->frame_id);
             t->st = T_WAIT_CALL;
@@ -1243,14 +1256,9 @@ static void tacc_add(TAcc *a, const char *nm, int64_t sz, int64_t mode, int64_t 
     a->sz[i]=sz; a->mode[i]=(int32_t)mode; a->mt[i]=mt; a->uid[i]=(int32_t)uid;
     a->gid[i]=(int32_t)gid; a->off[i]=off; a->hl[i]=hl; a->rng[i]=rng; a->n++;
 }
-static int qvm_tarscan(const char *tar_path, int outfd){
-    int fd = open(tar_path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "qvm tarscan: %s: %s\n", tar_path, strerror(errno)); return 1; }
-    struct stat st; if (fstat(fd, &st)) { close(fd); return 1; }
-    int64_t sz = st.st_size;
-    uint8_t *m = sz ? mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
-    if (sz && m == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
-    TAcc a; memset(&a, 0, sizeof a);
+/* Parse a tar image [m, m+sz) into `a` (member rows with buffer-relative
+ * offsets). Shared by the `tarscan` subcommand and OP_TARSCAN. */
+static void tar_parse(const uint8_t *m, int64_t sz, TAcc *a){
     char pax[4096], gnu[4096]; int has_pax = 0, has_gnu = 0; int64_t pax_sz = -1, mstart = -1;
     for (int64_t off = 0; off + 512 <= sz; ) {
         const uint8_t *h = m + off;
@@ -1278,28 +1286,72 @@ static int qvm_tarscan(const char *tar_path, int outfd){
                    if (pfx[0]) snprintf(name, sizeof name, "%s/%s", pfx, nm);
                    else snprintf(name, sizeof name, "%s", nm); }
             int64_t ms = mstart >= 0 ? mstart : off, doff = off + 512;
-            tacc_add(&a, name, real, tar_oct(h+100,8), tar_oct(h+136,12)*1000000000,
+            tacc_add(a, name, real, tar_oct(h+100,8), tar_oct(h+136,12)*1000000000,
                      tar_oct(h+108,8), tar_oct(h+116,8), ms, doff - ms,
                      (doff - ms) + ((real + 511) / 512) * 512);
         }
         off = (off + 512) + ((real + 511) / 512) * 512;
         has_pax = has_gnu = 0; pax_sz = -1; mstart = -1;
     }
-    int64_t n = a.n;
+}
+
+/* Emit the QTAR member batch (schema + one batch + eos) from `a` to `outfd`. */
+static void emit_qtar(int outfd, TAcc *a){
+    int64_t n = a->n;
     emit_schema(outfd, QTAR_SCHEMA_META, QTAR_SCHEMA_LEN);
     struct WBuf b[QTAR_N_BUFS] = {
-        {NULL,0},{a.poff, 8*(n+1)},{a.pd, a.plen},
-        {NULL,0},{a.sz, 8*n},   {NULL,0},{a.mode, 4*n}, {NULL,0},{a.mt, 8*n},
-        {NULL,0},{a.uid, 4*n},  {NULL,0},{a.gid, 4*n},  {NULL,0},{a.off, 8*n},
-        {NULL,0},{a.hl, 8*n},   {NULL,0},{a.rng, 8*n}};
+        {NULL,0},{a->poff, 8*(n+1)},{a->pd, a->plen},
+        {NULL,0},{a->sz, 8*n},   {NULL,0},{a->mode, 4*n}, {NULL,0},{a->mt, 8*n},
+        {NULL,0},{a->uid, 4*n},  {NULL,0},{a->gid, 4*n},  {NULL,0},{a->off, 8*n},
+        {NULL,0},{a->hl, 8*n},   {NULL,0},{a->rng, 8*n}};
     if (n == 0) b[1] = (struct WBuf){NULL,0};
     emit_batch(outfd, QTAR_BATCH_TMPL, QTAR_TMPL_LEN, QTAR_OFF_BODYLEN,
                QTAR_OFF_RBLEN, QTAR_NODE_OFF, QTAR_N_NODES, QTAR_BUF_OFF,
                QTAR_N_BUFS, n, b);
     uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(outfd, eos, 8);
+}
+
+static void tacc_free(TAcc *a){
+    free(a->pd); free(a->poff); free(a->sz); free(a->mt); free(a->off); free(a->hl);
+    free(a->rng); free(a->mode); free(a->uid); free(a->gid);
+}
+
+/* The DATA channel: rows the VM PUSHES to Python, multiplexed on the same fd as
+ * CALL requests by a leading tag byte — [1][u32 len][ipc-stream bytes] for DATA,
+ * [0][int64 id] for a CALL. Emitted on the scheduler thread (like OP_CALL), so
+ * the two never interleave on the shared fd. */
+static void emit_data(int fd, const uint8_t *buf, uint32_t len){
+    uint8_t hdr[5]; hdr[0] = 1; memcpy(hdr + 1, &len, 4);
+    if (write_full(fd, hdr, 5) || write_full(fd, buf, (size_t)len)) { /* ignore */ }
+}
+
+/* OP_TARSCAN: parse the decoded tar image in pool[buf_id] region [off,off+len)
+ * into member rows and push them down the DATA channel. Builds the QTAR batch
+ * into a memfd (to learn its length), then frames it as one DATA message. */
+static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz){
+    TAcc a; memset(&a, 0, sizeof a);
+    tar_parse(m, sz, &a);
+    int mfd = memfd_create("qtar", 0);
+    if (mfd < 0) { tacc_free(&a); return; }
+    emit_qtar(mfd, &a);
+    off_t n = lseek(mfd, 0, SEEK_END);
+    uint8_t *bytes = malloc(n ? n : 1);
+    if (bytes && pread(mfd, bytes, n, 0) == n) emit_data(S->call_fd, bytes, (uint32_t)n);
+    free(bytes); close(mfd); tacc_free(&a);
+}
+
+static int qvm_tarscan(const char *tar_path, int outfd){
+    int fd = open(tar_path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "qvm tarscan: %s: %s\n", tar_path, strerror(errno)); return 1; }
+    struct stat st; if (fstat(fd, &st)) { close(fd); return 1; }
+    int64_t sz = st.st_size;
+    uint8_t *m = sz ? mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+    if (sz && m == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
+    TAcc a; memset(&a, 0, sizeof a);
+    tar_parse(m, sz, &a);
+    emit_qtar(outfd, &a);
     if (m) munmap(m, sz); close(fd);
-    free(a.pd); free(a.poff); free(a.sz); free(a.mt); free(a.off); free(a.hl);
-    free(a.rng); free(a.mode); free(a.uid); free(a.gid);
+    tacc_free(&a);
     return 0;
 }
 

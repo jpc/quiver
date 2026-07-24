@@ -1313,6 +1313,25 @@ def test_qvm(tmp):
     assert ns == nz, (ns, nz)                      # same members as decode-scan
     ok("qvm recompress streaming: .tar.zstd decoded once, bounded, byte-exact")
 
+    # DATA channel: OP_TARSCAN parses a decoded tar IN A POOL BUFFER and PUSHES
+    # member rows to Python (tagged stdout, [1][len][ipc]) — no CALL round-trip.
+    # The rows must equal the reference `tar_scan`, and CALL (entry program) must
+    # still drive the same run on the shared stdout, tag-multiplexed.
+    tsz = os.path.getsize(tarp)
+    dref = qplan.tar_scan(tarp, qvm_exe=qvm).sort("path")
+    dprog = qplan._finalize([pl.DataFrame([
+        {"tid": 0, "_sub": 0, "op": qplan.OP_ALLOC, "buf_id": 0, "cap": tsz},
+        {"tid": 0, "_sub": 1, "op": qplan.OP_MOV, "src": qplan.E_FS,
+         "dst": qplan.E_BUF, "path": tarp, "buf_id": 0, "buf_off": 0, "len": tsz},
+        {"tid": 0, "_sub": 2, "op": qplan.OP_TARSCAN, "buf_id": 0, "buf_off": 0,
+         "len": tsz}])])
+    dgot = []
+    qplan.run_calls(lambda cid: dprog, qvm, "-", on_data=dgot.append)
+    assert dgot, "OP_TARSCAN pushed no DATA batch"
+    dscan = pl.concat(dgot).sort("path")
+    assert dscan.select(dref.columns).equals(dref), "DATA rows != tar_scan"
+    ok("qvm DATA channel: OP_TARSCAN pushes member rows == tar_scan, tag-muxed")
+
     # teardown (unlink/rmdir deepest-first) + durability (fbarrier) — mirror tail
     mr = tmp / "qvm_rm"
     (mr / "a/b").mkdir(parents=True); (mr / "c").mkdir()

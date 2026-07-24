@@ -30,7 +30,7 @@ from ..nock import nockidx as _zf     # the nock footer-index layer (no old-engi
 # opcodes — mirror qvm.c
 (OP_ALLOC, OP_FREE, OP_MOV, OP_MKDIR, OP_SETMETA, OP_SPAWN, OP_JOIN,
  OP_INFLATE, OP_DEFLATE, OP_CALL, OP_UNLINK, OP_RMDIR, OP_FBARRIER,
- OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE) = range(1, 17)
+ OP_SRC_OPEN, OP_SRC_NEXT, OP_SRC_CLOSE, OP_TARSCAN) = range(1, 18)
 # endpoint kinds
 E_NONE, E_FS, E_BUF, E_INLINE, E_ARCH = range(5)
 _BIG = 1 << 24                                # _sub for the frame's tail (deflate/free)
@@ -1246,7 +1246,7 @@ def _readn(fd: int, n: int) -> bytes:
 def run_calls(handler, qvm_exe: str, arch_path: str = "-",
               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
               want_comp: bool = False, env: dict | None = None,
-              transport: list | None = None):
+              transport: list | None = None, on_data=None):
     """CALL is qvm's SOLE entry point: qvm boots with one CALL(-1) and pulls
     every instruction batch by CALLing into Python. `handler(call_id)` answers
     each CALL — id -1 is the entry program; a driver's own CALLs pass their
@@ -1268,11 +1268,18 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          bufsize=0, pass_fds=pass_fds, env=penv)
     try:
+        out = p.stdout.fileno()
         while True:
-            req = _readn(p.stdout.fileno(), 8)  # a CALL request on stdout (blocks)
-            if len(req) < 8:
+            tag = _readn(out, 1)                 # tagged stdout: [0]=CALL [1]=DATA
+            if not tag:
                 break                            # qvm closed stdout → done
-            (cid,) = struct.unpack("<q", req)
+            if tag[0] == 1:                      # DATA: rows the VM pushed to us
+                (n,) = struct.unpack("<I", _readn(out, 4))
+                batch = _readn(out, n)
+                if on_data is not None:
+                    on_data(ipc.read_all(batch))
+                continue
+            (cid,) = struct.unpack("<q", _readn(out, 8))  # CALL request
             data = encode_stream(handler(cid))
             p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
     finally:
