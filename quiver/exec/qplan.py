@@ -338,7 +338,8 @@ def plan_pack(scan: pl.DataFrame, root: str, frame_bytes: int = 1 << 20,
 
 def pack_stream(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
                 chunk_rows: int = 64, frame_bytes: int = 1 << 20, level: int = 6,
-                npool: int = 16, nworkers: int = 8) -> int:
+                npool: int = 16, nworkers: int = 8,
+                transport: list | None = None) -> int:
     """Streaming pack with Python feedback: scan is split into chunks, each
     planned into its own instruction batch (frame ids offset by a running base)
     and STREAMED to the one persistent qvm — batch k+1 is planned while qvm packs
@@ -363,7 +364,7 @@ def pack_stream(scan: pl.DataFrame, root: str, out_path: str, qvm_exe: str,
 
     open(out_path, "wb").close()
     comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
-                     nworkers=nworkers, want_comp=True)
+                     nworkers=nworkers, want_comp=True, transport=transport)
     return _stream_footer(out_path, collected, comp)   # stream per-chunk parts
 
 
@@ -637,7 +638,8 @@ def _tar_window_stream(src_path: str, window_bytes: int):
 def recompress_zst_stream(src_path: str, out_path: str, qvm_exe: str,
                           window_bytes: int = 8 << 20, frame_bytes: int = 1 << 20,
                           level: int = 6, npool: int = 4, nworkers: int = 8,
-                          predicate: pl.Expr | None = None, chunk: int = 32) -> int:
+                          predicate: pl.Expr | None = None, chunk: int = 32,
+                          transport: list | None = None) -> int:
     """Fully-streaming recompress of a COMPRESSED foreign source (.tar.zstd) into
     a nock (ISA2 §5.5 feedback mode): decode the source ONCE with a streaming
     decompressor, cutting windows on the fly, and recompress each as it is
@@ -677,7 +679,7 @@ def recompress_zst_stream(src_path: str, out_path: str, qvm_exe: str,
 
     open(out_path, "wb").close()
     comp = run_calls(handler, qvm_exe, "-", sinks=(out_path,), npool=npool,
-                     nworkers=nworkers, want_comp=True)
+                     nworkers=nworkers, want_comp=True, transport=transport)
     return _stream_footer(out_path, collected, comp)   # stream per-window parts
 
 
@@ -1077,7 +1079,7 @@ def unpack_distributed(path: str, dest: str, qvm_exe: str, executors: int = 4,
 
         def run_group(i):
             for sh in groups[i]:
-                run_direct(plan_unpack(sh, dest, npool), qvm_exe, sh,
+                run(plan_unpack(sh, dest, npool), qvm_exe, sh,
                            npool=npool, nworkers=nworkers, transport=tp(i))
         with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
             list(ex.map(run_group, range(n)))
@@ -1096,7 +1098,7 @@ def unpack_distributed(path: str, dest: str, qvm_exe: str, executors: int = 4,
         if not keep:
             return
         sub = pl.concat([files.filter(pl.col("frame").is_in(keep)), dirs])
-        run_direct(plan_unpack(path, dest, npool, idx=sub), qvm_exe, path,
+        run(plan_unpack(path, dest, npool, idx=sub), qvm_exe, path,
                    npool=npool, nworkers=nworkers, transport=tp(i))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
@@ -1247,68 +1249,57 @@ def build_qvm(dest: str, src: str | None = None, uring: bool = False):
 
 def run(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
         sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-        want_comp: bool = False, env: dict | None = None):
-    """Encode and drive the C `qvm` executor. `sinks` are deflate output files;
-    `want_comp` collects the {frame, coff, clen} completions (via a temp fd) and
-    returns them as a DataFrame."""
+        want_comp: bool = False, env: dict | None = None,
+        transport: list | None = None):
+    """Encode and drive the C `qvm` executor for a single batch. `sinks` are
+    deflate output files; `want_comp` returns the {frame, coff, clen} completions.
+    `transport=["ssh", host]` runs it on a node (CALL over stdin/stdout, no
+    fd-passing — arch/sinks/comp are shared-fs paths)."""
     return run_calls(lambda cid: instr, qvm_exe, arch_path, sinks, npool,
-                     nworkers, want_comp, env=env)
+                     nworkers, want_comp, env=env, transport=transport)
 
 
-def run_direct(instr: pl.DataFrame, qvm_exe: str, arch_path: str = "-",
-               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-               want_comp: bool = False, transport: list | None = None,
-               env: dict | None = None):
-    """Run a SINGLE instruction batch WITHOUT the CALL fd-channel — the batch is
-    streamed on stdin, so it needs no fd-passing and runs over any argv-prefix
-    transport. `transport=["ssh", host]` places it on a node (arch/sinks/comp
-    must be shared-fs PATHS, not fd: pipes — weka). Local (transport=None) it is
-    the direct path, exercising the same code. Returns completions if want_comp."""
-    comp_path = "-"
-    if want_comp:
-        fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
-    argv = (transport or []) + [qvm_exe, "qvm", arch_path, str(npool),
-                                str(nworkers), comp_path, "-", *sinks]   # callfd = "-"
-    data = encode_stream(instr)
-    p = subprocess.run(argv, input=struct.pack("<I", len(data)) + data,
-                       stdout=subprocess.DEVNULL,
-                       env={**os.environ, **env} if env else None)
-    if p.returncode != 0:
-        if want_comp:
-            os.unlink(comp_path)
-        raise RuntimeError(f"qvm exited {p.returncode}")
-    if not want_comp:
-        return None
-    with open(comp_path, "rb") as cf:
-        raw = cf.read()
-    os.unlink(comp_path)
-    return ipc.read_all(raw).rename({"coff": "frame_coff", "clen": "frame_clen"})
+def _readn(fd: int, n: int) -> bytes:
+    """Read exactly n bytes (a CALL request), tolerating short reads (ssh may
+    fragment the back-channel). Returns < n only at EOF."""
+    buf = b""
+    while len(buf) < n:
+        c = os.read(fd, n - len(buf))
+        if not c:
+            break
+        buf += c
+    return buf
 
 
 def run_calls(handler, qvm_exe: str, arch_path: str = "-",
               sinks: tuple[str, ...] = (), npool: int = 16, nworkers: int = 8,
-              want_comp: bool = False, env: dict | None = None):
+              want_comp: bool = False, env: dict | None = None,
+              transport: list | None = None):
     """CALL is qvm's SOLE entry point: qvm boots with one CALL(-1) and pulls
     every instruction batch by CALLing into Python. `handler(call_id)` answers
     each CALL — id -1 is the entry program; a driver's own CALLs pass their
-    frame_id. Because a returned batch runs nested in the caller's scope, buffers
-    the caller holds are available to it (bounded, lexical resource management).
-    Completions accumulate across every (nested) batch."""
+    frame_id. Completions accumulate across every (nested) batch.
+
+    The CALL channel is ONE pair of pipes qvm inherits with no fd-passing:
+    requests come back on qvm's STDOUT (call_fd=1), responses go on its stdin —
+    exactly the two channels ssh forwards. So `transport=["ssh", host]` runs the
+    full CALL-driven set (windowed / streaming recompress) on a node over shared
+    storage, identically to local. (fd: pipe sinks still need pass_fds, so those
+    stay local.)"""
+    penv = {**os.environ, **env} if env else None
     comp_path = "-"
     if want_comp:
         fd, comp_path = tempfile.mkstemp(prefix="qvm_comp_"); os.close(fd)
-    cr_r, cr_w = os.pipe()                        # qvm -> Python OP_CALL requests
-    argv = [qvm_exe, "qvm", arch_path, str(npool), str(nworkers), comp_path,
-            str(cr_w), *sinks]
-    pass_fds = [cr_w] + [int(s[3:]) for s in sinks if s.startswith("fd:")]
-    p = subprocess.Popen(argv, stdin=subprocess.PIPE, pass_fds=pass_fds,
-                         env={**os.environ, **env} if env else None)
-    os.close(cr_w)                                # qvm holds its own copy
+    argv = (transport or []) + [qvm_exe, "qvm", arch_path, str(npool),
+            str(nworkers), comp_path, "1", *sinks]      # call_fd = 1 (stdout)
+    pass_fds = [int(s[3:]) for s in sinks if s.startswith("fd:")]  # local pipe sinks
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         bufsize=0, pass_fds=pass_fds, env=penv)
     try:
         while True:
-            req = os.read(cr_r, 8)               # a CALL request (blocks)
+            req = _readn(p.stdout.fileno(), 8)  # a CALL request on stdout (blocks)
             if len(req) < 8:
-                break                            # qvm closed the call fd → done
+                break                            # qvm closed stdout → done
             (cid,) = struct.unpack("<q", req)
             data = encode_stream(handler(cid))
             p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
@@ -1317,7 +1308,6 @@ def run_calls(handler, qvm_exe: str, arch_path: str = "-",
             p.stdin.close()
         except BrokenPipeError:
             pass
-        os.close(cr_r)
     rc = p.wait()
     if rc != 0:
         if want_comp:

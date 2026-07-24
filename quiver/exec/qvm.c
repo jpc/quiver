@@ -1365,30 +1365,17 @@ int main(int argc, char **argv){
     }
     Sched out;
     qvm_open(&out, arch_fd, sink_fds, nsinks, npool, nworkers, call_fd);
-    if (call_fd < 0) {
-        /* DIRECT mode (no CALL channel): read ONE instruction batch from stdin
-         * and run it — no fd-passing, so it works over ssh / any transport. Used
-         * for remote single-batch execution (pack/unpack/recompress). */
-        size_t blen; uint8_t *b = read_framed(0, &blen);
-        if (b) { int nn; char *nap, *nad;
-            Instr *nins = qvm_decode_arrow(b, blen, &nn, &nap, &nad);
-            int ep = build_batch(&out, nins, nn);
-            Batch *B = &out.bat[ep];             /* retire frees these */
-            B->pm = nins; B->ap = nap; B->ad = nad; B->raw = b;
-            ready_push(&out, &B->th[0]);
-            run_sched(&out);
-        }
-    } else {
-        /* CALL is the sole entry point: a single bootstrap CALL fetches the entry
-         * batch from Python (call id -1); that batch may itself CALL (drivers
-         * loop; windows fetch per-window gathers). Needs the fd-passed pipe. */
-        Instr boot; memset(&boot, 0, sizeof boot);
-        boot.op = OP_CALL; boot.frame_id = -1; boot.buf_id = -1;
-        boot.path = ""; boot.dpath = "";
-        int ep = build_batch(&out, &boot, 1);    /* bootstrap: one CALL(-1) */
-        ready_push(&out, &out.bat[ep].th[0]);
-        run_sched(&out);
-    }
+    /* CALL is the sole entry point: a single bootstrap CALL fetches the entry
+     * batch from Python (call id -1); that batch may itself CALL (drivers loop;
+     * windows fetch per-window gathers). The CALL channel is the process's own
+     * stdout (requests) + stdin (responses) — no fd-passing — so this runs
+     * identically local or behind ["ssh", host] (call_fd is typically 1). */
+    Instr boot; memset(&boot, 0, sizeof boot);
+    boot.op = OP_CALL; boot.frame_id = -1; boot.buf_id = -1;
+    boot.path = ""; boot.dpath = "";
+    int ep = build_batch(&out, &boot, 1);        /* bootstrap: one CALL(-1) */
+    ready_push(&out, &out.bat[ep].th[0]);
+    run_sched(&out);
     qvm_close(&out);
     int rc = out.failed;
     if (strcmp(comp, "-") != 0) {               /* footer completions → Arrow */

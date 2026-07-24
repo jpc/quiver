@@ -1344,11 +1344,11 @@ def test_qvm(tmp):
     assert ts.height and ts["is_dir"].sum() > 0
     tin, tmem, _ = qplan.plan_pack(ts, str(tsrc), frame_bytes=16 << 10, npool=8)
     tarc = str(tmp / "qvm_tp.nock"); open(tarc, "wb").close()
-    tcomp = qplan.run_direct(tin, qvm, "-", sinks=(tarc,), npool=8,   # pack on the "node"
-                             want_comp=True, transport=TP)
+    tcomp = qplan.run(tin, qvm, "-", sinks=(tarc,), npool=8,   # pack on the "node"
+                      want_comp=True, transport=TP)
     qplan._stream_footer(tarc, [tmem], tcomp, dirs=qplan._dir_footer_rows(ts))
-    qplan.run_direct(qplan.plan_unpack(tarc, str(tmp / "qvm_tp_x"), npool=8),
-                     qvm, tarc, npool=8, transport=TP)
+    qplan.run(qplan.plan_unpack(tarc, str(tmp / "qvm_tp_x"), npool=8),
+              qvm, tarc, npool=8, transport=TP)
     tidx = _zf.read_index(tarc).filter(pl.col("frame") >= 0)
     for pth in tidx["path"]:
         assert (tmp / "qvm_tp_x" / pth).read_bytes() == (tsrc / pth).read_bytes()
