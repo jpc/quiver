@@ -658,6 +658,8 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
     members: list[pl.DataFrame] = []
     frame_base = [0]
 
+    scan_cache: dict[int, bytes] = {}                # slot → encoded frame (constant)
+
     def scan_batch(slot, first=False):               # ALLOC buf[slot] + SRC_SCAN
         rows = ([{"tid": 0, "_sub": 0, "op": OP_SRC_OPEN, "lo": 0, "path": src_path}]
                 if first else [])
@@ -666,6 +668,13 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
                  {"tid": 0, "_sub": b + 1, "op": OP_SRC_SCAN, "lo": 0, "buf_id": slot,
                   "len": cap}]
         return _finalize([pl.DataFrame(rows)])
+
+    def push_scan(vm, slot, first=False):            # a scan is constant per slot →
+        if first:                                     # build+encode once, then reuse
+            vm.push(scan_batch(slot, first=True)); return
+        if slot not in scan_cache:
+            scan_cache[slot] = vm.frame(scan_batch(slot))
+        vm.push_raw(scan_cache[slot])
 
     def gather_group(group, last):                   # ONE gather over `group` windows
         # group: [(slot, rows)]; tag each window's rows with its slot and coalesce.
@@ -690,13 +699,13 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
         return _finalize(parts)
 
     def driver(vm):
-        vm.push(scan_batch(0, first=True))           # open + scan window 0
+        push_scan(vm, 0, first=True)                 # open + scan window 0
         rows = vm.read_rows(); done = vm.read_done()
         k, group = 0, []
         while True:
             group.append((k % R, rows))              # this window's slot + rows
             if not done:
-                vm.push(scan_batch((k + 1) % R))     # scan the next window (overlap)
+                push_scan(vm, (k + 1) % R)           # scan the next window (overlap)
             if done or len(group) == C:              # group full → ONE coalesced gather
                 vm.push(gather_group(group, last=done))
                 group = []
@@ -1219,8 +1228,15 @@ class _PushVM:
 
     def push(self, instr: pl.DataFrame) -> None:
         data = encode_stream(instr)
-        self.p.stdin.write(struct.pack("<I", len(data)) + data)
-        self.p.stdin.flush()
+        self.push_raw(struct.pack("<I", len(data)) + data)
+
+    def push_raw(self, framed: bytes) -> None:   # a pre-encoded [len][batch] frame
+        self.p.stdin.write(framed); self.p.stdin.flush()
+
+    @staticmethod
+    def frame(instr: pl.DataFrame) -> bytes:     # encode + length-prefix, for caching
+        data = encode_stream(instr)
+        return struct.pack("<I", len(data)) + data
 
     def _msg(self):                              # one DATA message → (kind, payload)
         t0 = time.monotonic_ns()                 # a read BLOCKS here until the VM emits
