@@ -163,18 +163,46 @@ def plan_cp(scan: pl.DataFrame, src_root: str, dst_root: str) -> pl.DataFrame:
 
 
 # ------------------------------------------------------------------------ scan
-def scan(root: str, qvm_exe: str, threads: int = 8,
-         transport: list | None = None) -> pl.DataFrame:
-    """Parallel filesystem scan by qvm itself (OP_SCANDIR): push a one-op batch,
-    the VM walks the tree with a worker pool and pushes one STAT batch back on the
-    DATA channel — relative path, is_dir, size, mode, mtime_ns, uid, gid (root
-    excluded, dirs + files incl. empty). Drop-in for wire.scan for the columns the
-    planner uses. `transport=["ssh", host]` runs it on a node (remote root)."""
+def scan_stream(root: str, qvm_exe: str, on_chunk, threads: int = 8,
+                chunk_rows: int = 1 << 16, transport: list | None = None) -> None:
+    """STREAMING parallel scan (OP_SCANDIR): the VM walks the tree with a worker
+    pool and PUSHES STAT rows in ~`chunk_rows` batches AS they are discovered, then
+    a done marker. `on_chunk(df)` is called for each batch — so a caller can shard
+    or pack files while the walk is still running (walk ‖ downstream work), one
+    pass, without ever holding the whole member list. Columns: relative path,
+    is_dir, size, mode, mtime_ns, uid, gid (root excluded; dirs + files incl. empty)."""
     root2 = root if transport else os.path.abspath(root)
     instr = _finalize([pl.DataFrame([
-        {"tid": 0, "_sub": 0, "op": OP_SCANDIR, "path": root2, "level": threads}])])
-    df = _push_scan(instr, qvm_exe, transport=transport)
-    return df.with_columns(pl.col("is_dir").cast(pl.Boolean))
+        {"tid": 0, "_sub": 0, "op": OP_SCANDIR, "path": root2, "level": threads,
+         "len": chunk_rows}])])
+
+    def driver(vm):
+        vm.push(instr)
+        while True:
+            m = vm._msg()
+            if m is None:
+                break
+            kind, payload = m
+            if kind == 2:                            # end-of-scan marker
+                break
+            df = ipc.read_all(payload)
+            if df.height:
+                on_chunk(df.with_columns(pl.col("is_dir").cast(pl.Boolean)))
+
+    push_exec(driver, qvm_exe, "-", transport=transport)
+
+
+def scan(root: str, qvm_exe: str, threads: int = 8,
+         transport: list | None = None) -> pl.DataFrame:
+    """Non-streaming convenience: collect the streaming scan into one DataFrame."""
+    parts: list[pl.DataFrame] = []
+    scan_stream(root, qvm_exe, parts.append, threads=threads, transport=transport)
+    if not parts:
+        return pl.DataFrame(schema={"path": pl.Utf8, "is_dir": pl.Boolean,
+                                    "size": pl.Int64, "mode": pl.Int32,
+                                    "mtime_ns": pl.Int64, "uid": pl.Int32,
+                                    "gid": pl.Int32})
+    return pl.concat(parts)
 
 
 # ------------------------------------------------------------- teardown / durability

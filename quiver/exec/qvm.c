@@ -245,6 +245,7 @@ enum { TK_INLINE_TO_BUF_UNUSED, TK_FS_TO_BUF, TK_BUF_TO_FS, TK_BUF_TO_ARCH,
        TK_UNLINK, TK_RMDIR, TK_FBARRIER,   /* teardown + durability */
        TK_SRC_NEXT,                        /* decode next window from a source */
        TK_SRC_SCAN,                        /* decode + member-aligned scan → DATA rows */
+       TK_SCANDIR,                         /* streaming parallel fs walk → DATA rows */
        TK_BATCH_READY };   /* reader thread → scheduler: a CALL response arrived */
 
 #define QCAP 4096
@@ -307,6 +308,7 @@ static ssize_t do_cfr(int in, int64_t *ioff, int out, int64_t *ooff, int64_t n){
 static int64_t scan_window_emit(struct Sched_ *S, const uint8_t *buf, int64_t M,
                                 int64_t *end, int *done);
 static void emit_data(struct Sched_ *S, uint8_t kind, const uint8_t *buf, uint32_t len);
+static int emit_scandir_stream(struct Sched_ *S, const char *root, int nthreads, int64_t chunk);
 
 static void run_task(Task *t){
     t->res = 0;
@@ -412,6 +414,11 @@ static void run_task(Task *t){
         }
         t->clen = (int64_t)n; t->digest = s->eof;   /* report decoded size + eof */
         if (owned) free(win); break;
+    }
+    case TK_SCANDIR: {           /* streaming parallel fs walk → DATA rows */
+        int rc = emit_scandir_stream(t->sched, t->path, (int)t->detail, t->len);
+        if (rc) t->res = rc;
+        break;
     }
     case TK_SRC_SCAN: {          /* decode a window into buf, member-align, push rows */
         Source *s = t->source; uint8_t *buf = t->buf; int64_t cap = t->len;
@@ -774,7 +781,6 @@ static void submit_mov(Sched *S, Thread *t, Instr *I){
 /* run a thread from pc until it suspends (task in flight / parked) or finishes */
 static void emit_tarscan(Sched *S, const uint8_t *m, int64_t sz);       /* defined below */
 static int  emit_tarscan_file(Sched *S, const char *tar_path);         /* scanning ops */
-static int  emit_scandir(Sched *S, const char *root, int nthreads);
 static void emit_cksum(Sched *S, const char *in, size_t len, int64_t part_size, int nthreads);
 
 static void run_thread(Sched *S, Thread *t){
@@ -823,12 +829,14 @@ static void run_thread(Sched *S, Thread *t){
             tr_log(S, tt, tr_now(), t->tid, OP_TARSCAN, I->buf_id, I->buf_off, I->len, 0);
             t->pc++; break;
         }
-        case OP_SCANDIR: {                       /* parallel fs walk → STAT rows */
-            int64_t tt = tr_now();
-            int rc = emit_scandir(S, I->path, I->level > 0 ? I->level : 8);
-            if (rc) S->failed = S->failed ? S->failed : rc;
-            tr_log(S, tt, tr_now(), t->tid, OP_SCANDIR, 0, 0, 0, 0);
-            t->pc++; break;
+        case OP_SCANDIR: {                       /* streaming fs walk → STAT rows (task) */
+            Task *k = calloc(1, sizeof *k);
+            k->tid = t->tid; k->epoch = t->epoch; k->op = I->op; k->kind = TK_SCANDIR;
+            k->sched = S; k->path = I->path; k->buf_log = -1;
+            k->detail = I->level > 0 ? I->level : 8;   /* nthreads */
+            k->len = I->len;                           /* chunk rows (0 → default) */
+            t->pc++; S->inflight++; tq_push(&S->tasks, k); t->st = T_WAIT_IO;
+            return;
         }
         case OP_CKSUM: {                         /* S3 ETag + CRC64 per path → DATA */
             int64_t tt = tr_now();
@@ -1565,12 +1573,13 @@ typedef struct SDir { int dfd; char *rel; uint64_t ino; struct SDir *next; } SDi
 typedef struct {
     pthread_mutex_t qmu; pthread_cond_t qcv;
     SDir *qh, *qt; int64_t pending; int done;
-    pthread_mutex_t amu;                          /* shared row accumulator */
+    pthread_mutex_t amu; pthread_cond_t acv;      /* shared row accumulator + signal */
     char *pdata; int64_t plen, pcap;              /* large_utf8 path data */
     int64_t *poff; uint8_t *isdir; int64_t *size, *mtime, *atime, *ctime, *blocks;
     int32_t *mode, *uid, *gid, *nlink, *depth;
     uint64_t *ino, *pino, *dev;
     int64_t n, cap;
+    int64_t drained; int emit_done;               /* streaming: rows flushed / walk over */
 } Scan;
 
 static void sacc_add(Scan *s, const char *rel, size_t rl, int isdir,
@@ -1599,6 +1608,7 @@ static void sacc_add(Scan *s, const char *rel, size_t rl, int isdir,
     s->nlink[i]=(int32_t)st->st_nlink; s->depth[i]=depth;
     s->ino[i]=(uint64_t)st->st_ino; s->pino[i]=pino; s->dev[i]=(uint64_t)st->st_dev;
     s->n++;
+    pthread_cond_signal(&s->acv);                 /* wake a streaming flusher */
     pthread_mutex_unlock(&s->amu);
 }
 static void sq_push(Scan *s, int dfd, char *rel, uint64_t ino){  /* owns rel */
@@ -1641,8 +1651,11 @@ static void *scan_worker(void *arg){
         }
         free(d->rel); free(d);
         pthread_mutex_lock(&s->qmu);
-        if (--s->pending == 0) { s->done = 1; pthread_cond_broadcast(&s->qcv); }
+        int last = (--s->pending == 0);
+        if (last) { s->done = 1; pthread_cond_broadcast(&s->qcv); }
         pthread_mutex_unlock(&s->qmu);
+        if (last) { pthread_mutex_lock(&s->amu);   /* wake the flusher: walk over */
+            s->emit_done = 1; pthread_cond_signal(&s->acv); pthread_mutex_unlock(&s->amu); }
     }
     return NULL;
 }
@@ -1686,13 +1699,64 @@ static void scan_free(Scan *s){
     free(s->dev);
 }
 
-/* OP_SCANDIR: walk `root` and push the full STAT batch on the DATA channel. */
-static int emit_scandir(Sched *S, const char *root, int nthreads){
-    Scan s; int rc = scandir_run(root, nthreads, &s);
-    if (rc) return rc;
-    int mfd = memfd_create("qscan", 0);
-    if (mfd >= 0) { emit_scan(mfd, &s); memfd_to_data(S, mfd); }
-    scan_free(&s);
+/* Emit STAT rows [lo,hi) as one QSCAN batch. Path offsets are rebased to 0; the
+ * other columns point straight into the accumulator (caller holds amu → no realloc). */
+static void emit_scan_range(int fd, Scan *s, int64_t lo, int64_t hi){
+    int64_t n = hi - lo, base = s->poff[lo];
+    int64_t *po = malloc((n + 1) * 8);
+    for (int64_t i = 0; i <= n; i++) po[i] = s->poff[lo + i] - base;
+    emit_schema(fd, QSCAN_SCHEMA_META, QSCAN_SCHEMA_LEN);
+    struct WBuf b[QSCAN_N_BUFS] = {
+        {NULL,0},{po, 8*(n+1)},{s->pdata + base, s->poff[hi] - base},
+        {NULL,0},{s->isdir+lo, n},   {NULL,0},{s->size+lo, 8*n},
+        {NULL,0},{s->mode+lo, 4*n},  {NULL,0},{s->mtime+lo, 8*n},
+        {NULL,0},{s->uid+lo, 4*n},   {NULL,0},{s->gid+lo, 4*n},
+        {NULL,0},{s->ino+lo, 8*n},   {NULL,0},{s->pino+lo, 8*n},
+        {NULL,0},{s->dev+lo, 8*n},   {NULL,0},{s->blocks+lo, 8*n},
+        {NULL,0},{s->nlink+lo, 4*n}, {NULL,0},{s->atime+lo, 8*n},
+        {NULL,0},{s->ctime+lo, 8*n}, {NULL,0},{s->depth+lo, 4*n}};
+    if (n == 0) b[1] = (struct WBuf){NULL,0};
+    emit_batch(fd, QSCAN_BATCH_TMPL, QSCAN_TMPL_LEN, QSCAN_OFF_BODYLEN,
+               QSCAN_OFF_RBLEN, QSCAN_NODE_OFF, QSCAN_N_NODES,
+               QSCAN_BUF_OFF, QSCAN_N_BUFS, n, b);
+    uint32_t eos[2] = {0xFFFFFFFFu, 0}; write_full(fd, eos, 8);
+    free(po);
+}
+
+/* OP_SCANDIR (streaming): walk `root` with a worker pool and PUSH STAT rows on the
+ * DATA channel in ~`chunk`-row batches AS they are discovered — so a consumer can
+ * shard / pack files while the walk is still running — then a kind-2 done marker.
+ * Runs as a task so the scheduler keeps servicing pushed batches meanwhile. */
+static int emit_scandir_stream(Sched *S, const char *root, int nthreads, int64_t chunk){
+    if (chunk < 1) chunk = 1 << 16;
+    int rfd = open(root, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (rfd < 0) return -errno;
+    struct stat rst; uint64_t rino = fstat(rfd, &rst) == 0 ? (uint64_t)rst.st_ino : 0;
+    Scan s; memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.qmu,0); pthread_cond_init(&s.qcv,0);
+    pthread_mutex_init(&s.amu,0); pthread_cond_init(&s.acv,0);
+    if (nthreads < 1) nthreads = 1;
+    sq_push(&s, rfd, strdup(""), rino);
+    pthread_t *th = malloc(nthreads * sizeof *th);
+    for (int i = 0; i < nthreads; i++) pthread_create(&th[i], 0, scan_worker, &s);
+    for (;;) {                                     /* flush loop: chunked emit */
+        pthread_mutex_lock(&s.amu);
+        while (s.n - s.drained < chunk && !s.emit_done)
+            pthread_cond_wait(&s.acv, &s.amu);
+        int64_t lo = s.drained, hi = s.n;
+        if (hi - lo > chunk) hi = lo + chunk;
+        int mfd = (hi > lo) ? memfd_create("qscan", 0) : -1;
+        if (mfd >= 0) emit_scan_range(mfd, &s, lo, hi);   /* reads arrays under amu */
+        s.drained = hi;
+        int fin = s.emit_done && s.drained >= s.n;
+        pthread_mutex_unlock(&s.amu);
+        if (mfd >= 0) memfd_to_data(S, mfd);       /* stdout write, off the lock */
+        if (fin) break;
+    }
+    for (int i = 0; i < nthreads; i++) pthread_join(th[i], 0);
+    uint8_t d = 1; emit_data(S, 2, &d, 1);         /* end-of-scan marker */
+    scan_free(&s); free(th);
+    pthread_cond_destroy(&s.acv);
     return 0;
 }
 
