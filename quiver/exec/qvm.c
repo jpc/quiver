@@ -34,6 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include <zlib.h>                  /* gzip source codec (xz would add <lzma.h>) */
 #include <sys/mman.h>
 #include "qvm_comp.h"           /* Arrow-emit template for the completion schema */
 #include "qvm_scan.h"           /* Arrow-emit template for the fs-scan schema */
@@ -142,10 +143,79 @@ static uint64_t xxh_digest(XXH *s){
 /* a streaming decompress source: a stateful zstd stream over a file, drained
  * window-by-window by OP_SRC_NEXT. A source is decoded by ONE (serial, low-tid)
  * fiber, so no lock — the read-side analog of a Sink. */
-typedef struct { ZSTD_DStream *ds; int fd; uint8_t *in; size_t incap, inpos, inlen;
-                 int eof; int64_t produced;
-                 uint8_t *carry; size_t carry_len, carry_cap;  /* member-aligned window carry */
-                 } Source;
+/* A streaming decompressor: a compressed fd behind a uniform source_pull() that
+ * yields PLAINTEXT bytes. The codec (zstd / gzip / xz) is an implementation
+ * detail here; nothing above this layer knows the format — that is what keeps
+ * "add another compressor" a change confined to source_open/pull/close, and the
+ * tar-container scanning (OP_SRC_SCAN) a separate concern layered on top. */
+enum { CODEC_ZSTD, CODEC_GZIP /* , CODEC_XZ */ };
+typedef struct Source {
+    int fd; int codec;
+    uint8_t *in; size_t incap, inpos, inlen; int eof;
+    ZSTD_DStream *ds;            /* CODEC_ZSTD */
+    z_stream *gz;                /* CODEC_GZIP (zlib, gzip-wrapped) */
+    int64_t produced;
+    uint8_t *carry; size_t carry_len, carry_cap;  /* member-aligned window carry */
+} Source;
+
+/* Open + sniff the codec from the leading magic bytes (the primed bytes stay in
+ * `in` for the first pull, so nothing is lost). */
+static int source_open(Source *s, const char *path){
+    memset(s, 0, sizeof *s);
+    s->fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (s->fd < 0) return -errno;
+    s->incap = 1 << 20; s->in = malloc(s->incap);
+    ssize_t r = read(s->fd, s->in, s->incap);
+    if (r < 0) { int e = -errno; close(s->fd); free(s->in); return e; }
+    s->inpos = 0; s->inlen = (size_t)(r > 0 ? r : 0);
+    const uint8_t *m = s->in;
+    if (r >= 4 && m[0]==0x28 && m[1]==0xB5 && m[2]==0x2F && m[3]==0xFD) {
+        s->codec = CODEC_ZSTD; s->ds = ZSTD_createDStream(); ZSTD_initDStream(s->ds);
+    } else if (r >= 2 && m[0]==0x1F && m[1]==0x8B) {
+        s->codec = CODEC_GZIP; s->gz = calloc(1, sizeof *s->gz);
+        if (inflateInit2(s->gz, 15 + 16) != Z_OK) {   /* +16: gzip wrapper */
+            close(s->fd); free(s->in); free(s->gz); return -EIO; }
+    } else { close(s->fd); free(s->in); return -EINVAL; }   /* unknown magic */
+    return 0;
+}
+
+/* Decompress up to `max` plaintext bytes into dst; returns bytes produced (0 at
+ * end-of-stream, which also sets s->eof), or -1 on a codec/read error. */
+static int64_t source_pull(Source *s, uint8_t *dst, int64_t max){
+    size_t pos = 0;
+    while (pos < (size_t)max && !s->eof) {
+        if (s->inpos >= s->inlen) {                   /* refill compressed input */
+            ssize_t r = read(s->fd, s->in, s->incap);
+            if (r < 0) return -1;
+            if (r == 0) { s->eof = 1; break; }
+            s->inpos = 0; s->inlen = (size_t)r;
+        }
+        if (s->codec == CODEC_ZSTD) {
+            ZSTD_outBuffer out = {dst, (size_t)max, pos};
+            ZSTD_inBuffer in = {s->in, s->inlen, s->inpos};
+            size_t rc = ZSTD_decompressStream(s->ds, &out, &in);
+            s->inpos = in.pos; pos = out.pos;
+            if (ZSTD_isError(rc)) return -1;
+        } else {                                      /* CODEC_GZIP */
+            z_stream *z = s->gz;
+            z->next_in = s->in + s->inpos; z->avail_in = (uInt)(s->inlen - s->inpos);
+            z->next_out = dst + pos; z->avail_out = (uInt)((size_t)max - pos);
+            int rc = inflate(z, Z_NO_FLUSH);
+            s->inpos = s->inlen - z->avail_in; pos = (size_t)max - z->avail_out;
+            if (rc == Z_STREAM_END) { s->eof = 1; break; }   /* single-member gzip */
+            if (rc != Z_OK && rc != Z_BUF_ERROR) return -1;
+        }
+    }
+    return (int64_t)pos;
+}
+
+static void source_close(Source *s){
+    if (s->ds) ZSTD_freeDStream(s->ds);
+    if (s->gz) { inflateEnd(s->gz); free(s->gz); }
+    if (s->fd > 0) close(s->fd);
+    free(s->in); free(s->carry);
+    memset(s, 0, sizeof *s);
+}
 
 typedef struct Task {
     uint32_t tid;
@@ -318,20 +388,9 @@ static void run_task(Task *t){
         int owned = t->buf == NULL;
         uint8_t *win = t->buf ? t->buf + t->detail : malloc((size_t)t->len);
         if (!win) { t->res = -ENOMEM; break; }
-        ZSTD_outBuffer out = {win, (size_t)t->len, 0};
-        while (out.pos < out.size && !s->eof) {
-            if (s->inpos >= s->inlen) {           /* refill compressed input */
-                ssize_t r = read(s->fd, s->in, s->incap);
-                if (r < 0) { t->res = -errno; break; }
-                if (r == 0) { s->eof = 1; break; }
-                s->inpos = 0; s->inlen = (size_t)r;
-            }
-            ZSTD_inBuffer in = {s->in, s->inlen, s->inpos};
-            size_t rc = ZSTD_decompressStream(s->ds, &out, &in);
-            s->inpos = in.pos;
-            if (ZSTD_isError(rc)) { t->res = -EIO; break; }
-        }
-        size_t n = out.pos; s->produced += (int64_t)n;
+        int64_t pn = source_pull(s, win, t->len);   /* codec-agnostic decode */
+        if (pn < 0) { t->res = -EIO; if (owned) free(win); break; }
+        size_t n = (size_t)pn; s->produced += pn;
         if (t->res == 0 && t->sink && n) {        /* append the window to the sink */
             Sink *sk = t->sink;
             if (sk->is_pipe) { pthread_mutex_lock(&sk->mu);
@@ -353,20 +412,9 @@ static void run_task(Task *t){
         Source *s = t->source; uint8_t *buf = t->buf; int64_t cap = t->len;
         int64_t base = (int64_t)s->carry_len;       /* carried partial member */
         if (base) memcpy(buf, s->carry, (size_t)base);
-        ZSTD_outBuffer out = {buf, (size_t)cap, (size_t)base};
-        while (out.pos < out.size && !s->eof) {      /* fill to cap (or eof) */
-            if (s->inpos >= s->inlen) {
-                ssize_t r = read(s->fd, s->in, s->incap);
-                if (r < 0) { t->res = -errno; break; }
-                if (r == 0) { s->eof = 1; break; }
-                s->inpos = 0; s->inlen = (size_t)r;
-            }
-            ZSTD_inBuffer in = {s->in, s->inlen, s->inpos};
-            size_t rc = ZSTD_decompressStream(s->ds, &out, &in);
-            s->inpos = in.pos;
-            if (ZSTD_isError(rc)) { t->res = -EIO; break; }
-        }
-        int64_t M = (int64_t)out.pos; s->produced += M - base;
+        int64_t pn = source_pull(s, buf + base, cap - base);   /* fill to cap (or eof) */
+        if (pn < 0) { t->res = -EIO; break; }
+        int64_t M = base + pn; s->produced += pn;
         int64_t e = 0; int zero = 0;
         /* member-align + emit the file rows (kind 0). A dir-only window advances
          * e (headers parsed) with 0 file rows — legitimate, keep going. No
@@ -737,20 +785,14 @@ static void run_thread(Sched *S, Thread *t){
         case OP_FREE:
             tr_log(S, tr_now(), tr_now(), t->tid, OP_FREE, I->buf_id, 0, 0, 0);
             pool_free(S, I->buf_id); t->pc++; break;
-        case OP_SRC_OPEN: {                      /* open src[lo] over path (zstd) */
-            Source *s = &S->src[I->lo];
-            s->fd = open(I->path, O_RDONLY|O_CLOEXEC);
-            if (s->fd < 0) S->failed = S->failed ? S->failed : -errno;
-            else { s->ds = ZSTD_createDStream(); ZSTD_initDStream(s->ds);
-                   s->incap = 1<<20; s->in = malloc(s->incap);
-                   s->inpos = s->inlen = 0; s->eof = 0; s->produced = 0; }
+        case OP_SRC_OPEN: {                      /* open src[lo]; codec sniffed from magic */
+            int rc = source_open(&S->src[I->lo], I->path);
+            if (rc) S->failed = S->failed ? S->failed : rc;
             tr_log(S, tr_now(), tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
             t->pc++; break;
         }
         case OP_SRC_CLOSE: {
-            Source *s = &S->src[I->lo];
-            if (s->ds) ZSTD_freeDStream(s->ds);
-            if (s->fd > 0) close(s->fd); free(s->in); free(s->carry); memset(s, 0, sizeof *s);
+            source_close(&S->src[I->lo]);
             t->pc++; break;
         }
         case OP_SRC_SCAN: {                      /* decode window + member scan → DATA */

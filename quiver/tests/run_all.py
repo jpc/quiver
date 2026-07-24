@@ -1360,6 +1360,22 @@ def test_qvm(tmp):
         assert (tmp / "qvm_wpush_x" / pth).read_bytes() == (src / pth).read_bytes()
     ok("qvm windowed PUSH: member-aligned windows, bounded memory, byte-exact")
 
+    # codec layer: the SAME push path over a GZIP source (codec sniffed from magic,
+    # decode decoupled from the tar scan). Adding xz would be one more codec case.
+    import gzip as _gz
+    tgz = str(tmp / "qvm_re.tar.gz")
+    with open(tarp, "rb") as fi, _gz.open(tgz, "wb") as fo:
+        shutil.copyfileobj(fi, fo)
+    gp = str(tmp / "qvm_gz.nock")
+    gpn = qplan.recompress_zst_window_push(tgz, gp, qvm, window_bytes=small,
+                                           frame_bytes=16 << 10)
+    assert gpn == nz, (gpn, nz)
+    gpidx = _zf.read_index(gp).filter(pl.col("frame") >= 0)
+    qplan.unpack(gp, str(tmp / "qvm_gz_x"), qvm, npool=8)
+    for pth in gpidx["path"]:
+        assert (tmp / "qvm_gz_x" / pth).read_bytes() == (src / pth).read_bytes()
+    ok("qvm codec layer: gzip source via magic-sniff, same scan/gather, byte-exact")
+
     # teardown (unlink/rmdir deepest-first) + durability (fbarrier) — mirror tail
     mr = tmp / "qvm_rm"
     (mr / "a/b").mkdir(parents=True); (mr / "c").mkdir()

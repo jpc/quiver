@@ -1324,6 +1324,7 @@ def build_qvm(dest: str, src: str | None = None, uring: bool = False):
     cmd = ["cc", "-O2", "-pthread", "-o", dest, src, md5]
     cmd += [f"-I{zp}/include", f"{zp}/lib/libzstd.a"] \
         if os.path.exists(f"{zp}/lib/libzstd.a") else ["-lzstd"]
+    cmd += ["-lz"]                                # gzip source codec (zlib)
     if uring:
         lu = _find_liburing()
         if not lu:
