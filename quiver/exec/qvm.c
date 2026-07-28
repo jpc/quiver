@@ -165,6 +165,9 @@ typedef struct Source {
     uint8_t *carry; size_t carry_len, carry_cap;  /* member-aligned window carry */
     int ckpt_fd;                 /* gzip resume index (zran): append checkpoints here */
     int64_t ckpt_ivl, ckpt_last; /* compressed-byte interval, last checkpointed total_in */
+    int64_t skip;                /* on resume, discard this many decoded bytes first
+                                  * (a block-boundary checkpoint lands mid-member; skip
+                                  * to the next tar member boundary the driver resumes at) */
 } Source;
 
 /* A gzip resume checkpoint (zran-style), fixed size so the LAST one is a tail read.
@@ -271,7 +274,7 @@ static void gz_checkpoint(Source *s, z_stream *z, size_t pos){
 
 /* Decompress up to `max` plaintext bytes into dst; returns bytes produced (0 at
  * end-of-stream, which also sets s->eof), or -1 on a codec/read error. */
-static int64_t source_pull(Source *s, uint8_t *dst, int64_t max){
+static int64_t src_decode(Source *s, uint8_t *dst, int64_t max){
     size_t pos = 0;
     while (pos < (size_t)max && !s->eof) {
         if (s->inpos >= s->inlen) {                   /* refill compressed input */
@@ -302,6 +305,21 @@ static int64_t source_pull(Source *s, uint8_t *dst, int64_t max){
         }
     }
     return (int64_t)pos;
+}
+
+/* Wrapper: on resume, discard s->skip decoded bytes first (from the checkpoint's
+ * block boundary up to the tar member boundary the driver re-aligns at), then
+ * produce normally. */
+static int64_t source_pull(Source *s, uint8_t *dst, int64_t max){
+    while (s->skip > 0 && !s->eof) {
+        uint8_t sc[65536];
+        int64_t w = s->skip < (int64_t)sizeof sc ? s->skip : (int64_t)sizeof sc;
+        int64_t g = src_decode(s, sc, w);
+        if (g < 0) return -1;
+        if (g == 0) break;                            /* eof before the skip completed */
+        s->skip -= g;
+    }
+    return src_decode(s, dst, max);
 }
 
 static void source_close(Source *s){
@@ -526,8 +544,12 @@ static void run_task(Task *t){
         int64_t nmemb = scan_window_emit(t->sched, buf, M, &e, &zero);
         int fin = zero || s->eof;                    /* zero-block or source EOF */
         int oversized = (nmemb == 0 && e == 0 && !fin);  /* member > window buffer */
-        uint8_t done = (fin || oversized) ? 1 : 0;   /* control: always 1 byte after rows */
-        emit_data(t->sched, 2, &done, 1);
+        uint8_t ctrl[9];                              /* control: [done][e i64] — e is the
+                                                       * decompressed bytes this window
+                                                       * covered (member-aligned), so the
+                                                       * driver can track absolute offsets */
+        ctrl[0] = (fin || oversized) ? 1 : 0; memcpy(ctrl + 1, &e, 8);
+        emit_data(t->sched, 2, ctrl, 9);
         if (oversized) { t->res = -EMSGSIZE; break; }
         int64_t clen = M - e;                        /* carry the trailing partial */
         if (clen > (int64_t)s->carry_cap) {
@@ -894,6 +916,7 @@ static void run_thread(Sched *S, Thread *t){
             const char *ckpt = (I->dpath && I->dpath[0]) ? I->dpath : NULL;
             int rc = source_open(&S->src[I->lo], I->path, I->payload, I->payload_len,
                                  ckpt, I->mode > 0, I->cap);   /* mode=resume, cap=interval */
+            if (!rc && I->mode > 0) S->src[I->lo].skip = I->buf_off;  /* re-align skip */
             if (rc) S->failed = S->failed ? S->failed : rc;
             tr_log(S, tt, tr_now(), t->tid, OP_SRC_OPEN, I->lo, 0, 0, 0);
             t->pc++; break;
@@ -1130,10 +1153,19 @@ static void qvm_open(Sched *S, int arch_fd, int *sink_fds, int nsinks,
  * its threads (the in-flight prefetch loader keeps running on the workers DURING
  * this blocking read — that is the overlap); otherwise reap a completion and
  * resume its thread. Runs until nothing is ready, pending, or in flight. */
+/* Bound tasks pushed to S->tasks before draining completions. A batch can ready
+ * a huge thread set at once (unpack: one fiber per frame — 100k+ for a big nock);
+ * running them all would push >QCAP tasks into the bounded task ring and clobber
+ * in-flight slots. Cap in-flight below QCAP so both the task and completion rings
+ * stay bounded; the scheduler drains a completion each outer iteration, so ready
+ * threads left un-run resume as slots free — backpressure, no deadlock (workers
+ * always drain S->tasks independently of the scheduler making more). */
+#define INFLIGHT_MAX (QCAP / 2)
+
 static void run_sched(Sched *S){
     for (;;) {
         Thread *t;
-        while ((t = ready_pop(S))) run_thread(S, t);
+        while (S->inflight < INFLIGHT_MAX && (t = ready_pop(S))) run_thread(S, t);
         /* PUSH model: run until Python closes stdin (reader EOF) AND all work
          * drained. When idle but stdin still open, tq_pop blocks for the next
          * pushed batch — so an empty ready queue is a pause, not termination. */

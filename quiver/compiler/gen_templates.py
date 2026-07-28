@@ -25,6 +25,27 @@ SCHEMAS = {
     # child_count: -1 on a normal stat row; >=0 marks a directory
     # close-event (path=dir, is_dir=1) carrying its emitted-child count,
     # emitted at getdents-EOF only when the scan is asked for closes.
+    # bvm's STAT stream (SCAN_FS / SCAN_NAMES / OPEN_TAR -> planner). SUPERSET of
+    # qvm's STAT (= pwalk2/ducl's Feather schema: the inode graph + full timestamps)
+    # plus blocks' own columns — so ducl can consume bvm scans directly. `link` is ""
+    # for plain files, the target for symlinks, the canonical path for hardlinks
+    # (kind rides in in_off: 0=symlink, 1=hardlink); OPEN_TAR uses in_off as the
+    # member's offset in its frame. Fields a mode doesn't know (names-only scan,
+    # tar without inode data) are zero. Replaces a hand-rolled row encoding that
+    # Python re-parsed per row (~17x slower than native Arrow).
+    "BSTAT": ([("path","large_string"),("link","large_string"),("in_off","i64"),
+               ("size","i64"),("blocks","i64"),
+               ("mtime_ns","i64"),("atime_ns","i64"),("ctime_ns","i64"),
+               ("ino","u64"),("parent_ino","u64"),("dev","u64"),
+               ("mode","i32"),("uid","i32"),("gid","i32"),("nlink","i32"),
+               ("depth","i32"),("is_dir","u8"),
+               ("digest","i64"),("chunks","large_binary")],
+              # digest: whole-file BLAKE2b-64 (-1 = absent). chunks: FastCDC manifest
+              # [u32 n][n x (u32 len, u64 hi, u64 lo)] — 128-bit two-seed chunk ids,
+              # empty for files < 128K (they ARE their single chunk). APPENDED so all
+              # existing BSTAT buffer indexes (0-35) stay stable.
+              [["a","bb"],["c","dd"]] + [[1,2]]*6 + [[3,4]]*3 + [[5,6]]*5
+              + [[0,1]] + [[7,8]] + [[b"x",b"yy"]]),
     "STAT": ([("path","large_string"),("size","i64"),("blocks","i64"),
               ("mtime_ns","i64"),("atime_ns","i64"),("ctime_ns","i64"),
               ("ino","u64"),("parent_ino","u64"),("dev","u64"),

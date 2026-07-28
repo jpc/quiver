@@ -24,8 +24,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 import polars as pl
 import zstandard as zstd
 
-from . import zframe
-
 _MIME = {"json": "application/json", "jsonl": "application/json",
          "txt": "text/plain", "wav": "audio/wav", "mp3": "audio/mpeg",
          "opus": "audio/ogg", "flac": "audio/flac"}
@@ -34,7 +32,11 @@ _MIME = {"json": "application/json", "jsonl": "application/json",
 class Archive:
     def __init__(self, path: str):
         self.path = path
-        idx = zframe.read_index(path)
+        from ..exec import blocks
+        self.files = blocks.store_files(path)           # a sharded store is out + out.1 + ...
+        idx = blocks.scan_nock(path).filter(pl.col("frame") >= 0)   # chunked footer, files only
+        if "shard" not in idx.columns:
+            idx = idx.with_columns(shard=pl.lit(0, pl.Int64))
         self.idx = idx.with_row_index("id").with_columns(
             name=pl.col("path").str.split("/").list.last(),
             ext=pl.col("path").str.extract(r"\.([^./]+)$", 1)
@@ -45,25 +47,29 @@ class Archive:
         self._cache: dict[int, bytes] = {}
         self._order: list[int] = []
 
-    def _frame(self, coff: int, clen: int) -> bytes:
+    # Sharded stores put a frame in `out.<shard>`, so a reader that only ever opens `out`
+    # returns the wrong bytes for every member outside shard 0 — silently, since a wrong
+    # offset in another file usually still inflates.
+    def _frame(self, shard: int, coff: int, clen: int) -> bytes:
+        key = (shard, coff)                   # NOT coff alone: offsets repeat across shards
         with self._lock:
-            hit = self._cache.get(coff)
+            hit = self._cache.get(key)
             if hit is not None:
                 return hit
-        with open(self.path, "rb") as f:      # concurrent readers, own fd
+        with open(self.files[shard], "rb") as f:      # concurrent readers, own fd
             f.seek(coff)
             comp = f.read(clen)
         raw = self._dctx.decompress(comp)
         with self._lock:
-            self._cache[coff] = raw
-            self._order.append(coff)
+            self._cache[key] = raw
+            self._order.append(key)
             while len(self._order) > 12:
                 self._cache.pop(self._order.pop(0), None)
         return raw
 
     def member(self, i: int):
         r = self.idx.row(i, named=True)
-        raw = self._frame(r["frame_coff"], r["frame_clen"])
+        raw = self._frame(r["shard"], r["coff"], r["clen"])
         return raw[r["in_off"]: r["in_off"] + r["size"]], r
 
     def query(self, q, ext, coll, offset, limit):

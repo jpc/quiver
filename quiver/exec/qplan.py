@@ -523,6 +523,14 @@ def _np_gather(boff, rng, hl, frame_bytes, buf_id, buf=None):
         t[0::3] = r_buf[a:b] if r_buf is not None else buf_id
         t[1::3] = r_off[a:b]; t[2::3] = r_len[a:b]
         payloads[int(r_frame[a])] = t.tobytes()
+    # densify: `frame = c // frame_bytes` is SPARSE — a member whose footprint
+    # exceeds frame_bytes jumps the counter, so `uf` skips values. Downstream frame
+    # accounting advances frame_base by the frame COUNT and per-shard footers record
+    # contiguous id ranges, both of which assume dense ids; remap uf -> 0..nf-1.
+    if len(uf) and uf[-1] != len(uf) - 1:               # gaps ⟺ a member > frame_bytes
+        frame = np.searchsorted(uf, frame)              # sparse id -> dense rank
+        payloads = {int(np.searchsorted(uf, k)): v for k, v in payloads.items()}
+        uf = np.arange(len(uf), dtype=np.int64)
     return frame, in_off, uf, clen, payloads
 
 
@@ -728,7 +736,7 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
 
     def driver(vm):
         push_scan(vm, 0, first=True)                 # open + scan window 0
-        rows = vm.read_rows(); done = vm.read_done()
+        rows = vm.read_rows(); done, _ = vm.read_done()
         k, group = 0, []
         while True:
             group.append((k % R, rows))              # this window's slot + rows
@@ -739,7 +747,7 @@ def recompress_zst_window_push(src_path: str, out_path: str, qvm_exe: str,
                 group = []
             if done:
                 break
-            rows = vm.read_rows(); done = vm.read_done()
+            rows = vm.read_rows(); done, _ = vm.read_done()
             k += 1
 
     open(out_path, "wb").close()
@@ -850,7 +858,7 @@ def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
              "mode": 1 if resume else 0, "cap": ckpt_interval},
             {"tid": 0, "_sub": 1, "op": OP_ALLOC, "buf_id": 0, "cap": cap},
             {"tid": 0, "_sub": 2, "op": OP_SRC_SCAN, "lo": 0, "buf_id": 0, "len": cap}])]))
-        rows = vm.read_rows(); done = vm.read_done()
+        rows = vm.read_rows(); done, _ = vm.read_done()
         while True:
             batch, rotated = build(rows, done, scan_next=not done)
             for gk, slot, idx, mem, frames in rotated:
@@ -858,7 +866,7 @@ def recompress_sharded(src_path: str, out_dir: str, qvm_exe: str, shard_key,
             vm.push(batch)
             if done:
                 break
-            rows = vm.read_rows(); done = vm.read_done()
+            rows = vm.read_rows(); done, _ = vm.read_done()
         for gk, st in G.items():                     # final open shards
             if st["members"]:
                 manifest.append([shard_path(gk, st["idx"]), gk, st["idx"],
@@ -1408,9 +1416,12 @@ class _PushVM:
         m = self._msg(); assert m and m[0] == 0, m
         return ipc.read_all(m[1])
 
-    def read_done(self) -> bool:                 # kind 2: the window done flag
+    def read_done(self):                         # kind 2: (done flag, window bytes e)
         m = self._msg(); assert m and m[0] == 2, m
-        return bool(m[1][0]) if m[1] else True
+        p = m[1]
+        done = bool(p[0]) if p else True
+        e = struct.unpack_from("<q", p, 1)[0] if len(p) >= 9 else 0
+        return done, e
 
 
 def push_exec(driver, qvm_exe: str, arch_path: str = "-",

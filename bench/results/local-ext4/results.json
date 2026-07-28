@@ -1,0 +1,211 @@
+{
+ "env": {
+  "host": "pg11b-5-5-hpc6",
+  "dir": "/tmp/claude-50001/-mnt-weka-jpc-src-quiver/94f8ec2d-13d4-4bcc-be57-98b70204e1a8/scratchpad/localbench",
+  "fstype": "ext2/ext3",
+  "cpus": 64,
+  "mem_gb": 251,
+  "kernel": "5.15.0-177-generic",
+  "date": "2026-07-28 11:17",
+  "args": {
+   "out": "results/local-ext4",
+   "dir": "/tmp/claude-50001/-mnt-weka-jpc-src-quiver/94f8ec2d-13d4-4bcc-be57-98b70204e1a8/scratchpad/localbench",
+   "only": "read,dirspread,cdc",
+   "srun": "",
+   "gb": 1,
+   "threads": [
+    4,
+    8,
+    16,
+    32
+   ],
+   "chunks": [
+    1,
+    2,
+    4,
+    8,
+    16
+   ],
+   "sinks": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+   ],
+   "scan_dirs": 200,
+   "scan_per_dir": 100,
+   "tree": null,
+   "numa_mb": 48,
+   "dirspread": [
+    1,
+    4,
+    16,
+    64,
+    256
+   ],
+   "dir_files": 20000,
+   "dir_file_kb": 16,
+   "cdc_mb": 128,
+   "nodes": null,
+   "node_counts": [
+    1,
+    2,
+    4
+   ],
+   "srun_base": "srun -p gpu -G 8 -N 1 -n 1 --mem=0 --time=30",
+   "workers": 32,
+   "level": 6,
+   "report": null
+  }
+ },
+ "fsbw": {
+  "threads": {
+   "4": 0.56,
+   "8": 0.6,
+   "16": 0.59,
+   "32": 0.55
+  },
+  "chunk_mb": {
+   "1": 0.52,
+   "2": 0.53,
+   "4": 0.51,
+   "8": 0.53
+  },
+  "sinks": {
+   "1": 0.52,
+   "2": 0.55,
+   "4": 0.59,
+   "8": 0.55,
+   "16": 0.57
+  },
+  "mode": {
+   "separate_direct": 0.64,
+   "separate_buffered": 0.65,
+   "one_sink_direct": 0.68,
+   "one_sink_buffered": 0.47
+  },
+  "best_threads": 8,
+  "best_chunk_mb": 2
+ },
+ "scan": {
+  "readdir_dtype": 1029537.0,
+  "readdir_lstat": 285685.0,
+  "getdents64_dtype": 1071032.0,
+  "files": 20000
+ },
+ "hashes": {
+  "xxh64 two-seed (128b)": 3.89,
+  "BLAKE2b-128 (sodium)": 0.86,
+  "BLAKE2b-256 (sodium)": 0.86,
+  "SHA-256 (sodium)": 0.28,
+  "SipHash64 (reference)": 1.99,
+  "BLAKE3": 2.12
+ },
+ "crypto": {
+  "keyed-BLAKE2b-256": 0.86,
+  "XChaCha20-Poly1305": 1.24,
+  "AES-256-GCM (NI)": 1.81
+ },
+ "numa": {
+  "none": 1.29,
+  "none_end_to_end": 0.83,
+  "cpuonly": 1.25,
+  "cpuonly_end_to_end": 0.88,
+  "local": 1.39,
+  "local_end_to_end": 0.79,
+  "interleave": 1.48,
+  "interleave_end_to_end": 0.74,
+  "remote": 1.46,
+  "remote_end_to_end": 0.84
+ },
+ "quiver": {
+  "seconds": 4.4,
+  "files": 4096,
+  "store_gb": 0.82,
+  "gb_per_s": 0.187,
+  "errors": 0,
+  "lost": 0,
+  "perf": {
+   "util": 0.18,
+   "busy_ns": {
+    "read": 577573521,
+    "compress": 209754696,
+    "decompress": 0,
+    "write": 6221846929,
+    "hash": 955465634,
+    "open/create": 28836101,
+    "metadata": 0,
+    "unlink": 0
+   },
+   "wall_s": 2.8,
+   "workers": 16,
+   "rd_gb": 0.82,
+   "wr_gb": 0.82,
+   "comp_ratio": 1.0
+  },
+  "hints": [
+   "worker utilization 18% of 16 workers; busy split: write 78%  hash 12%  read 7%  compress 3%",
+   "BANDWIDTH-BOUND: read 1.42 GB/s, write 0.13 GB/s (per-op avg)",
+   "scan: 4,160 stats avg 3us",
+   "job queue full 30%+ of the time: workers saturated (this is good scaling)",
+   "incompressible fast-path: 819 raw frames, 0.8 GB stored codec-free (unpack = pure fs-to-fs)",
+   "queues: jobq 50% full (46% saturated, 48% empty) | workers busy 9.7/16 (61%) | scanq 0 dirs | packbuf 0% | blockbuf 0%",
+   "BOTTLENECK = WORKERS (61% engaged, queue saturated 46%): this node is the limit \u2014 ADD NODES (per-node fabric/CPU is saturated, more threads won't help)"
+  ],
+  "workers": 16,
+  "level": 6
+ },
+ "read": {
+  "threads": {
+   "4": 3.53,
+   "8": 3.53,
+   "16": 3.54,
+   "32": 3.54
+  },
+  "mode": {
+   "separate_direct": 3.55,
+   "separate_buffered": 3.49,
+   "one_file_direct": 3.54,
+   "one_file_buffered": 2.72
+  }
+ },
+ "dirspread": {
+  "create": {
+   "1": 26283.0,
+   "4": 75420.0,
+   "16": 147710.0,
+   "64": 151592.0,
+   "256": 151888.0
+  },
+  "stat": {
+   "1": 7838012.0,
+   "4": 6897006.0,
+   "16": 9449278.0,
+   "64": 10127041.0,
+   "256": 9579458.0
+  },
+  "unlink": {
+   "1": 46782.0,
+   "4": 128350.0,
+   "16": 133578.0,
+   "64": 137645.0,
+   "256": 144670.0
+  },
+  "write_gbs": {
+   "1": 0.3,
+   "4": 0.84,
+   "16": 1.16,
+   "64": 1.19,
+   "256": 1.21
+  }
+ },
+ "cdc": {
+  "chunk_gbs": 1.6,
+  "chunk_hash_gbs": 1.35,
+  "delta_send_mb": 0.029,
+  "delta_pct": 0.02,
+  "file_mb": 128
+ }
+}

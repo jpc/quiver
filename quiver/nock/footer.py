@@ -35,7 +35,14 @@ MAGIC = b"NOCKIDX1"
 # then records the total footer-region byte SPAN (not the IPC length) and this
 # magic; the reader walks the frames and concatenates their payloads.
 MAGIC_MULTI = b"NOCKIDXM"
-TRAILER_LEN = 8 + len(MAGIC)          # both magics are 8 bytes
+# The current footer format (blocks): the STAT table is split into fixed-row Arrow-IPC
+# batches, each independently zstd-compressed (paths are mostly shared prefixes, ~15x)
+# and wrapped in its own zstd skippable frame; a final skippable frame holds an
+# uncompressed DIRECTORY (per batch: absolute offset, clen, first row, nrow) so a reader
+# can inflate ONE batch without the rest. Trailer `[u64 dir_clen][NOCKZC01]`. The raw
+# NOCKIDX1/M pair above is retired for WRITING; kept only for reading legacy archives.
+MAGIC_CHUNK = b"NOCKZC01"
+TRAILER_LEN = 8 + len(MAGIC)          # all magics are 8 bytes
 ARROW_MAGIC = b"ARROW1"
 
 FOOTER_COLS = ["path", "offset", "data_offset", "size", "read_size",

@@ -1,11 +1,15 @@
 __pycache__/
 *.pyc
 quiver/exec/quiver-exec
+quiver/exec/bvm
 quiver/exec/ipc_gen.h
 *.wal
 *.wal.done
 dist/
 *.egg-info/
+
+# chat logs / scratch
+.claude/
 
 # large data archives (never commit)
 *.tar.zstd

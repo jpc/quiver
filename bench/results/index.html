@@ -1,0 +1,50 @@
+<title>quiver bench · comparison</title>
+<style>
+:root{--ink:#12161b;--paper:#fafbfc;--card:#fff;--muted:#5b6672;--rule:#e3e8ed;
+--accent:#0d7490;--accent-soft:#0d74901a;--warn:#a8442a;--warn-soft:#a8442a14}
+@media (prefers-color-scheme:dark){:root{--ink:#e7edf3;--paper:#0e1216;--card:#151b21;
+--muted:#93a1b0;--rule:#232c35;--accent:#38b6d4;--accent-soft:#38b6d422;--warn:#e08b62;--warn-soft:#e08b6218}}
+:root[data-theme=dark]{--ink:#e7edf3;--paper:#0e1216;--card:#151b21;--muted:#93a1b0;
+--rule:#232c35;--accent:#38b6d4;--accent-soft:#38b6d422;--warn:#e08b62;--warn-soft:#e08b6218}
+:root[data-theme=light]{--ink:#12161b;--paper:#fafbfc;--card:#fff;--muted:#5b6672;
+--rule:#e3e8ed;--accent:#0d7490;--accent-soft:#0d74901a;--warn:#a8442a;--warn-soft:#a8442a14}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:44px 22px 80px}
+code,.mono,td.n,th.n{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+font-variant-numeric:tabular-nums}
+h1{font-size:30px;line-height:1.15;margin:0 0 6px;letter-spacing:-.02em;text-wrap:balance}
+h2{font-size:20px;margin:44px 0 4px;letter-spacing:-.01em}
+h3{font-size:15px;margin:26px 0 8px;font-weight:600}
+.eyebrow{font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);
+font-weight:600;margin:0 0 10px}
+.sub{color:var(--muted);font-size:13.5px;margin:0 0 2px}
+.sub code{font-size:12.5px}
+.lede{color:var(--muted);max-width:66ch;margin:6px 0 0}
+.card{background:var(--card);border:1px solid var(--rule);border-radius:9px;padding:18px 20px;margin:14px 0}
+.verdict{border-left:3px solid var(--accent)}
+.verdict ul{margin:8px 0 0;padding-left:20px}
+.verdict li{margin:9px 0;max-width:78ch}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:11px;letter-spacing:.08em;
+text-transform:uppercase;padding:0 10px 7px 0;border-bottom:1px solid var(--rule);white-space:nowrap}
+td{padding:6px 10px 6px 0;border-bottom:1px solid var(--rule);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+td.n,th.n{text-align:right;white-space:nowrap}
+.bar{position:relative;min-width:120px;width:100%}
+.bar i{display:block;height:9px;border-radius:2px;background:var(--accent);opacity:.85}
+.bar.w i{background:var(--warn)}
+.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;
+background:var(--accent-soft);color:var(--accent);font-weight:600;white-space:nowrap}
+.badge.w{background:var(--warn-soft);color:var(--warn)}
+.kv{display:flex;flex-wrap:wrap;gap:6px 26px;margin:10px 0 0;font-size:13px;color:var(--muted)}
+.kv b{color:var(--ink);font-weight:600}
+.note{font-size:13px;color:var(--muted);margin:10px 0 0;max-width:74ch}
+.foot{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--muted)}
+a{color:var(--accent)}
+</style>
+<div class="wrap"><p class="eyebrow">quiver benchmark</p><h1>Filesystem comparison</h1><p class="lede">The same suite, the same binaries, different storage. Every tuning recommendation quiver makes is derived per-filesystem — these two sites disagree on nearly all of them.</p><div class="grid"><div class="card"><h3><a href="iren-weka/report.html">UNKNOWN (0x18031977)</a> <span class="badge">iren-weka</span></h3><div class="kv"><span>peak write <b>7.30</b> GB/s</span><span>sink gain <b>3.2×</b></span><span>64 CPUs</span></div><p class="note">pg11b-5-5-hpc6 · 2026-07-28 16:39</p></div><div class="card"><h3><a href="local-ext4/report.html">ext2/ext3</a> <span class="badge">local-ext4</span></h3><div class="kv"><span>peak write <b>0.60</b> GB/s</span><span>sink gain <b>1.1×</b></span><span>64 CPUs</span></div><p class="note">pg11b-5-5-hpc6 · 2026-07-28 11:17</p></div></div><h2>Sink count: where the filesystems disagree</h2><p class="lede">Concurrent writers into one file versus many. This single measurement changes quiver's recommended <code>--shards</code> from 1 to 32.</p><div class="grid"><div class="card"><h3>UNKNOWN (0x18031977)</h3><div class="tbl"><table><thead><tr><th>sinks</th><th class="n">GB/s</th><th style="width:52%"></th></tr></thead><tbody><tr><td class="mono">1</td><td class="n">1.81</td><td><div class="bar w"><i style="width:31.0%"></i></div></td></tr><tr><td class="mono">2</td><td class="n">2.52</td><td><div class="bar"><i style="width:43.2%"></i></div></td></tr><tr><td class="mono">4</td><td class="n">2.84</td><td><div class="bar"><i style="width:48.7%"></i></div></td></tr><tr><td class="mono">8</td><td class="n">3.63</td><td><div class="bar"><i style="width:62.3%"></i></div></td></tr><tr><td class="mono">16</td><td class="n">4.58</td><td><div class="bar"><i style="width:78.6%"></i></div></td></tr><tr><td class="mono">32</td><td class="n">5.83</td><td><div class="bar"><i style="width:100.0%"></i></div></td></tr></tbody></table></div></div><div class="card"><h3>ext2/ext3</h3><div class="tbl"><table><thead><tr><th>sinks</th><th class="n">GB/s</th><th style="width:52%"></th></tr></thead><tbody><tr><td class="mono">1</td><td class="n">0.52</td><td><div class="bar w"><i style="width:88.1%"></i></div></td></tr><tr><td class="mono">2</td><td class="n">0.55</td><td><div class="bar"><i style="width:93.2%"></i></div></td></tr><tr><td class="mono">4</td><td class="n">0.59</td><td><div class="bar"><i style="width:100.0%"></i></div></td></tr><tr><td class="mono">8</td><td class="n">0.55</td><td><div class="bar"><i style="width:93.2%"></i></div></td></tr><tr><td class="mono">16</td><td class="n">0.57</td><td><div class="bar"><i style="width:96.6%"></i></div></td></tr></tbody></table></div></div></div><h2>Write bandwidth vs threads</h2><div class="grid"><div class="card"><h3>UNKNOWN (0x18031977)</h3><div class="tbl"><table><thead><tr><th>threads</th><th class="n">GB/s</th><th style="width:52%"></th></tr></thead><tbody><tr><td class="mono">4</td><td class="n">1.89</td><td><div class="bar"><i style="width:25.9%"></i></div></td></tr><tr><td class="mono">8</td><td class="n">3.43</td><td><div class="bar"><i style="width:47.0%"></i></div></td></tr><tr><td class="mono">16</td><td class="n">5.79</td><td><div class="bar"><i style="width:79.3%"></i></div></td></tr><tr><td class="mono">32</td><td class="n">6.65</td><td><div class="bar"><i style="width:91.1%"></i></div></td></tr><tr><td class="mono">64</td><td class="n">7.30</td><td><div class="bar"><i style="width:100.0%"></i></div></td></tr></tbody></table></div></div><div class="card"><h3>ext2/ext3</h3><div class="tbl"><table><thead><tr><th>threads</th><th class="n">GB/s</th><th style="width:52%"></th></tr></thead><tbody><tr><td class="mono">4</td><td class="n">0.56</td><td><div class="bar"><i style="width:93.3%"></i></div></td></tr><tr><td class="mono">8</td><td class="n">0.60</td><td><div class="bar"><i style="width:100.0%"></i></div></td></tr><tr><td class="mono">16</td><td class="n">0.59</td><td><div class="bar"><i style="width:98.3%"></i></div></td></tr><tr><td class="mono">32</td><td class="n">0.55</td><td><div class="bar"><i style="width:91.7%"></i></div></td></tr></tbody></table></div></div></div><div class="foot">Generated by <code>quiver/bench/report_html.py</code> from <code>results.json</code>. Numbers are specific to this filesystem, client configuration and node — re-run with <code>./run_bench.py --out results/&lt;site&gt; --dir &lt;path&gt;</code> before tuning anything.</div></div>
