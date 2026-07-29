@@ -79,7 +79,19 @@ static int tcp_connect(const char *hostport){       /* "host:port" -> connected 
     freeaddrinfo(res); return fd;
 }
 static char g_dest[4096]; static size_t g_destlen;
-typedef struct { uint64_t frame_id, coff, clen; } Done;
+static int64_t now_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000000000LL+t.tv_nsec; }
+static int64_t g_start_ns;                        /* frame times are relative to it */
+/* PER-FRAME record. A 1 Hz sampler blurs exactly what you want to see -- which subtree was
+ * expensive, which worker stalled, how deep the queue was when a frame started -- so every
+ * frame carries its own cost instead. The planner knows frame_id -> path, so no strings
+ * cross the wire, and it writes the whole table to a SIDECAR next to the store: the archive
+ * format stays untouched and the telemetry is optional to keep. 64 B/frame, i.e. 36 MB for
+ * a 556k-frame whole-home backup. */
+typedef struct {
+    uint64_t frame_id, coff, clen;
+    int64_t  t0_ns, t1_ns, in_bytes;                 /* start/end relative to g_start_ns */
+    int32_t  jq_depth, busy, worker, sink;           /* queue state WHEN THE FRAME STARTED */
+} Done;
 static Done *g_done; static int g_ndone, g_donecap; static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int ensure(uint8_t **b, size_t *cap, size_t need) {
@@ -155,11 +167,15 @@ static int read_full(int fd, void *buf, size_t n) {
     return 1;
 }
 #define RD(T, p) ({ T _v; memcpy(&_v, (p), sizeof(T)); (p) += sizeof(T); _v; })
-static void record_done(uint64_t f, uint64_t coff, uint64_t clen) {
+static void record_done_x(uint64_t f, uint64_t coff, uint64_t clen, int64_t t0, int64_t in_b,
+                          int32_t jq, int32_t busy, int32_t worker, int32_t sink) {
     pthread_mutex_lock(&g_done_mu);
     if (g_ndone == g_donecap) { g_donecap = g_donecap ? g_donecap * 2 : 1024; g_done = realloc(g_done, g_donecap * sizeof(Done)); }
-    g_done[g_ndone++] = (Done){ f, coff, clen }; pthread_mutex_unlock(&g_done_mu);
+    g_done[g_ndone++] = (Done){ f, coff, clen, t0, now_ns() - g_start_ns, in_b, jq, busy, worker, sink };
+    pthread_mutex_unlock(&g_done_mu);
 }
+#define record_done(f, coff, clen) \
+    record_done_x((f), (coff), (clen), w->jt0, (int64_t)len, w->jjq, w->jbusy, w->id, (int32_t)sink_id)
 
 /* ------------------------------------------------------------------ perf stats */
 /* Always-on counters at every cost center; emitted as ONE type-4 message at exit so the
@@ -208,8 +224,6 @@ static void wshrink(uint8_t **b, size_t *cap) {
     if (*cap > (size_t)SHRINK_CAP) { free(*b); *b = NULL; *cap = 0; }
 }
 #define ST(f, v) __atomic_fetch_add(&g_st.f, (int64_t)(v), __ATOMIC_RELAXED)
-static int64_t now_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000000000LL+t.tv_nsec; }
-static int64_t g_start_ns;
 
 /* ------------------------------------------------------------------ content digests */
 /* Digests: BLAKE3 (static libblake3, runtime-dispatched SSE2/SSE4.1/AVX2/AVX512) — 4.5 GB/s
@@ -632,7 +646,8 @@ static void blk_retire(uint64_t id){ pthread_mutex_lock(&g_blk_mu); BBlock *b=bl
 /* ------------------------------------------------------------------ workers */
 typedef struct { ZSTD_CCtx *c; ZSTD_DCtx *d; uint8_t *cb; size_t ccap; uint8_t *ob; size_t ocap;
                  uint8_t *mb; size_t mbcap; uint8_t *ctb; size_t ctcap; uint8_t *sb; size_t sbcap;
-                 int64_t files; int err; } W;
+                 int64_t files; int err;
+                 int id; int64_t jt0; int32_t jjq, jbusy; } W;   /* per-frame cost accounting */
 /* STREAMING whole-file BLAKE3 + CDC manifest, in a fixed window instead of the whole file.
  * The manifest job used to materialize the entire file to hash it — the same unbounded
  * allocation that made a giant member OOM the pack path. BLAKE3 is incremental and FastCDC
@@ -838,6 +853,9 @@ static void *worker(void *arg) {
     W *w = arg; char full[4096];
     for (;;) {
         Job *j = jq_pop(&g_jq); if (!j) break;
+        w->jt0 = now_ns() - g_start_ns;                  /* queue state AT START, not at end: */
+        w->jjq = (int32_t)g_jq.n;                        /* a frame that waited on a full queue */
+        w->jbusy = (int32_t)__atomic_load_n(&g_busy, __ATOMIC_RELAXED);   /* is the thing to see */
         __atomic_fetch_add(&g_busy, 1, __ATOMIC_RELAXED);
         if (j->kind == J_COPY_BLOCK) {
             BBlock *b = blk_get(j->block_id);               /* ref held since enqueue -> present */
@@ -1255,7 +1273,7 @@ static void *rx_reader(void *a) {
             if (pwrite_all(sk->fd, comp, (size_t)clen, coff)) {
                 char fb[64]; snprintf(fb, sizeof fb, "rx frame %llu", (unsigned long long)fid);
                 emit_err(fb, errno ? -errno : -EIO); continue; }
-            record_done(fid, (uint64_t)coff, clen);
+            record_done_x(fid, (uint64_t)coff, clen, 0, (int64_t)clen, 0, 0, -1, 0);
         }
     }
     if (dc) ZSTD_freeDCtx(dc); close(fd); free(ctb); free(mb); free(ob); return NULL;
@@ -1309,8 +1327,33 @@ static void scan_flush(ScanCtx *c){ emit_bstat(c->sid, -1, &c->bc); } /* hold c-
  * constraint; persistently EMPTY => its producer is. Sums / q_samples in the report. */
 static volatile int g_sampling = 1;
 extern int g_busy;
+static int g_nworkers;
+/* type-4 STATS: the whole counter block. Every counter is CUMULATIVE, so the planner
+ * differences consecutive samples to get per-interval rates. Emitted once a second as well
+ * as at exit: a whole-run average blends phases that behave nothing alike (1.8M small files
+ * are metadata-bound, 9k multi-GB files are bandwidth-bound) and reports a single blurred
+ * bottleneck for both. */
+static void emit_stats(void) {
+    int64_t st_[40] = { g_st.rd_bytes, g_st.wr_bytes, g_st.comp_in, g_st.comp_out,
+        g_st.dcomp_out, g_st.ns_read, g_st.ns_comp, g_st.ns_dcomp, g_st.ns_write,
+        g_st.ns_hash, g_st.n_open, g_st.ns_open, g_st.slow_open, g_st.n_meta,
+        g_st.ns_meta, g_st.n_unlink, g_st.ns_unlink, g_st.scan_entries,
+        g_st.ns_scan_stat, g_st.ns_idle, g_st.ns_emit, g_st.ns_qfull,
+        g_st.n_raw_frames, g_st.raw_bytes, g_st.cfr_bytes, g_st.n_probe, g_st.probe_in,
+        g_st.q_samples, g_st.jq_sum, g_st.jq_full, g_st.jq_empty, g_st.dq_sum,
+        g_st.busy_sum, g_st.pack_used_sum, g_st.blk_live_sum,
+        (int64_t)g_jq.cap, g_pack_budget, g_budget,
+        now_ns() - g_start_ns, (int64_t)g_nworkers };
+    uint32_t body = 1 + sizeof st_; uint8_t hdr4[5];
+    memcpy(hdr4, &body, 4); hdr4[4] = 4;
+    pthread_mutex_lock(&g_out_mu);
+    write_all(1, hdr4, 5); write_all(1, st_, sizeof st_);
+    pthread_mutex_unlock(&g_out_mu);
+}
+
 static void *sampler(void *unused) {
     (void)unused;
+    int64_t tick = 0;
     while (__atomic_load_n(&g_sampling, __ATOMIC_RELAXED)) {
         int n = g_jq.n, cap = g_jq.cap;
         ST(q_samples, 1); ST(jq_sum, n);
@@ -1319,6 +1362,7 @@ static void *sampler(void *unused) {
         ST(dq_sum, g_dq.n);
         ST(busy_sum, __atomic_load_n(&g_busy, __ATOMIC_RELAXED));
         ST(pack_used_sum, g_pack_used); ST(blk_live_sum, g_live);
+        if (++tick % 100 == 0) emit_stats();          /* 100 ticks x 10ms = one sample/second */
         struct timespec ts = {0, 10 * 1000 * 1000};
         nanosleep(&ts, NULL);
     }
@@ -1597,7 +1641,8 @@ static char *readstr(uint8_t **p){ uint16_t l=RD(uint16_t,*p); char *s=malloc(l+
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: bvm <nworkers> <budget_mb>\n"); return 2; }
-    int nw = atoi(argv[1]); g_budget = atoll(argv[2]) << 20; if (g_budget <= 0) g_budget = 512LL << 20;
+    int nw = atoi(argv[1]);
+    g_nworkers = nw;                                 /* emit_stats() runs on the sampler thread */ g_budget = atoll(argv[2]) << 20; if (g_budget <= 0) g_budget = 512LL << 20;
     for (int i = 0; i < 1024; i++) g_nock_fds[i] = -1;
     { char *q = getenv("BVM_URING_QD"); if (q) { g_uring_qd = atoi(q); if (g_uring_qd < 64) g_uring_qd = 64;
         if (g_uring_qd > 32768) g_uring_qd = 32768; } }
@@ -1816,28 +1861,12 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nw; i++) { pthread_join(th[i], 0); files += ws[i].files; if (ws[i].err && !err) err = ws[i].err;
         ZSTD_freeCCtx(ws[i].c); ZSTD_freeDCtx(ws[i].d); free(ws[i].cb); free(ws[i].ob); free(ws[i].mb); free(ws[i].ctb); free(ws[i].sb); }
     __atomic_store_n(&g_sampling, 0, __ATOMIC_RELAXED); pthread_join(smp, 0);
-    {   /* type-4 STATS: fixed array of i64 counters + wall + nworkers (planner parses) */
-        int64_t st_[40] = { g_st.rd_bytes, g_st.wr_bytes, g_st.comp_in, g_st.comp_out,
-            g_st.dcomp_out, g_st.ns_read, g_st.ns_comp, g_st.ns_dcomp, g_st.ns_write,
-            g_st.ns_hash, g_st.n_open, g_st.ns_open, g_st.slow_open, g_st.n_meta,
-            g_st.ns_meta, g_st.n_unlink, g_st.ns_unlink, g_st.scan_entries,
-            g_st.ns_scan_stat, g_st.ns_idle, g_st.ns_emit, g_st.ns_qfull,
-            g_st.n_raw_frames, g_st.raw_bytes, g_st.cfr_bytes, g_st.n_probe, g_st.probe_in,
-            g_st.q_samples, g_st.jq_sum, g_st.jq_full, g_st.jq_empty, g_st.dq_sum,
-            g_st.busy_sum, g_st.pack_used_sum, g_st.blk_live_sum,
-            (int64_t)g_jq.cap, g_pack_budget, g_budget,
-            now_ns() - g_start_ns, (int64_t)nw };
-        uint32_t body = 1 + sizeof st_; uint8_t hdr4[5];
-        memcpy(hdr4, &body, 4); hdr4[4] = 4;
-        pthread_mutex_lock(&g_out_mu);
-        write_all(1, hdr4, 5); write_all(1, st_, sizeof st_);
-        pthread_mutex_unlock(&g_out_mu);
-    }
+    emit_stats();                                    /* final sample: the run's totals */
     if (g_apply) rx_apply_meta();                    /* links + dir metadata: after ALL rx drains */
     for (int i = 0; i < g_nsinks; i++) if (g_sinks[i].fd >= 0) close(g_sinks[i].fd);   /* flush/EOF sinks */
-    uint32_t body = 1 + 4 + g_ndone * 24; uint8_t hdr[9]; memcpy(hdr, &body, 4); hdr[4] = 2; uint32_t nd = g_ndone; memcpy(hdr + 5, &nd, 4);
+    uint32_t body = 1 + 4 + g_ndone * (uint32_t)sizeof(Done); uint8_t hdr[9]; memcpy(hdr, &body, 4); hdr[4] = 2; uint32_t nd = g_ndone; memcpy(hdr + 5, &nd, 4);
     pthread_mutex_lock(&g_out_mu); write_all(1, hdr, 9);       /* short write would desync the protocol */
-    for (int i = 0; i < g_ndone; i++) { write_all(1, &g_done[i].frame_id, 8); write_all(1, &g_done[i].coff, 8); write_all(1, &g_done[i].clen, 8); }
+    for (int i = 0; i < g_ndone; i++) write_all(1, &g_done[i], sizeof(Done));
     pthread_mutex_unlock(&g_out_mu);
     (void)err;                                       /* per-op errors are REPORTED (type 3) and the
                                                       * planner decides (strict=) — they must NOT turn

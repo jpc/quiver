@@ -109,13 +109,23 @@ def pack_footer(df, base_off: int, rows_per_batch: int = 1 << 20, level: int = 3
     return bytes(out)
 
 
+def footer_path(path: str) -> str:
+    """Where this store's footer lives. A single-file nock keeps it appended to the data, so
+    the file stays self-describing (`zstd -dc | tar` still works, standard tools skip the
+    index). A SHARDED store already spans several files, so nothing is lost by giving the
+    footer its own -- and a lot is gained: shard 0 stops being the one shard that is both data
+    and index, and the footer no longer waits on one specific shard's last frame."""
+    side = path + ".footer"
+    return side if os.path.exists(side) else path
+
+
 def read_directory(path: str, at: int | None = None, with_prev: bool = False):
     """Return the footer batch directory [(off, clen, first_row, nrow), ...], or None if
     there is no chunked footer. Reads only ~32 B/batch — no batch is decompressed.
     `at` = the file size AT SNAPSHOT TIME (its trailer end) to read an OLDER snapshot's
     footer from the append-only chain; None = the latest (file end). `with_prev` also
     returns the previous snapshot's `at` (or None)."""
-    with open(path, "rb") as f:
+    with open(footer_path(path), "rb") as f:
         end = at if at is not None else os.fstat(f.fileno()).st_size
         f.seek(end - TRAILER_LEN)
         dir_clen, magic = struct.unpack("<Q", f.read(8))[0], f.read(len(MAGIC_CHUNK))
@@ -148,7 +158,7 @@ def iter_batches(path: str, batches=None, at: int | None = None):
     import zstandard as _z
     dctx = _z.ZstdDecompressor()
     want = None if batches is None else set(batches)
-    with open(path, "rb") as f:
+    with open(footer_path(path), "rb") as f:
         for i, (off, clen, first, nrow) in enumerate(ents):
             if want is not None and i not in want:
                 continue
@@ -171,7 +181,8 @@ def snapshots(path: str):
         r = read_directory(path, at=at, with_prev=True)
         if r is None or r[0] is None:
             break
-        out.append({"at": at if at is not None else os.path.getsize(path), "time_ns": r[2],
+        out.append({"at": at if at is not None else os.path.getsize(footer_path(path)),
+                    "time_ns": r[2],
                     "root": r[3].hex() if r[3] else None,
                     "commit": r[4].hex() if r[4] else None})
         at = r[1]

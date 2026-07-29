@@ -73,7 +73,13 @@ def default_bvm():
     exe, src = os.path.join(d, "bvm"), os.path.join(d, "bvm.c")
     if not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src):
         import subprocess
-        subprocess.check_call(["make", "-C", d, "bvm"])
+        # Build to a TEMP name, then rename over the old one. Writing the executable in place
+        # replaces the text of every executor ALREADY RUNNING it -- including remote ones on a
+        # shared filesystem, where the kernel's ETXTBSY guard does not reach. That killed a
+        # 100-minute backup at 95%: an unrelated test called default_bvm(), which rebuilt.
+        # rename is atomic and leaves running processes on their original inode.
+        subprocess.check_call(["make", "-C", d, "bvm", "BVM_OUT=bvm.new"])
+        os.replace(os.path.join(d, "bvm.new"), exe)
     return exe
 
 
@@ -151,7 +157,7 @@ def verify_merkle(nock, at=None):
     if root is None:
         return dict(root=None, commit=None, batches=len(ents or []), bad=None)  # pre-merkle store
     bad = []
-    with open(nock, "rb") as f:
+    with open(_nx.footer_path(nock), "rb") as f:         # batches live with the directory
         for i, (off, clen, _fr, _nr) in enumerate(ents):
             f.seek(off)
             if hashlib.blake2b(f.read(clen), digest_size=32).digest() != leaves[i]:
@@ -369,6 +375,31 @@ def _s(s):
     b = s.encode(); return struct.pack("<H", len(b)) + b
 
 
+def frame_costs(bvms, pdf=None, root_depth=2):
+    """One row per frame: when it ran, on which worker and sink, what it cost, and how deep
+    the queue was WHEN IT STARTED. With `pdf` (the planner's frame->member table) each row
+    also gets the subtree it came from, so a slow stretch can be attributed to a path rather
+    than guessed at. This is what the 1 Hz sampler was approximating; the samples blurred a
+    metadata-bound small-file phase into a bandwidth-bound big-file one and reported a single
+    verdict that fit neither."""
+    rows = []
+    for i, b in enumerate(bvms):
+        if b.frames:
+            rows.append(pl.DataFrame(b.frames, schema=list(_Bvm.FRAME_COLS), orient="row")
+                        .with_columns(node=pl.lit(i, pl.Int32)))
+    if not rows:
+        return pl.DataFrame()
+    df = pl.concat(rows).with_columns(
+        secs=(pl.col("t1_ns") / 1e9), dur_ms=((pl.col("t1_ns") - pl.col("t0_ns")) / 1e6),
+        mb_s=(pl.col("in_bytes") / ((pl.col("t1_ns") - pl.col("t0_ns")).clip(1) / 1e9) / 1e6))
+    if pdf is not None:
+        roots = (pdf.group_by("fid").agg(pl.col("path").first())
+                 .with_columns(root=pl.col("path").str.split("/").list.head(root_depth)
+                               .list.join("/")).select(frame="fid", root="root"))
+        df = df.join(roots, on="frame", how="left")
+    return df.sort("secs")
+
+
 def perf_report(perf):
     """Turn bvm's type-4 counters into WHERE-DID-MY-TIME-GO guidance. Returns
     (summary dict, [human hint lines]). All ns_* are summed across workers."""
@@ -534,7 +565,10 @@ class _Bvm:
         self.strict = True                               # False: finish() reports, doesn't raise
         self.stats = []                                  # (sid, block, df) STATs seen during finish
                                                          # (pack workers report digests this way)
-        self.perf = None                                 # type-4 STATS from bvm exit (bottlenecks)
+        self.perf = None                                 # type-4 STATS: the LAST sample (totals)
+        self.perf_series = []                            # one per second; counters are cumulative,
+                                                         # so difference them for per-interval rates
+        self.frames = []                                 # one cost record per frame (FRAME_COLS)
         # DEDICATED stdout reader: bvm workers emit STAT/ERROR messages at ANY time (pack
         # digests, scan batches); if the planner only reads between sends, the stdout pipe
         # fills, workers block in emit under g_out_mu, the command loop stops reading stdin,
@@ -636,6 +670,9 @@ class _Bvm:
         s_ = paths if isinstance(paths, pl.Series) else pl.Series(list(paths), dtype=pl.Utf8)
         self._send(13, struct.pack("<B", 1 if removedir else 0)
                    + _ipc_bytes(s_.rename("path").to_frame()))
+    DONE_SZ = 64                                     # bvm.c: sizeof(Done)
+    FRAME_COLS = ("frame", "coff", "clen", "t0_ns", "t1_ns", "in_bytes",
+                  "jq_depth", "busy", "worker", "sink")
     PERF_FIELDS = ("rd_bytes", "wr_bytes", "comp_in", "comp_out", "dcomp_out",
                    "ns_read", "ns_comp", "ns_dcomp", "ns_write", "ns_hash",
                    "n_open", "ns_open", "slow_open", "n_meta", "ns_meta",
@@ -652,7 +689,7 @@ class _Bvm:
                 self._err(pld); continue
             if t == 4:
                 self.perf = dict(zip(self.PERF_FIELDS, struct.unpack(f"<{len(self.PERF_FIELDS)}q", pld)))
-                continue
+                self.perf_series.append(self.perf); continue
             return t, pld
     def _err(self, pld):
         err = struct.unpack_from("<i", pld, 0)[0]
@@ -676,6 +713,10 @@ class _Bvm:
                 self.stats.append(_stat_df(pld)); n += 1
             elif t == 3:
                 self._err(pld)
+            elif t == 4:                                 # a periodic sample, not end-of-stream:
+                self.perf = dict(zip(self.PERF_FIELDS,   # consume it, or poll() stops draining
+                                     struct.unpack(f"<{len(self.PERF_FIELDS)}q", pld)))
+                self.perf_series.append(self.perf)
             else:
                 self._q.put(item)                        # end-of-stream: finish()'s business
                 return n
@@ -695,10 +736,13 @@ class _Bvm:
                 continue
             if t == 0:
                 self.stats.append(_stat_df(pld)); continue
-            if t == 2:
+            if t == 2:                                   # per-frame cost records (Done in bvm.c)
                 nd = struct.unpack_from("<I", pld, 0)[0]; off = 4
                 for _ in range(nd):
-                    f, c, l = struct.unpack_from("<QQQ", pld, off); off += 24; locs[f] = (c, l)
+                    rec = struct.unpack_from("<QQQqqqiiii", pld, off)
+                    off += self.DONE_SZ
+                    locs[rec[0]] = (rec[1], rec[2])
+                    self.frames.append(rec)
         rc = self.p.wait()
         if self.errors and self.strict:                  # partial failure is an ERROR, never silent
             import errno as _e
@@ -1374,6 +1418,9 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                  snap_time_ns=time_ns if time_ns is not None else time.time_ns(),
                  prev_commit=prior_commit)
     os.close(fd)
+    fc = frame_costs([b], pdf)
+    if fc.height:
+        fc.write_parquet(out + ".frames.parquet")
     return dict(snapshot_bytes=sum(os.path.getsize(p) for p in paths) - sum(prev_ends),
                 shards=shards, snapshot_bytes_shard0=end - prev_ends[0], carried=carried.height + sum(p.len() for p in reused_paths),
                 reused_batches=len(reuse_ents), rewritten_carried=carried.height,
@@ -1525,11 +1572,13 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
             print(f"    frames {c}/{nframes}  outstanding={outstanding}", flush=True)
         c = e
 
+    globals()["_last_bvms"] = bs                         # so a driver can pull the frame costs
     locs, perfs = {}, []
     for i, b in enumerate(bs):
-        locs.update(b.finish())
+        locs.update(b.finish())                          # blocks until that executor drains
         perfs.append(b.perf)
     pack_s = time.time() - t_pack
+    t_foot = time.time()
 
     # ---- footer (planner-owned, on shard 0) ----
     gcum = pre
@@ -1596,6 +1645,10 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
         in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64),
         digest=pl.lit(-1, pl.Int64), link="link", chunks=pl.lit(None, pl.Binary),
         extents=pl.lit(None, pl.Binary), shard=pl.lit(0, pl.Int64))
+    # SEPARATE FOOTER. With several shards nothing is gained by hiding the index inside one
+    # of them: it forced the footer to be written after shard 0's last frame, and made shard 0
+    # the only shard that is both data and index. Its own file has base offset 0 and no
+    # ordering relationship to any shard at all. nockidx.footer_path() finds it.
     # Per-shard data end from the LOCATORS, not from stat(): the planner never wrote these
     # files — remote executors did — and a distributed filesystem happily serves the planner
     # a cached size from before those writes (measured: 11 of 12 shards reported ~0 while
@@ -1605,17 +1658,22 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
         if k in locs:
             sh_ = int(shard_of[k])
             ends[sh_] = max(ends[sh_], int(locs[k][0] + locs[k][1]))
-    end = ends[0]
-    fd = os.open(out, os.O_RDWR)
+    end = 0                                              # the footer file starts at 0
+    fpath = out + ".footer"
+    fd = os.open(fpath, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     ps = [packed.select(C13), dirsr.select(C13), linksr.select(C13)]
     if ddf is not None:
         ps.append(ddf)
     write_footer(fd, end, ps, prev_off=None, rows_per_batch=1 << 12, part_cuts=True,
                  snap_time_ns=time_ns if time_ns is not None else time.time_ns())
     os.close(fd)
-    footer_bytes = os.path.getsize(out) - end                # the planner wrote this one
+    footer_s = round(time.time() - t_foot, 1)            # how much is SERIAL after packing?
+    fc = frame_costs(bs, pdf)                            # SIDECAR, never inside the archive:
+    if fc.height:                                        # telemetry is optional to keep
+        fc.write_parquet(out + ".frames.parquet")
+    footer_bytes = os.path.getsize(fpath)                    # the planner wrote this one
     return dict(nodes=list(nodes), sinks=len(paths), scan_s=round(scan_s, 1),
-                pack_s=round(pack_s, 1),
+                pack_s=round(pack_s, 1), footer_s=footer_s,
                 store_bytes=sum(ends) + footer_bytes, data_per_shard=ends,
                 frames=nframes, frames_per_node=per_node_frames,
                 bytes_per_node=[int(x) for x in sent_bytes],
@@ -1689,6 +1747,11 @@ def _tail_hash(path, end):
         f.seek(max(0, end - 32)); return hashlib.blake2b(f.read(min(32, end)), digest_size=8).hexdigest()
 
 
+def _nockidx_footer(store):
+    from ..nock import nockidx as _n
+    return _n.footer_path(store)
+
+
 def push(store, url):
     """Replicate a backup chain to an object store — APPEND-ONLY DELTA: uploads only the
     bytes added since the last push (one segment object per push), verified by a tail
@@ -1699,6 +1762,9 @@ def push(store, url):
     head = ob.get("head")
     head = json.loads(head) if head else None
     sfiles = store_files(store)                            # each shard replicates independently
+    fp = _nockidx_footer(store)
+    if fp != store:
+        sfiles = sfiles + [fp]                             # ... and so does a separate footer
     shard_heads, uploaded, full, nseg = [], 0, False, 0
     for k, path in enumerate(sfiles):
         pfx = "" if k == 0 else f"s{k}-"                   # shard 0 keys stay unprefixed
@@ -1833,7 +1899,7 @@ def gc(store, last=None, daily=None, weekly=None, monthly=None, yearly=None):
         for off, clen, first, nrow in ents:
             batches.setdefault((off, clen), (first, nrow))
     def _load(off, clen):
-        with open(store, "rb") as f:
+        with open(_nx.footer_path(store), "rb") as f:
             f.seek(off)
             raw = _z.ZstdDecompressor().decompress(f.read(clen))
         df = pl.read_ipc(_io.BytesIO(raw))
