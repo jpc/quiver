@@ -25,7 +25,21 @@ The report ends with **recommended settings computed from your run** (`--shards`
 | `hashes` | BLAKE3 / BLAKE2b / SHA-256 / SipHash | chunk-id + digest algorithm |
 | `crypto` | AES-GCM / XChaCha20-Poly1305 / keyed BLAKE2b | encryption headroom |
 | `cfr` | stored-frame write shapes: buffered copy vs `writev` vs `copy_file_range` | incompressible pack path |
-| `rw` | read and write concurrently vs each alone — the ceiling a backup actually faces | is the job near the limit? |
+| `rw` | read+write concurrently vs each alone, **in both I/O modes** | is the job near the limit? |
+
+**Read `rw` before comparing any job against a ceiling.** The mode decides the answer. On WEKA,
+32 threads / 8 MB / 16 sinks:
+
+| mode | read-only | write-only | concurrent (each) | combined |
+|---|---|---|---|---|
+| O_DIRECT | 4.78 | 5.14 | 2.63 | 5.26 |
+| buffered + 64 MB paced writeback | 4.52 | 3.24 | 2.04 | 4.08 |
+
+quiver writes buffered with paced writeback, so 2.04 GB/s/direction is its ceiling — and it
+reaches 2.20 read / 1.78 write, i.e. 97.5% of the combined 4.08. An earlier version of this
+bench measured O_DIRECT only; comparing the job against that 2.93 figure invented a 37% gap
+that does not exist. O_DIRECT is *faster* for this bench's sequential per-thread writes and
+*2.3x slower* for quiver's offset-reserved shared-sink writes (see `BVM_SINK_DIRECT`).
 | `framecap` | compression ratio vs (zstd level x frame cap) on YOUR corpora | `--frame-cap-mb` |
 | `numa` | fully-loaded compression vs CPU/memory placement | whether to pin workers |
 | `multinode` | aggregate bandwidth with N nodes writing at once | how many nodes to use |
