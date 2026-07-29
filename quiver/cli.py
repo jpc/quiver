@@ -95,7 +95,8 @@ def main(argv=None):
                    help="extra .quiverignore-style pattern (repeatable)")
     a.add_argument("--frame-cap-mb", type=int, metavar="MB",
                    help="split members bigger than this across frames (bounds pack memory). "
-                        "Default: 8x zstd's window for -L (16/32/64 MB) — see bench/framecap")
+                        "Default 64: chosen on write throughput, not ratio (which is "
+                        "flat from 16 MB to 4 GB) — see bench/framecap and DEFAULT_FRAME_CAP")
     a.add_argument("--sinks", type=int, default=1, metavar="N",
                    help="write data across N sink files (out, out.1, ...); parallel "
                         "filesystems serialize concurrent writes to one inode")

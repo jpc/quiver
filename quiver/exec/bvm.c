@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* bvm.c — the BLOCKS executor (docs/BLOCKS.md), C port of quiver/exec/blocks.py.
  *
  * A PERSISTENT executor driven by a stdin COMMAND STREAM (not one mode per argv):
@@ -80,6 +81,23 @@ static int tcp_connect(const char *hostport){       /* "host:port" -> connected 
 }
 static char g_dest[4096]; static size_t g_destlen;
 static int64_t now_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000000000LL+t.tv_nsec; }
+/* Writeback pacing. 64 MB, not 256: measured on ~/eot, smaller and MORE FREQUENT flushes win,
+ * because a large sync_file_range stalls the writer until it completes.
+ *     64 MB  80.6s   256 MB  88.1s   1 GB  100.8s   4 GB  99.0s   never  76.9s
+ * `never` is fastest but not shippable -- this pacing exists because dirty page cache counts
+ * against the job's cgroup and OOM-killed the process at healthy RSS. 64 MB is within 4.6% of
+ * unpaced AND bounds the dirty window four times tighter than the old default. BVM_FLUSH_MB
+ * overrides; 0 disables. */
+static int64_t g_flush_bytes = 64LL << 20;
+/* BVM_SINK_DIRECT: open sinks O_DIRECT. Buffered pwrite reaches 1.57 GB/s here while fsbw
+ * measures 6.01 GB/s durable with O_DIRECT and 8 MB chunks, so the page cache round trip is
+ * worth testing. Direct I/O needs the offset, length and buffer all 4 KB-aligned: frames are
+ * therefore placed on 4 KB boundaries and written rounded up. The footer records each frame's
+ * exact (coff, clen), so the padding between frames is invisible to every reader -- and at
+ * <=4095 B per frame it is 0.04% of a 6 TB store. */
+static int g_sink_direct;
+#define SINK_ALIGN 4096
+static int64_t align_up(int64_t v, int64_t a){ return (v + a - 1) / a * a; }
 static int64_t g_start_ns;                        /* frame times are relative to it */
 /* PER-FRAME record. A 1 Hz sampler blurs exactly what you want to see -- which subtree was
  * expensive, which worker stalled, how deep the queue was when a frame started -- so every
@@ -97,7 +115,12 @@ static Done *g_done; static int g_ndone, g_donecap; static pthread_mutex_t g_don
 static int ensure(uint8_t **b, size_t *cap, size_t need) {
     if (*cap >= need) return 0;
     size_t nc = *cap ? *cap : (1 << 20); while (nc < need) nc <<= 1;
-    uint8_t *p = realloc(*b, nc); if (!p) return -1; *b = p; *cap = nc; return 0;
+    /* 4 KB-aligned so any of these buffers can back an O_DIRECT write (BVM_SINK_DIRECT).
+     * aligned_alloc + copy rather than realloc: realloc gives no alignment guarantee. */
+    uint8_t *p = aligned_alloc(4096, (nc + 4095) & ~(size_t)4095);
+    if (!p) return -1;
+    if (*b) { memcpy(p, *b, *cap); free(*b); }
+    *b = p; *cap = nc; return 0;
 }
 static void mkparents(char *full) {
     for (char *p = strchr(full + 1, '/'); p; p = strchr(p + 1, '/')) { *p = 0; mkdir(full, 0777); *p = '/'; }
@@ -908,13 +931,16 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
         inc = !bad && nr && r[nr / 2] >= sn - (sn >> 5);    /* < ~3% gain: incompressible */
     }
     Sink *sk = &g_sinks[sink_id];
-    /* the compressBound-sized scratch is only needed when we actually codec (or when a
-     * socket sink needs one contiguous message): a stored frame to a file writes from
-     * `src` and needs 3 bytes per 128 KiB, nothing more. */
-    if (!(inc && !sk->is_sock) && ensure(&w->cb, &w->ccap, ZSTD_compressBound(len))) { w->err = -1; return; }
+    /* stored + file sink: write the frame straight out of `src` with writev (no second copy,
+     * no compressBound scratch). Socket sinks need one contiguous message; O_DIRECT sinks
+     * cannot use writev either, because the 3-byte Raw_Block headers make the iovecs
+     * unaligned. Decide ONCE -- the scratch allocation and the write path must agree, or an
+     * incompressible frame skips the compressBound alloc and then writes len bytes into a
+     * buffer sized for 3 bytes per 128 KiB (heap corruption, found exactly that way). */
+    int direct = inc && !sk->is_sock && !g_sink_direct;
+    if (!direct && ensure(&w->cb, &w->ccap, ZSTD_compressBound(len) + SINK_ALIGN)) { w->err = -1; return; }
     /* stored + file sink: write the frame straight out of `src` with writev (no second
      * copy, no compressBound scratch). Socket sinks still need a contiguous message. */
-    int direct = inc && !sk->is_sock;
     int64_t t0 = now_ns();
     size_t cl;
     if (inc) {
@@ -941,14 +967,21 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
         pthread_mutex_unlock(&sk->mu);
         record_done(frame_id, (uint64_t)-1, cl);
     } else {                                            /* file sink: pwrite at reserved offset */
-        pthread_mutex_lock(&sk->mu); int64_t coff = sk->cursor; sk->cursor += cl; pthread_mutex_unlock(&sk->mu);
+        size_t wlen = cl;                                /* padding room reserved above */
+        pthread_mutex_lock(&sk->mu);
+        if (g_sink_direct) {                             /* 4 KB-aligned slot, rounded length */
+            sk->cursor = align_up(sk->cursor, SINK_ALIGN);
+            wlen = (size_t)align_up((int64_t)cl, SINK_ALIGN);
+        }
+        int64_t coff = sk->cursor; sk->cursor += (int64_t)wlen;
+        pthread_mutex_unlock(&sk->mu);
         int64_t tw = now_ns(); int wrc;
         if (direct) {                                   /* block headers only: 3B per 128KB */
             size_t nb = (len + 131071) / 131072; if (!nb) nb = 1;
             if (ensure(&w->cb, &w->ccap, nb * 3)) { w->err = -ENOMEM; emit_err("stored-frame", -ENOMEM); return; }
             wrc = stored_frame_pwritev(sk->fd, src, len, coff, w->cb);
         } else {
-            wrc = pwrite_all(sk->fd, w->cb, cl, coff);
+            wrc = pwrite_all(sk->fd, w->cb, wlen, coff);   /* wlen == cl unless direct */
         }
         ST(ns_write, now_ns() - tw); ST(wr_bytes, cl);
         /* STREAMING-WRITE HYGIENE: we never re-read the sink; without this, TBs of dirty
@@ -964,7 +997,7 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
         pthread_mutex_lock(&sk->mu);
         sk->unflushed += cl;
         int64_t lo = -1, hi = -1;
-        if (sk->unflushed >= (256 << 20)) {
+        if (g_flush_bytes && sk->unflushed >= g_flush_bytes) {
             lo = sk->flushed; hi = sk->cursor; sk->flushed = hi; sk->unflushed = 0;
         }
         pthread_mutex_unlock(&sk->mu);
@@ -1838,6 +1871,8 @@ int main(int argc, char **argv) {
         if (s > 2) close(s);
         break;
     }
+    { const char *fm = getenv("BVM_FLUSH_MB"); if (fm) g_flush_bytes = atoll(fm) << 20; }
+    g_sink_direct = getenv("BVM_SINK_DIRECT") != NULL;
     int nw = atoi(argv[1]);
     g_nworkers = nw;                                 /* emit_stats() runs on the sampler thread */ g_budget = atoll(argv[2]) << 20; if (g_budget <= 0) g_budget = 512LL << 20;
     for (int i = 0; i < 1024; i++) g_nock_fds[i] = -1;
@@ -1873,7 +1908,8 @@ int main(int argc, char **argv) {
                     unsigned char hdr[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
                     crypto_secretstream_xchacha20poly1305_init_push(&sk->st, hdr, g_key);
                     write_all(sk->fd, hdr, sizeof hdr); sk->enc = 1; } }
-            else { sk->fd = open(spec, O_RDWR | O_CREAT, 0644); sk->is_sock = 0; sk->cursor = start; }
+            else { sk->fd = open(spec, O_RDWR | O_CREAT | (g_sink_direct ? O_DIRECT : 0), 0644);
+                   sk->is_sock = 0; sk->cursor = start; sk->flushed = start; }
             if ((int)sid + 1 > g_nsinks) g_nsinks = sid + 1; free(spec); }
         else if (type == 2) { char *path = readstr(&p); mkdir(path, 0777); g_destlen = strlen(path);
             memcpy(g_dest, path, g_destlen); if (g_destlen && g_dest[g_destlen-1] != '/') g_dest[g_destlen++] = '/'; g_dest[g_destlen] = 0; free(path); }

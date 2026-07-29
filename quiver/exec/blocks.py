@@ -1188,6 +1188,19 @@ def _old_chunk_locator(prow):
 
 CDC_CUTOFF = 128 * 1024                                  # == bvm.c: below this, no manifest
 
+# How many bytes of one member a worker materializes at once. Chosen on TWO axes, because the
+# first one I measured turned out not to matter:
+#   ratio -- flat. bench/framecap on real data: 7.0016x at 16 MB vs 7.0054x at 4 GB (0.06%),
+#            and a whole-subtree store differs by 0.02% from 16 MB to 256 MB.
+#   write  -- this is the axis that pays. ~/eot, -j128, 16 sinks, flush 64 MB:
+#            16 MB 83.7s | 32 MB 87.5s | 64 MB 78.2s | 128 MB 77.7s | 256 MB 75.3s
+#            (32 MB above 16 MB is noise -- run-to-run spread here is 5-9%, so read this as
+#             ~7-8% for 16 -> 64 MB, not the 15% a single measurement suggested.)
+# 64 MB takes most of that for 8 GB across 128 workers; 256 MB buys ~4% more for 32 GB and
+# re-creates the memory pressure splitting members exists to avoid. An earlier default derived
+# the cap from zstd's window per level -- that was reasoning from the ratio axis, which is flat.
+DEFAULT_FRAME_CAP = 64 << 20
+
 
 def _pieces(off, ln, cap):
     """Split a byte run into <= cap pieces: [(src_off, len), ...]. A worker materializes a
@@ -1390,8 +1403,8 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     restorable (`nockidx.snapshots` + `unpack_c(at=)`). The store is quiver-native
     (extent members have no tar view). Returns a summary dict."""
     import numpy as np
-    if frame_cap is None:                                # 8x the level's zstd window: see above
-        frame_cap = (16 if level <= 6 else 32 if level <= 15 else 64) << 20
+    if frame_cap is None:
+        frame_cap = DEFAULT_FRAME_CAP
     root_abs = os.path.abspath(root)
     from ..nock import nockidx as _nx
     exists = os.path.exists(out) and os.path.getsize(out) > 0
@@ -1809,7 +1822,7 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     import numpy as np
     root_abs = os.path.abspath(root)
     if frame_cap is None:
-        frame_cap = (16 if level <= 6 else 32 if level <= 15 else 64) << 20
+        frame_cap = DEFAULT_FRAME_CAP
     nn = len(nodes)
     ign = load_ignore(root_abs, excludes)
     t_start = time.time()
