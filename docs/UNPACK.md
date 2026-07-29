@@ -41,8 +41,8 @@ between unpacking a linear and a sharded nock.
 `FILE(path)` per member, plus `MKDIR` (deduped dirs) and `SETMETA` (mode/mtime)
 — exactly `extract`'s existing `EXTRACT`+`MKDIR`+`SETMETA` shape (§6), now with
 a decode. The sink generalizes like recompress's did: unpack to files, or
-**re-pack** into another archive (transcode/re-level), or to `STREAM` (→ S3 / a
-pipe) — same three sink modes.
+**re-pack** into another archive (`recompress_c`, which re-levels), or to `STREAM`
+(→ S3 / a pipe) — same three sink modes.
 
 ## Local parallel unpack: the compress pool, backwards
 

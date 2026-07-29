@@ -451,6 +451,20 @@ def render(res, path):
             L += ["", "| level | " + " | ".join(f"L{v}" for v in levs) + " |",
                   "|---|" + "---|" * len(levs),
                   "| zstd window | " + " | ".join(f"{wins.get(v,0):.1f} MB" for v in levs) + " |"]
+        sp = {}
+        for name, c in fc.items():
+            m = c.get("mb_per_s") or {}
+            for v, d in m.items():
+                if d.get("1") and d.get("16"):
+                    sp.setdefault(v, []).append(d["1"] / d["16"])
+        if sp:
+            L += ["", "Speed moves too, and in the opposite direction — a bigger frame means a "
+                  "bigger match search. Going from a 1 MB to a 16 MB cap costs "
+                  + ", ".join(f"{max(sp[v]):.1f}x at L{v}" for v in sorted(sp, key=int)
+                              if max(sp[v]) > 1.2)
+                  + " of compression throughput (worst corpus). Past 16 MB it flattens: 64 MB "
+                    "is within ~5% of 16 MB everywhere measured, for at most 1.3% more ratio.",
+                  ""]
         L += ["", "The window is a FLOOR, not the answer. Data with no exploitable structure "
               "(model weights, already-compressed media) is flat from 1 MB — a bigger frame has "
               "nothing to find. Data with long-range redundancy (logs, JSONL, source) keeps "

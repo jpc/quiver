@@ -92,6 +92,9 @@ quiver splits an oversized member into `--frame-cap-mb` pieces, each compressed 
 |---|---|---|---|---|---|---|---|
 | zstd window | 0.5 MB | 2.1 MB | 2.1 MB | 4.2 MB | 4.2 MB | 4.2 MB | 8.4 MB |
 
+Speed moves too, and in the opposite direction — a bigger frame means a bigger match search. Going from a 1 MB to a 16 MB cap costs 1.7x at L1, 1.4x at L9, 2.4x at L12, 3.6x at L15, 2.4x at L19 of compression throughput (worst corpus). Past 16 MB it flattens: 64 MB is within ~5% of 16 MB everywhere measured, for at most 1.3% more ratio.
+
+
 The window is a FLOOR, not the answer. Data with no exploitable structure (model weights, already-compressed media) is flat from 1 MB — a bigger frame has nothing to find. Data with long-range redundancy (logs, JSONL, source) keeps gaining well past the window, because a longer frame also amortizes the entropy tables. quiver defaults to 8x the window for the level (16/32/64 MB), which costs under 1% of ratio on every corpus measured here while keeping worker memory linear in the cap.
 
 ## End-to-end pack

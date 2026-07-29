@@ -115,7 +115,7 @@ b.sink(0, "store.nock", start=prior_end)    # append past the prior frames
 b.scan_fs(0, "/data/tree")                  # bvm walks → STAT(0, -1, files) … SRC_EOF
 # read STAT; WAL-diff → unchanged (reuse) / changed+added (send) / deleted (drop)
 for frame, members in framed_delta:
-    b.pack_files(frame, 6, "/data/tree", [(mode, rel), ...])   # PACK_FILES → file sink 0
+    b.pack_files_df(6, "/data/tree", typed_df, sink_id=0)      # PACK_FILES → file sink 0
 ```
 
 **networked streaming rsync** — both ends bvm, sharded + encrypted:

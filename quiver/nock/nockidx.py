@@ -67,7 +67,14 @@ def pack_footer(df, base_off: int, rows_per_batch: int = 1 << 20, level: int = 3
     zstd-compressed (shared-prefix paths ~15x) in its OWN skippable frame; a final skippable
     frame holds an uncompressed DIRECTORY (nbatch, then per batch: absolute payload offset,
     compressed len, first row, nrow). Trailer `[u64 dir_clen][NOCKZC01]`. Frame-aligned
-    batches let the reader scatter each batch's whole frames with no cross-batch carry."""
+    batches let the reader scatter each batch's whole frames with no cross-batch carry.
+
+    `rows_per_batch` is a RANDOM-ACCESS knob, not a compression one: reaching one member
+    costs exactly one batch inflate, so 1M-row batches made `extract --glob` pay ~288 ms to
+    reach a single member vs ~1.5 ms at 10k rows (192x), and they put a ~200 MB/nock floor
+    under any streaming reader. The compression they buy is nearly nothing — measured on
+    real EVI STAT, 12.9x at 1M vs 12.8x at 100k vs 11.9x at 10k, i.e. 8% more footer bytes
+    at 10k, ~0.002% of the archive."""
     import io as _io
     import zstandard as _z
     import numpy as np

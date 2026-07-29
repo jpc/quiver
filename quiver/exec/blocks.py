@@ -1,24 +1,25 @@
-"""blocks.py — reference executor for the BLOCKS model (docs/BLOCKS.md).
+"""blocks.py — the PLANNER for the BLOCKS model (docs/BLOCKS.md).
 
-The rewrite's clean core: a STAT table + residences + whole-member FRAMES + one
-COPY verb, no ALLOC/FREE/gather-triples/frame_base/carry. This is a pure-Python
-reference — the executable spec and correctness proof (it must be byte-exact on
-the large-member sources that broke the old windowed/coalesce paths); the C port
-follows this contract.
+A STAT table + residences + whole-member FRAMES + one COPY verb: no
+ALLOC/FREE/gather-triples/frame_base/carry. Every byte is moved by the C executor
+(`bvm.c`); this module plans the work, streams it over an Arrow-IPC command pipe,
+and assembles the footer from what comes back. Correctness is checked against the
+C engine's own round-trips and against upstream tools (tar/zstd) — the pure-Python
+reference core that once lived here was removed once nothing executed it.
 
 Model:
   * A STAT batch is a polars frame of {path,size,mode,mtime_ns,uid,gid} + a locator.
     `res` (batch-level) is FS | MEM | NOCK. It is the file list, the in-flight work,
     AND the on-disk footer.
-  * A FRAME is the universal unit: one compression frame == one memory Block == a
-    group of WHOLE members. Legacy archives synthesize whole-member frames on the
-    fly (frames_from_targz); a nock's frames are read lazily.
-  * A Block is a refcounted buffer of concatenated member bodies. It frees when the
+  * A FRAME is the universal unit: one compression frame == one memory block == a
+    group of WHOLE members. A member bigger than `frame_cap` is the exception: it
+    is cut into pieces and stitched back by an EXTENT row.
+  * A block is a refcounted buffer of concatenated member bodies. It frees when the
     last STAT batch pointing into it retires. Bounded memory == a byte budget.
   * COPY(stat, dst[, codec]) is the only mover: MEM->SINK is deflate, NOCK->FS is
     lazy-inflate + scatter, etc.
 """
-import os, io, struct, tarfile, hashlib, threading, queue, time
+import os, io, struct, hashlib, threading, queue, time
 import polars as pl
 import zstandard as zstd
 
@@ -28,120 +29,12 @@ STAT_COLS = ["path", "size", "mode", "mtime_ns", "uid", "gid",
 
 
 # ------------------------------------------------------------------ blocks
-class Block:
-    """A refcounted buffer of whole members (a frame's decompressed body)."""
-    __slots__ = ("bid", "buf", "rc")
-    def __init__(self, bid, buf):
-        self.bid, self.buf, self.rc = bid, buf, 0
-
-
-class Arena:
-    """Owns live blocks and enforces a byte budget. A producer waits when the live
-    bytes would exceed the budget; retiring a STAT batch drops refs and frees at
-    rc==0. (The reference runs producers on a thread; the C scheduler is the same
-    contract with a worker pool.)"""
-    def __init__(self, budget=256 << 20):
-        self.budget = budget
-        self.live = 0
-        self._blocks = {}
-        self._next = 0
-        self._cv = threading.Condition()
-
-    def make(self, buf):
-        with self._cv:
-            while self.live + len(buf) > self.budget and self._blocks:
-                self._cv.wait()                    # backpressure: wait for retirement
-            b = Block(self._next, buf); self._next += 1
-            self._blocks[b.bid] = b; self.live += len(buf)
-            return b
-
-    def ref(self, b):    b.rc += 1
-    def retire(self, b):                            # a batch pointing into b is done
-        with self._cv:
-            b.rc -= 1
-            if b.rc <= 0 and b.bid in self._blocks:
-                self.live -= len(self._blocks[b.bid].buf)
-                del self._blocks[b.bid]
-                self._cv.notify_all()
-
-
 # ------------------------------------------------------------------ SCAN / DECODE
 def _stat_rows(members):
     schema = {c: (pl.Utf8 if c in ("path", "link") else pl.Int64) for c in STAT_COLS}
     if not members:
         return pl.DataFrame(schema=schema)
     return pl.DataFrame(members, schema=schema).with_columns(pl.col("link").fill_null(""))
-
-
-def frames_from_targz(src, frame_bytes=1 << 20):
-    """DECODE a (.tar.zstd/.tar.gz/.tar) into whole-member FRAMES, streaming.
-
-    Yields ('frame', body:bytes, stat:DataFrame) for file frames and
-    ('dirs', None, stat) for directory rows. A member is placed whole; when the
-    next member would overflow `frame_bytes` the frame is closed and emitted; a
-    member larger than `frame_bytes` becomes its own frame. The frame boundary is
-    therefore ALWAYS a member boundary — no partial carry, no member ever split,
-    no member-larger-than-window error. `body` is the concatenation of the frame's
-    member bodies; each STAT row's `in_off` is its offset within `body`."""
-    r = _open_decompress(src)
-    tf = tarfile.open(fileobj=r, mode="r|")
-    blk = bytearray(); rows = []; dirs = []
-    for m in tf:
-        if m.isdir():
-            dirs.append(dict(path=m.name, size=0, mode=m.mode, mtime_ns=int(m.mtime)*10**9,
-                             uid=m.uid, gid=m.gid, frame=-1, in_off=-1, coff=-1, clen=-1, digest=-1))
-            continue
-        if not m.isreg():
-            continue
-        body = tf.extractfile(m).read()
-        if blk and len(blk) + len(body) > frame_bytes:      # close current frame
-            yield "frame", bytes(blk), _stat_rows(rows)
-            blk = bytearray(); rows = []
-        rows.append(dict(path=m.name, size=len(body), mode=m.mode,
-                         mtime_ns=int(m.mtime)*10**9, uid=m.uid, gid=m.gid,
-                         frame=0, in_off=len(blk), coff=-1, clen=-1, digest=-1))
-        blk += body
-    if rows:
-        yield "frame", bytes(blk), _stat_rows(rows)
-    if dirs:
-        yield "dirs", None, _stat_rows(dirs)
-
-
-def frames_from_nock(nock, frame_bytes=None):
-    """DECODE an existing nock as whole-member FRAMES — FAST vs a .tar.zstd: the
-    frames are already independent + compressed, and members are contiguous
-    (in_off,size) slices, so there is NO single-frame serial stream decode and NO
-    per-member tar-header parsing. Reads a blocks-format footer or a legacy
-    zframe-format one. `frame_bytes` is ignored (source framing is preserved)."""
-    idx = scan_nock(nock); cf, cl = "coff", "clen"   # scan_nock reads new+legacy footers
-    if "shard" not in idx.columns:
-        idx = idx.with_columns(shard=pl.lit(0, pl.Int64))
-    files = idx.filter(pl.col("frame") >= 0).sort(["shard", cf, "in_off"])
-    dirs = idx.filter(pl.col("frame") < 0)
-    sel = dict(path="path", size=pl.col("size").cast(pl.Int64),
-               mode=pl.col("mode").cast(pl.Int64), mtime_ns=pl.col("mtime_ns").cast(pl.Int64),
-               uid=pl.col("uid").cast(pl.Int64), gid=pl.col("gid").cast(pl.Int64),
-               frame=pl.lit(0, pl.Int64), in_off=pl.col("in_off").cast(pl.Int64),
-               coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64))
-    dctx = zstd.ZstdDecompressor()
-    fhs = [open(p, "rb") for p in store_files(nock)]
-    try:
-        for (sh_, coff, clen), grp in files.group_by(["shard", cf, cl], maintain_order=True):
-            f = fhs[sh_]
-            f.seek(coff); body = dctx.decompress(f.read(clen))    # one bulk decode / frame
-            yield "frame", body, grp.select(**sel)
-    finally:
-        for f in fhs:
-            f.close()
-    if dirs.height:
-        d = dict(sel); d["size"] = pl.lit(0, pl.Int64); d["frame"] = pl.lit(-1, pl.Int64)
-        d["in_off"] = pl.lit(-1, pl.Int64)
-        yield "dirs", None, dirs.select(**d)
-
-
-def _frames(src, frame_bytes):
-    return (frames_from_nock(src) if src.endswith(".nock")
-            else frames_from_targz(src, frame_bytes))
 
 
 def scan_fs(root, chunk_rows=50000, bvm_exe=None, workers=32):
@@ -349,7 +242,6 @@ def rm(root, workers=32, bvm_exe=None, procs=1):
     WEKA clients) AFTER the scan completes — no overlap with the scan. Falls back to os.walk +
     threaded unlink if `bvm_exe` is None. Returns entries removed."""
     import random
-    from collections import defaultdict
     root_abs = os.path.abspath(root)
     if not bvm_exe:                                        # bvm-free fallback: os.walk + threaded unlink
         import concurrent.futures as cf
@@ -451,80 +343,12 @@ def cp(src, dst, workers=32, preserve=True):
     return len(files) + len(syms) + len(hards)
 
 
-def _mdigest(b):
-    return int.from_bytes(hashlib.blake2b(b, digest_size=8).digest(), "little", signed=True)
-
-
 def _wal_stat(path):
     """Load the WAL as a STAT table: the prior committed {path,size,mtime_ns,digest,
     frame,in_off,coff,clen}. This IS the manifest of what content exists and where."""
     committed, _, _ = _wal_load(path)
     parts = [s for _, _, s in committed.values()]
     return pl.concat(parts, how="vertical_relaxed") if parts else _stat_rows([])
-
-
-def pack_fs(root, out, wal_path, level=6, frame_bytes=1 << 20, dedup=True):
-    """INCREMENTAL, content-addressed pack of a filesystem tree into a nock, driven
-    by the WAL-as-STAT. Streaming: SCAN -> diff(WAL) -> COPY only the delta ->
-    append(WAL). The nock GROWS in place (new frames appended past the old footer);
-    UNCHANGED and DEDUP rows reference frames already in it; DELETED rows drop.
-    Returns a dict of {unchanged,changed_or_added,dedup,packed,deleted,frames}."""
-    prior = _wal_stat(wal_path)
-    pmap, owners, cursor, fid = {}, {}, 0, 0            # owners: digest -> frow that stores it
-    for r in prior.iter_rows(named=True):
-        pmap[r["path"]] = r
-        if r["frame"] >= 0:
-            cursor = max(cursor, r["coff"] + r["clen"]); fid = max(fid, r["frame"] + 1)
-            if dedup and r["digest"] != -1:
-                owners.setdefault(r["digest"], r)
-    fd = os.open(out, os.O_RDWR | os.O_CREAT, 0o644)
-    if prior.height:
-        os.ftruncate(fd, cursor)                         # drop the old footer, keep frames
-    wal = open(wal_path, "ab" if prior.height else "wb")
-    # each output file is (meta, owner): owner is the frow holding its bytes (a prior
-    # row, a pending frow, or itself), resolved to a locator by flush().
-    out, topack, seen = [], [], set()
-    for batch in scan_fs(root):                          # STREAMING scan + change-detect
-        for r in batch.iter_rows(named=True):
-            seen.add(r["path"]); pr = pmap.get(r["path"])
-            if pr and pr["frame"] >= 0 and pr["size"] == r["size"] and pr["mtime_ns"] == r["mtime_ns"]:
-                out.append((r, pr))                      # UNCHANGED -> reuse prior locator
-            else:
-                topack.append(r)                         # CHANGED or ADDED
-    S = dict(unchanged=len(out), changed_or_added=len(topack),
-             dedup=0, packed=0, deleted=0, frames=0)
-    blk, pend = bytearray(), []
-
-    def flush():
-        nonlocal blk, pend, cursor, fid
-        if not pend:
-            return
-        comp = zstd.ZstdCompressor(level=level).compress(bytes(blk))
-        os.pwrite(fd, comp, cursor)
-        for fr in pend:                                  # resolve pending frows' locators
-            fr["frame"], fr["coff"], fr["clen"] = fid, cursor, len(comp)
-        _wal_append(wal, fid, cursor + len(comp), _stat_rows(pend))
-        cursor += len(comp); fid += 1; S["frames"] += 1; blk, pend = bytearray(), []
-
-    for r in topack:
-        body = open(os.path.join(root, r["path"]), "rb").read()
-        dg = _mdigest(body)
-        if dedup and dg in owners:                       # CONTENT DEDUP (prior OR this run)
-            out.append((r, owners[dg])); S["dedup"] += 1; continue
-        if blk and len(blk) + len(body) > frame_bytes:
-            flush()
-        fr = dict(path=r["path"], size=len(body), mode=r["mode"], mtime_ns=r["mtime_ns"],
-                  uid=r["uid"], gid=r["gid"], frame=0, in_off=len(blk),
-                  coff=-1, clen=-1, digest=dg)
-        pend.append(fr); blk += body; owners[dg] = fr; out.append((r, fr)); S["packed"] += 1
-    flush()                                              # resolves all pending owners
-    S["deleted"] = sum(1 for p in pmap if p not in seen)  # WAL-only -> deleted (dropped)
-    rows = [dict(path=m["path"], size=o["size"], mode=m["mode"], mtime_ns=m["mtime_ns"],
-                 uid=m["uid"], gid=m["gid"], frame=o["frame"], in_off=o["in_off"],
-                 coff=o["coff"], clen=o["clen"], digest=o["digest"]) for m, o in out]
-    write_footer(fd, cursor, [_stat_rows(rows)])
-    os.close(fd); wal.close()
-    return S
 
 
 def _read_msg(f):
@@ -778,21 +602,7 @@ class _Bvm:
                     f"there, or give each piece a distinct name.")
         self._send(7, struct.pack("<IIB", level, sink_id, 1 if tar_compat else 0)
                    + _s(root) + _ipc_bytes(df))
-    def pack_files(self, frame, level, root, members, sink_id=0, tar_compat=0):
-        # compat: [(mode, size, rel)] tuples (+ optional mtime_ns, uid, gid in slots 3..5)
-        g = lambda m, i: m[i] if len(m) > i else 0
-        self.pack_files_df(level, root, pl.DataFrame({
-            "fid": pl.Series([frame] * len(members), dtype=pl.Int64),
-            "type": pl.Series([0] * len(members), dtype=pl.UInt8),
-            "mode": pl.Series([m[0] for m in members], dtype=pl.Int32),
-            "size": pl.Series([m[1] for m in members], dtype=pl.Int64),
-            "mtime_ns": pl.Series([g(m, 3) for m in members], dtype=pl.Int64),
-            "uid": pl.Series([g(m, 4) for m in members], dtype=pl.Int32),
-            "gid": pl.Series([g(m, 5) for m in members], dtype=pl.Int32),
-            "src_off": pl.Series([0] * len(members), dtype=pl.Int64),
-            "path": pl.Series([m[2] for m in members], dtype=pl.Utf8),
-            "link": pl.Series([""] * len(members), dtype=pl.Utf8)}),
-            sink_id=sink_id, tar_compat=tar_compat)
+
     def copy_members_df(self, block, frame, level, df, sink_id=0, tar_compat=0):
         """ARROW copy-members: same columns as PACK_FILES minus fid (block+frame are scalars,
         one filtered block per message); in_off = the member's SOURCE offset in the block.
@@ -813,20 +623,8 @@ class _Bvm:
         planner's send cost is O(chunks), not O(frames) (polars pays ~0.4 ms per IPC write —
         per-frame messages dominated at small frames). `df` carries SCATTER_SCHEMA."""
         self._send(8, _ipc_bytes(df))
-    def scatter(self, coff, clen, members, nock_id=0):  # compat: [(in_off,size,mode,mtime_ns,uid,gid,path)]
-        cols = list(zip(*members)) if members else [[]] * 7
-        n = len(members)
-        d = {"nock": pl.Series([nock_id] * n, dtype=pl.Int32),
-             "coff": pl.Series([coff] * n, dtype=pl.Int64),
-             "clen": pl.Series([clen] * n, dtype=pl.Int64)}
-        keys = [k for k in self.SCATTER_SCHEMA if k not in ("nock", "coff", "clen", "out_off", "fsize")]
-        for k, v in zip(keys, cols):
-            d[k] = pl.Series(v, dtype=self.SCATTER_SCHEMA[k])
-        d["out_off"] = pl.Series([0] * n, dtype=pl.Int64)
-        d["fsize"] = d["size"]
-        self.scatter_df(pl.DataFrame(d).select(list(self.SCATTER_SCHEMA)))
+
     def free_block(self, block):    self._send(9, struct.pack("<Q", block))   # retire owner-ref
-    skip = free_block                                                          # legacy alias
     def key(self, k):               self._send(10, k)   # 32-byte session key, BEFORE tcp sinks
     def listen(self, port, n, apply=0): self._send(11, struct.pack("<IIB", port, n, apply))
     def unlink(self, paths, removedir=0):   # io_uring batch unlink (removedir=1 -> rmdir)
@@ -898,8 +696,10 @@ def _stat_df(payload):
 
 def _parse_stat(payload):
     """Compat view of a STAT payload -> (sid, block_id, [member dicts]) shaped like the old
-    wire: FILE/LINK rows only (dir rows dropped) and perm-masked mode. Kept for the planner
-    paths that assemble frames from dicts (pack/recompress); hot paths use _stat_df."""
+    wire: FILE/LINK rows only (dir rows dropped) and perm-masked mode. NO planner path uses
+    this — every one of them takes the zero-copy Arrow batch through _stat_df. It survives
+    only because tests/test_blocks.py needs a block_id out of a STAT message to exercise the
+    use-after-free guard; delete it the day that test stops needing one."""
     sid, block, df = _stat_df(payload)
     if df.height:
         df = df.filter(pl.col("is_dir") == 0).with_columns(pl.col("mode") & 0o7777)
@@ -2275,21 +2075,6 @@ def _kx_session(so, client, pk, sk, peer):
     return rx.raw, tx.raw
 
 
-def _fs_stat(root, with_mode=False):
-    st = {}
-    for dp, _, fns in os.walk(root):
-        for fn in fns:
-            p = os.path.join(dp, fn)
-            try:
-                s = os.lstat(p)
-            except OSError:
-                continue
-            rel = os.path.relpath(p, root)
-            st[rel] = (s.st_size, s.st_mtime_ns // 10**9, s.st_mode & 0o7777) if with_mode \
-                else (s.st_size, s.st_mtime_ns // 10**9)
-    return st
-
-
 def _fs_entries(root):
     """Scan `root` -> (files, links, dirs) for rsync. files[rel] = (size, mtime_ns, mode,
     uid, gid); links[rel] = (kind, target, mtime_ns, uid, gid, mode) with kind 0=symlink
@@ -2451,17 +2236,6 @@ def rsync(src, dst, bvm_exe, n=4, nworkers=8, level=6):
     t.join(); return out
 
 
-def _open_decompress(src):
-    f = open(src, "rb")
-    head = f.read(4); f.seek(0)
-    if head[:4] == b"\x28\xb5\x2f\xfd":
-        return zstd.ZstdDecompressor().stream_reader(f)
-    if head[:2] == b"\x1f\x8b":
-        import gzip
-        return gzip.open(f, "rb")
-    return f                                                 # plain tar
-
-
 def scan_nock(path, at=None):
     """SCAN(NOCK): read the chunked footer STAT table (NOCKZC01). Decodes NO data frames
     (they are lazy). Normalizes the on-disk locator names (frame_coff/clen -> coff/clen)
@@ -2481,77 +2255,6 @@ def scan_nock(path, at=None):
 
 
 # ------------------------------------------------------------------ COPY
-def copy_mem_to_sink(body, stat, sink_fd, cursor, level, frame_id):
-    """COPY(MEM -> SINK, zstd): compress a frame's block, append at `cursor`, assign
-    `frame_id`. Returns (new_cursor, stat') with the NOCK locator (frame,coff,clen,
-    digest) stamped in. This is 'deflate' as a residence copy."""
-    comp = zstd.ZstdCompressor(level=level).compress(body)
-    os.pwrite(sink_fd, comp, cursor)
-    dg = int.from_bytes(hashlib.blake2b(body, digest_size=8).digest(), "little", signed=True)
-    stat = stat.with_columns(frame=pl.lit(frame_id, pl.Int64), coff=pl.lit(cursor, pl.Int64),
-                             clen=pl.lit(len(comp), pl.Int64), digest=pl.lit(dg, pl.Int64))
-    return cursor + len(comp), stat
-
-
-def copy_nock_to_fs(stat, nock_path, dest, predicate=None):
-    """COPY(NOCK -> FS): materialize files. Frames are inflated LAZILY — one
-    decode per referenced frame, then its members scatter to disjoint files. A
-    frame subset (predicate over STAT, e.g. frame % nnodes == k) decodes only the
-    frames it touches — the per-frame distributed unpack, for free."""
-    files = stat.filter(pl.col("frame") >= 0)
-    dirs = stat.filter(pl.col("frame") == -1)
-    syms = stat.filter(pl.col("frame") == -2)
-    hards = stat.filter(pl.col("frame") == -3)
-    if predicate is not None:
-        files = files.filter(predicate)
-    for r in dirs.sort("path").iter_rows(named=True):        # tree first
-        os.makedirs(os.path.join(dest, r["path"]), exist_ok=True)
-    for r in syms.iter_rows(named=True):                     # symlinks
-        p = os.path.join(dest, r["path"]); os.makedirs(os.path.dirname(p), exist_ok=True)
-        if os.path.lexists(p):
-            os.remove(p)
-        os.symlink(r["link"], p)
-        try:
-            os.utime(p, ns=(r["mtime_ns"], r["mtime_ns"]), follow_symlinks=False)
-        except (OSError, NotImplementedError):
-            pass
-    dctx = zstd.ZstdDecompressor()
-    n = 0
-    fhs = [open(p, "rb") for p in store_files(nock_path)]
-    if "shard" not in files.columns:
-        files = files.with_columns(shard=pl.lit(0, pl.Int64))
-    try:
-        for (sh_, coff, clen), grp in files.group_by(["shard", "coff", "clen"], maintain_order=True):
-            f = fhs[sh_]
-            f.seek(coff); body = dctx.decompress(f.read(clen))    # lazy: decode on COPY
-            for r in grp.iter_rows(named=True):
-                p = os.path.join(dest, r["path"])
-                d = os.path.dirname(p)
-                if d:
-                    os.makedirs(d, exist_ok=True)
-                with open(p, "wb") as w:
-                    w.write(body[r["in_off"]: r["in_off"] + r["size"]])
-                os.chmod(p, r["mode"] & 0o7777)
-                try:
-                    if r["uid"] or r["gid"]:
-                        os.chown(p, r["uid"], r["gid"])          # best-effort (privilege)
-                except OSError:
-                    pass
-                os.utime(p, ns=(r["mtime_ns"], r["mtime_ns"])); n += 1
-    finally:
-        for f in fhs:
-            f.close()
-    for r in hards.iter_rows(named=True):                     # hardlinks LAST (targets now exist)
-        p = os.path.join(dest, r["path"]); os.makedirs(os.path.dirname(p) or dest, exist_ok=True)
-        if os.path.lexists(p):
-            os.remove(p)
-        try:
-            os.link(os.path.join(dest, r["link"]), p); n += 1
-        except OSError:
-            pass
-    return n
-
-
 # ------------------------------------------------------------------ drivers
 def write_footer(sink_fd, cursor, parts, level=3, rows_per_batch=1 << 20, prev_off=None,
                  reuse_ents=None, part_cuts=False, snap_time_ns=None, prev_commit=None):
@@ -2574,144 +2277,6 @@ def write_footer(sink_fd, cursor, parts, level=3, rows_per_batch=1 << 20, prev_o
                                            forced_cuts=fc, snap_time_ns=snap_time_ns,
                                            prev_commit=prev_commit), cursor)
     return stat
-
-
-def recompress(src, out, level=6, frame_bytes=1 << 20, budget=256 << 20, wal_path=None,
-               resume=False):
-    """RECOMPRESS legacy archive -> nock. DECODE whole-member frames, COPY each to
-    the sink, footer = accumulated STAT. Optional simplified WAL layered on top:
-    each committed frame appends (frame_id,coff,clen,digest)+its STAT to the WAL;
-    `resume` replays it, skips those frames (bytes already durable), truncates the
-    sink to the last committed offset, and continues. Returns member count."""
-    committed, cursor0, wal = _wal_load(wal_path) if resume else ({}, 0, None)
-    fd = os.open(out, os.O_RDWR | os.O_CREAT, 0o644)
-    if resume:
-        os.ftruncate(fd, cursor0)                            # drop any partial tail
-    wal = _wal_open(wal_path, resume) if wal_path else None
-    arena = Arena(budget)                                    # budget/refcount shown; sequential here
-    cursor = cursor0
-    parts = [s for _, _, s in committed.values()] if resume else []
-    fid = max(committed) + 1 if committed else 0
-    nmemb = sum(s.height for _, _, s in committed.values()) if resume else 0
-    for kind, body, stat in _frames(src, frame_bytes):
-        if kind == "dirs":
-            parts.append(stat); continue
-        blk = arena.make(bytearray(body)); arena.ref(blk)    # a block, refcounted by this batch
-        if fid in committed:                                 # already durable -> skip COPY
-            parts_stat = committed[fid][2]
-        else:
-            cursor, parts_stat = copy_mem_to_sink(body, stat, fd, cursor, level, fid)
-            if wal:
-                _wal_append(wal, fid, cursor, parts_stat)
-        parts.append(parts_stat); nmemb += stat.height; fid += 1
-        arena.retire(blk)                                    # batch consumed -> block frees
-    stat_all = write_footer(fd, cursor, parts)
-    os.close(fd)
-    if wal:
-        wal.close()
-    return int((stat_all["frame"] >= 0).sum())
-
-
-def transcode(nock_src, out):
-    """COPY(NOCK-frame -> SINK, codec=passthrough): the frames are ALREADY the
-    target compression, so copy the compressed bytes verbatim and rewrite the
-    footer. No decode, no re-compress — near-instant (the 'much faster' nock path;
-    re-compressing a nock only pays off when the C port parallelizes zstd or when
-    level/framing actually changes). Returns member count."""
-    idx = scan_nock(nock_src); cf, cl = "coff", "clen"
-    files = idx.filter(pl.col("frame") >= 0).sort([cf, "in_off"])
-    dirs = idx.filter(pl.col("frame") < 0)
-    fd = os.open(out, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-    cursor = 0; parts = []; fid = 0
-    with open(nock_src, "rb") as f:
-        for (coff, clen), grp in files.group_by([cf, cl], maintain_order=True):
-            f.seek(coff); os.pwrite(fd, f.read(clen), cursor)     # verbatim frame copy
-            parts.append(grp.select(
-                path="path", size=pl.col("size").cast(pl.Int64), mode=pl.col("mode").cast(pl.Int64),
-                mtime_ns=pl.col("mtime_ns").cast(pl.Int64), uid=pl.col("uid").cast(pl.Int64),
-                gid=pl.col("gid").cast(pl.Int64), frame=pl.lit(fid, pl.Int64),
-                in_off=pl.col("in_off").cast(pl.Int64), coff=pl.lit(cursor, pl.Int64),
-                clen=pl.lit(clen, pl.Int64), digest=pl.lit(-1, pl.Int64)))
-            cursor += clen; fid += 1
-    if dirs.height:
-        parts.append(dirs.select(
-            path="path", size=pl.lit(0, pl.Int64), mode=pl.col("mode").cast(pl.Int64),
-            mtime_ns=pl.col("mtime_ns").cast(pl.Int64), uid=pl.col("uid").cast(pl.Int64),
-            gid=pl.col("gid").cast(pl.Int64), frame=pl.lit(-1, pl.Int64),
-            in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64),
-            clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64)))
-    stat = write_footer(fd, cursor, parts); os.close(fd)
-    return int((stat["frame"] >= 0).sum())
-
-
-def unpack(nock, dest, predicate=None):
-    """COPY(SCAN(NOCK) -> FS). Lazy per-frame decode; predicate = a frame subset."""
-    os.makedirs(dest, exist_ok=True)
-    return copy_nock_to_fs(scan_nock(nock), nock, dest, predicate)
-
-
-def rebatch_footer(path, rows_per_batch=1 << 14, level=3, backup=True):
-    """Rewrite an existing CHUNKED footer at a different `rows_per_batch`, IN PLACE. The
-    compressed data frames are never touched — only the index region past data_end — so this
-    is cheap and reversible. Batches stay FRAME-ALIGNED (pack_footer only ever cuts on a frame
-    boundary, so a frame never straddles two batches).
-
-    Why smaller batches: random access costs ONE batch inflate, so 1M-row batches made
-    `extract --glob` pay ~288 ms to reach a single member vs ~1.5 ms at 10k rows (192x), and
-    they set a ~200 MB/nock floor on any streaming reader. Measured on real EVI STAT, the
-    compression these big batches bought is nearly nothing: 12.9x at 1M vs 12.8x at 100k vs
-    11.9x at 10k — i.e. 8% more footer bytes at 10k, ~0.002% of the archive.
-
-    Safety: the replacement footer is fully built (and the data_end boundary re-checked)
-    BEFORE anything is truncated; the old footer region is copied to `path + '.footerbak'`
-    (with its base offset) first; and the result is verified to carry the same row count,
-    raising with the backup path if not. Returns (rows, batches_before, batches_after)."""
-    from ..nock import nockidx
-    ents0 = nockidx.read_directory(path)
-    if ents0 is None:
-        raise ValueError(f"{path}: no chunked footer to re-batch (run migrate first)")
-    disk = nockidx.read_footer(path)                      # stored form: frame_coff/frame_clen
-    n0 = disk.height
-    files = disk.filter(pl.col("frame") >= 0)
-    data_end = int((files["frame_coff"] + files["frame_clen"]).max()) if files.height else 0
-    fsz = os.path.getsize(path)
-    if data_end < fsz:                                    # same guard migrate() uses: the
-        with open(path, "rb") as f:                       # footer must start on a frame magic
-            f.seek(data_end); m = struct.unpack("<I", f.read(4))[0]
-        if m not in (0x184D2A50, 0xFD2FB528):
-            raise RuntimeError(f"{path}: data_end={data_end} is not a zstd frame boundary "
-                               f"(0x{m:08X}); refusing to re-batch")
-    blob = nockidx.pack_footer(disk, data_end, rows_per_batch, level)   # built BEFORE truncate
-    if backup:
-        with open(path, "rb") as f:
-            f.seek(data_end); old = f.read(fsz - data_end)
-        with open(path + ".footerbak", "wb") as g:        # [u64 base_off][old footer region]
-            g.write(struct.pack("<Q", data_end)); g.write(old)
-    fd = os.open(path, os.O_RDWR)
-    try:
-        os.ftruncate(fd, data_end)
-        os.pwrite(fd, blob, data_end)
-    finally:
-        os.close(fd)
-    ents1 = nockidx.read_directory(path)
-    got = sum(e[3] for e in ents1) if ents1 else -1
-    if got != n0:
-        raise RuntimeError(f"{path}: RE-BATCH VERIFY FAILED ({got} rows != {n0}); "
-                           f"restore with restore_footer('{path}')")
-    return n0, len(ents0), len(ents1)
-
-
-def restore_footer(path):
-    """Undo a rebatch_footer: put back the footer region saved in `path + '.footerbak'`."""
-    bak = path + ".footerbak"
-    with open(bak, "rb") as f:
-        base = struct.unpack("<Q", f.read(8))[0]; old = f.read()
-    fd = os.open(path, os.O_RDWR)
-    try:
-        os.ftruncate(fd, base); os.pwrite(fd, old, base)
-    finally:
-        os.close(fd)
-    return base
 
 
 def migrate(path):
