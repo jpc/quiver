@@ -520,10 +520,15 @@ class _Bvm:
     """A session with the unified bvm command-stream executor: open sources (tars /
     fs subtrees), send COPY/PACK/SCATTER plans, read STAT/SRC_EOF/DONE. One process
     can hold many sources at once (shared pool + block budget)."""
-    def __init__(self, bvm_exe, nworkers=16, budget_mb=512):
+    def __init__(self, bvm_exe, nworkers=16, budget_mb=512, launch=None):
+        """`launch` puts the executor on ANOTHER HOST: a command prefix such as
+        ["srun", "-w", "node7", ...] or ["ssh", "node7"]. bvm speaks its whole protocol
+        over stdin/stdout, and srun/ssh forward both, so a remote executor is the same
+        object as a local one — the planner does not know the difference. Sinks and source
+        trees must be paths both ends can see (a shared filesystem)."""
         import subprocess
-        self.p = subprocess.Popen([bvm_exe, str(nworkers), str(budget_mb)],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        argv = list(launch or []) + [bvm_exe, str(nworkers), str(budget_mb)]
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.errors = []                                 # (path, -errno) per-op failures from bvm
         self._sock_sinks = set()                         # sinks whose receiver reassembles BY NAME
         self.strict = True                               # False: finish() reports, doesn't raise
@@ -653,6 +658,27 @@ class _Bvm:
         err = struct.unpack_from("<i", pld, 0)[0]
         plen = struct.unpack_from("<H", pld, 4)[0]
         self.errors.append((pld[6:6 + plen].decode(errors="replace"), err))
+
+    def poll(self):
+        """Consume whatever this executor has emitted SO FAR (one BSTAT per completed
+        frame, plus errors) and return how many frames completed since the last call. Lets
+        a planner hand out work against OBSERVED progress instead of a static split — which
+        is the whole difference between balanced and long-pole-bound on a real tree.
+        finish() still sees everything: a DONE/STATS/EOF message is put straight back."""
+        n = 0
+        while True:
+            try:
+                item = self._q.get_nowait()
+            except queue.Empty:
+                return n
+            t, pld = item
+            if t == 0:
+                self.stats.append(_stat_df(pld)); n += 1
+            elif t == 3:
+                self._err(pld)
+            else:
+                self._q.put(item)                        # end-of-stream: finish()'s business
+                return n
 
     def finish(self):
         """Close stdin (no more plans), drain, return {frame_id: (coff, clen)}."""
@@ -1348,6 +1374,234 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                 errors=len(b.errors), error_sample=b.errors[:5],
                 lost=len(lost_paths), lost_sample=lost_paths[:5],
                 perf=perf_report(b.perf))
+
+
+def slurm_launch(node, gpus=8, minutes=240, partition="gpu"):
+    """A `launch` prefix that puts one bvm on `node`. --unbuffered is NOT optional: without
+    it srun buffers the task's stdout and the planner's first read blocks forever."""
+    return ["srun", "-p", partition, "-G", str(gpus), "-N", "1", "-n", "1", "--mem=0",
+            f"--time={minutes}", "-w", node, "--unbuffered"]
+
+
+def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
+                 excludes=None, strict=False, sinks_per_node=8, frame_cap=None,
+                 launch=slurm_launch, chunk_gb=2, verbose=False):
+    """ONE planner, N executors, one store. Each node runs a bvm over the shared filesystem
+    and owns its own sink files, so nothing is serialized on a single inode or a single host's
+    fabric; the planner keeps the footer, which is what makes the result ONE archive rather
+    than N archives that have to be globbed back together.
+
+    Work is handed out AS NODES DRAIN, not pre-partitioned. A static split of a real tree is
+    long-pole-bound — one subtree here holds 3.86 TB of 5.9 TB, so a size-balanced 3-way split
+    still leaves one node doing 65% of the work. The planner instead sends ~`chunk_gb` at a
+    time to whichever executor has the fewest frames outstanding, measured from the BSTATs
+    coming back (see _Bvm.poll).
+
+    Clean-slate only: this is the full-backup path, no prior snapshot, no delta. Returns a
+    summary dict shaped like backup()'s."""
+    import numpy as np
+    root_abs = os.path.abspath(root)
+    if frame_cap is None:
+        frame_cap = (16 if level <= 6 else 32 if level <= 15 else 64) << 20
+    nn = len(nodes)
+    paths = shard_paths(out, nn * sinks_per_node)        # node i owns [i*spn, (i+1)*spn)
+    for p in paths:
+        open(p, "wb").close()
+    ign = load_ignore(root_abs, excludes)
+    bs = []
+    for i, nd in enumerate(nodes):
+        b = _Bvm(bvm_exe, nworkers, launch=launch(nd))
+        b.strict = strict
+        for k in range(sinks_per_node):
+            b.sink(k, paths[i * sinks_per_node + k], start=0)
+        bs.append(b)
+
+    # ---- scan (metadata-bound, one node: it is ~2% of a full backup's wall time) ----
+    t_scan = time.time()
+    bs[0].scan_fs(0, root_abs, ignore=ign)
+    parts, dparts = [], []
+    while True:
+        t, pld = bs[0].read()
+        if t is None or t == 1:
+            break
+        if t == 0:
+            df = _stat_df(pld)[2]
+            if df.height:
+                nm = df.select(path="path", size="size",
+                               mode=(pl.col("mode") & 0o7777).cast(pl.Int64),
+                               mtime_ns="mtime_ns", uid=pl.col("uid").cast(pl.Int64),
+                               gid=pl.col("gid").cast(pl.Int64), in_off="in_off", link="link",
+                               is_dir="is_dir")
+                parts.append(nm.filter(pl.col("is_dir") == 0).drop("is_dir"))
+                dparts.append(nm.filter(pl.col("is_dir") == 1).drop("is_dir"))
+    SCH = {"path": pl.Utf8, "size": pl.Int64, "mode": pl.Int64, "mtime_ns": pl.Int64,
+           "uid": pl.Int64, "gid": pl.Int64, "in_off": pl.Int64, "link": pl.Utf8}
+    sc = pl.concat(parts) if parts else pl.DataFrame(schema=SCH)
+    dirs = (pl.concat(dparts) if dparts else pl.DataFrame(schema=SCH)).sort("path")
+    links, files = sc.filter(pl.col("link") != ""), sc.filter(pl.col("link") == "")
+    scan_s = time.time() - t_scan
+
+    # ---- typed member stream, oversized members split (same rule as backup()) ----
+    big = files.filter(pl.col("size") > frame_cap)
+    small = files.filter(pl.col("size") <= frame_cap)
+    typed = pl.concat([
+        dirs.with_columns(type=pl.lit(5, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
+        small.select(list(SCH)).with_columns(type=pl.lit(0, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
+        links.with_columns(type=pl.when(pl.col("in_off") == 1).then(1).otherwise(2).cast(pl.UInt8),
+                           src_off=pl.lit(0, pl.Int64)),
+    ])
+    piece_rows = []
+    for r in big.iter_rows(named=True):
+        for o2, n2 in _pieces(0, r["size"], frame_cap):
+            piece_rows.append(dict(path=r["path"], size=n2, mode=r["mode"],
+                                   mtime_ns=r["mtime_ns"], uid=r["uid"], gid=r["gid"],
+                                   in_off=0, link="", type=0, src_off=o2))
+    if piece_rows:
+        typed = pl.concat([typed, pl.DataFrame(piece_rows).select(typed.columns).cast(
+            {c: typed.schema[c] for c in typed.columns})])
+    sizes = np.where(typed["type"].to_numpy() == 0, typed["size"].to_numpy(), 0)
+    pre = np.zeros(sizes.size + 1, np.int64); np.cumsum(sizes, out=pre[1:])
+    bounds = [0]
+    while bounds[-1] < sizes.size:
+        i = bounds[-1]
+        e = int(np.searchsorted(pre, pre[i] + (1 << 20), side="right")) - 1
+        bounds.append(max(e, i + 1))
+    nframes = len(bounds) - 1
+    fidx = np.repeat(np.arange(nframes, dtype=np.int64), np.diff(bounds))
+    pdf = typed.with_columns(fid=pl.Series(fidx))
+    ba = np.asarray(bounds, dtype=np.int64)
+
+    # ---- dispatch: ~chunk_gb at a time to the least-loaded executor ----
+    t_pack = time.time()
+    outstanding = [0] * nn                               # frames sent minus frames reported
+    shard_of = np.zeros(nframes, np.int64)
+    per_node_frames, sent_bytes = [0] * nn, [0] * nn
+    CH = int(chunk_gb * 1e9)
+    fcum = pre[ba]                                       # PAYLOAD BYTES at each frame boundary:
+    c = 0                                                # `ba` itself holds row indices, and
+    while c < len(bounds) - 1:                           # comparing those to a byte budget makes
+        e = max(int(np.searchsorted(fcum, fcum[c] + CH,  # the loop emit one giant chunk
+                                    side="right")) - 1, c + 1)
+        for i, b in enumerate(bs):
+            outstanding[i] -= b.poll()
+        # least outstanding, ties to whoever has had the least work overall: min() returns
+        # the FIRST minimum, so a plain least-outstanding rule sends everything to node 0
+        # whenever the executors drain between dispatches.
+        i = min(range(nn), key=lambda k: (outstanding[k], sent_bytes[k], k))
+        sl = pdf.slice(int(ba[c]), int(ba[e] - ba[c])).select(
+            fid="fid", type="type", mode=pl.col("mode").cast(pl.Int32), size="size",
+            mtime_ns="mtime_ns", uid=pl.col("uid").cast(pl.Int32), gid=pl.col("gid").cast(pl.Int32),
+            src_off="src_off", path="path", link="link")
+        fids = sl["fid"].unique().to_list()
+        for k in range(sinks_per_node):                  # spread within the node too
+            part = sl.filter(pl.col("fid") % sinks_per_node == k)
+            if part.height:
+                bs[i].pack_files_df(level, root_abs, part, sink_id=k, tar_compat=0)
+        for f in fids:
+            shard_of[int(f)] = i * sinks_per_node + int(f) % sinks_per_node
+        outstanding[i] += len(fids); per_node_frames[i] += len(fids)
+        sent_bytes[i] += int(ba[e] - ba[c]) and int(pre[ba[e]] - pre[ba[c]])
+        if verbose and c % 200 == 0:
+            print(f"    frames {c}/{nframes}  outstanding={outstanding}", flush=True)
+        c = e
+
+    locs, perfs = {}, []
+    for i, b in enumerate(bs):
+        locs.update(b.finish())
+        perfs.append(b.perf)
+    pack_s = time.time() - t_pack
+
+    # ---- footer (planner-owned, on shard 0) ----
+    gcum = pre
+    fstart = gcum[np.asarray(bounds[:-1], dtype=np.int64)]
+    in_off = gcum[:-1] - np.repeat(fstart, np.diff(bounds))
+    missing = [k for k in range(nframes) if k not in locs]
+    coff_a = np.fromiter((locs.get(k, (-1, 0))[0] for k in range(nframes)), np.int64, nframes)
+    clen_a = np.fromiter((locs.get(k, (-1, 0))[1] for k in range(nframes)), np.int64, nframes)
+    fall = pdf.with_columns(in_off_out=pl.Series(in_off),
+                            coff=pl.Series(np.repeat(coff_a, np.diff(bounds))),
+                            clen=pl.Series(np.repeat(clen_a, np.diff(bounds))),
+                            shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
+    lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
+    fall = fall.filter(pl.col("coff") >= 0)
+    digs, pdigs = [], {}
+    for b in bs:
+        for _s2, blk, d in b.stats:
+            dd = d.filter(pl.col("digest") != -1)
+            if dd.height:
+                digs.append(dd.select("path", "digest", "chunks"))
+                for rr in dd.iter_rows(named=True):
+                    pdigs[(int(blk), rr["path"])] = rr["chunks"]
+    digs = (pl.concat(digs) if digs else pl.DataFrame(
+        schema={"path": pl.Utf8, "digest": pl.Int64, "chunks": pl.Binary})
+        ).unique(subset="path", keep="last")
+    fullpaths = set(small["path"].to_list())
+    packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
+              .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),
+                            digest=pl.lit(-1, pl.Int64)).select(STAT_COLS + ["shard"])
+              .drop("digest").join(digs, on="path", how="left", maintain_order="left")
+              .with_columns(digest=pl.col("digest").fill_null(-1),
+                            extents=pl.lit(None, pl.Binary)))
+    lit_lookup = {}
+    for rr in fall.filter((pl.col("type") == 0) & ~pl.col("path").is_in(list(fullpaths))).iter_rows(named=True):
+        lit_lookup[(rr["path"], rr["src_off"])] = (rr["coff"], rr["clen"], rr["in_off_out"],
+                                                   rr["shard"], rr["fid"])
+    drows = []
+    for r in big.iter_rows(named=True):                  # split members -> EXTENT rows
+        ex, oo, mans, ok_ = [], 0, [], True
+        for o2, n2 in _pieces(0, r["size"], frame_cap):
+            hit = lit_lookup.get((r["path"], o2))
+            if hit is None:
+                ok_ = False; break
+            coff, clen, io_, sh_, fid_ = hit
+            ex.append((coff, clen, io_, n2, oo, sh_)); oo += n2
+            mans.append(pdigs.get((int(fid_), r["path"])))
+        if not ok_:
+            lost_paths.append(r["path"]); continue
+        drows.append(dict(path=r["path"], size=r["size"], mode=r["mode"], mtime_ns=r["mtime_ns"],
+                          uid=r["uid"], gid=r["gid"], frame=-4, in_off=-1, coff=-1, clen=-1,
+                          digest=-1, link="", chunks=_cat_manifests(mans),
+                          extents=_pack_extents(ex), shard=0))
+    C13 = STAT_COLS + ["chunks", "extents", "shard"]
+    ddf = pl.DataFrame(drows).select(C13) if drows else None
+    dirsr = fall.filter(pl.col("type") == 5).select(
+        path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
+        gid="gid", frame=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64),
+        coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64),
+        link=pl.lit("", pl.Utf8), chunks=pl.lit(None, pl.Binary), extents=pl.lit(None, pl.Binary),
+        shard=pl.lit(0, pl.Int64))
+    linksr = links.select(
+        path="path", size="size", mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid",
+        frame=pl.when(pl.col("in_off") == 1).then(-3).otherwise(-2).cast(pl.Int64),
+        in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64),
+        digest=pl.lit(-1, pl.Int64), link="link", chunks=pl.lit(None, pl.Binary),
+        extents=pl.lit(None, pl.Binary), shard=pl.lit(0, pl.Int64))
+    # Per-shard data end from the LOCATORS, not from stat(): the planner never wrote these
+    # files — remote executors did — and a distributed filesystem happily serves the planner
+    # a cached size from before those writes (measured: 11 of 12 shards reported ~0 while
+    # holding 247 MB). The footer's own locators are authoritative and cost nothing.
+    ends = [0] * len(paths)
+    for k in range(nframes):
+        if k in locs:
+            sh_ = int(shard_of[k])
+            ends[sh_] = max(ends[sh_], int(locs[k][0] + locs[k][1]))
+    end = ends[0]
+    fd = os.open(out, os.O_RDWR)
+    ps = [packed.select(C13), dirsr.select(C13), linksr.select(C13)]
+    if ddf is not None:
+        ps.append(ddf)
+    write_footer(fd, end, ps, prev_off=None, rows_per_batch=1 << 12, part_cuts=True,
+                 snap_time_ns=time_ns if time_ns is not None else time.time_ns())
+    os.close(fd)
+    footer_bytes = os.path.getsize(out) - end                # the planner wrote this one
+    return dict(nodes=list(nodes), sinks=len(paths), scan_s=round(scan_s, 1),
+                pack_s=round(pack_s, 1),
+                store_bytes=sum(ends) + footer_bytes, data_per_shard=ends,
+                frames=nframes, frames_per_node=per_node_frames,
+                bytes_per_node=[int(x) for x in sent_bytes],
+                full=small.height, split=big.height, dirs=dirsr.height, links=linksr.height,
+                errors=sum(len(b.errors) for b in bs), lost=len(lost_paths),
+                lost_sample=lost_paths[:5], perf=[perf_report(p) for p in perfs if p])
 
 
 def _obj_store(url):
