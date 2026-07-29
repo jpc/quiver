@@ -68,18 +68,29 @@ def scan_fs(root, chunk_rows=50000, bvm_exe=None, workers=32):
 
 
 def default_bvm():
-    """Path to the bvm executor, built on demand from bvm.c (static zstd+sodium)."""
+    """Path to the bvm executor. This NEVER builds it -- building is an explicit step:
+
+        make -C quiver/exec bvm
+
+    It used to rebuild whenever bvm.c looked newer, which is convenient right up until it
+    isn't: any incidental call would relink the executable that running executors were
+    mid-flight on. Over a shared filesystem the kernel's ETXTBSY guard does not reach the
+    nodes running them, so the write succeeds and they die. That cost a 100-minute backup at
+    95%. A stale binary is just as bad in the other direction -- a long benchmark that
+    silently measures the code you thought you replaced -- so staleness is an error too.
+
+    QUIVER_BVM points at a prebuilt binary; QUIVER_ALLOW_STALE=1 waives the freshness check.
+    """
     d = os.path.dirname(os.path.abspath(__file__))
-    exe, src = os.path.join(d, "bvm"), os.path.join(d, "bvm.c")
-    if not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src):
-        import subprocess
-        # Build to a TEMP name, then rename over the old one. Writing the executable in place
-        # replaces the text of every executor ALREADY RUNNING it -- including remote ones on a
-        # shared filesystem, where the kernel's ETXTBSY guard does not reach. That killed a
-        # 100-minute backup at 95%: an unrelated test called default_bvm(), which rebuilt.
-        # rename is atomic and leaves running processes on their original inode.
-        subprocess.check_call(["make", "-C", d, "bvm", "BVM_OUT=bvm.new"])
-        os.replace(os.path.join(d, "bvm.new"), exe)
+    exe = os.environ.get("QUIVER_BVM") or os.path.join(d, "bvm")
+    src = os.path.join(d, "bvm.c")
+    if not os.path.exists(exe):
+        raise RuntimeError(f"{exe} not built. Run:  make -C {d} bvm")
+    if (os.path.exists(src) and os.path.getmtime(exe) < os.path.getmtime(src)
+            and not os.environ.get("QUIVER_ALLOW_STALE")):
+        raise RuntimeError(
+            f"{exe} is older than {os.path.basename(src)} -- it would measure the wrong code. "
+            f"Run:  make -C {d} bvm    (or set QUIVER_ALLOW_STALE=1)")
     return exe
 
 
@@ -375,6 +386,24 @@ def _s(s):
     b = s.encode(); return struct.pack("<H", len(b)) + b
 
 
+FRAME_DT = [("frame", "<u8"), ("coff", "<u8"), ("clen", "<u8"), ("t0_ns", "<i8"),
+            ("t1_ns", "<i8"), ("in_bytes", "<i8"), ("jq_depth", "<i4"), ("busy", "<i4"),
+            ("worker", "<i4"), ("sink", "<i4")]
+
+
+def read_frames_live(path):
+    """Read a live <store>.frames.bin. Fixed-width records, so this needs no locking and no
+    format negotiation: floor to whole records and a half-written tail is simply not there
+    yet. This is the dump everything else reads -- the watcher, and the post-hoc analysis."""
+    import numpy as np
+    rec = np.dtype(FRAME_DT)
+    n = os.path.getsize(path) // rec.itemsize
+    if not n:
+        return pl.DataFrame()
+    a = np.fromfile(path, dtype=rec, count=n)
+    return pl.DataFrame({k: a[k] for k, _ in FRAME_DT})
+
+
 def frame_costs(bvms, pdf=None, root_depth=2):
     """One row per frame: when it ran, on which worker and sink, what it cost, and how deep
     the queue was WHEN IT STARTED. With `pdf` (the planner's frame->member table) each row
@@ -569,6 +598,7 @@ class _Bvm:
         self.perf_series = []                            # one per second; counters are cumulative,
                                                          # so difference them for per-interval rates
         self.frames = []                                 # one cost record per frame (FRAME_COLS)
+        self.frames_fd = None                            # set to stream them to disk as well
         # DEDICATED stdout reader: bvm workers emit STAT/ERROR messages at ANY time (pack
         # digests, scan batches); if the planner only reads between sends, the stdout pipe
         # fills, workers block in emit under g_out_mu, the command loop stops reading stdin,
@@ -696,6 +726,22 @@ class _Bvm:
         plen = struct.unpack_from("<H", pld, 4)[0]
         self.errors.append((pld[6:6 + plen].decode(errors="replace"), err))
 
+    def _take_done(self, pld):
+        """Parse a streamed batch of frame records, append them to the live dump, and return
+        their locators. bvm flushes these every DONE_FLUSH frames, so the file on disk is the
+        run's state as it happens: a watcher reads it, and after a crash the locators of every
+        frame already on disk are still there."""
+        nd = struct.unpack_from("<I", pld, 0)[0]
+        body = pld[4:4 + nd * self.DONE_SZ]
+        out = {}
+        for i in range(nd):
+            rec = struct.unpack_from("<QQQqqqiiii", body, i * self.DONE_SZ)
+            out[rec[0]] = (rec[1], rec[2])
+            self.frames.append(rec)
+        if self.frames_fd is not None:
+            os.write(self.frames_fd, body)               # fixed-width; a torn tail is one record
+        return out
+
     def poll(self):
         """Consume whatever this executor has emitted SO FAR (one BSTAT per completed
         frame, plus errors) and return how many frames completed since the last call. Lets
@@ -713,6 +759,8 @@ class _Bvm:
                 self.stats.append(_stat_df(pld)); n += 1
             elif t == 3:
                 self._err(pld)
+            elif t == 2:                                 # streamed frame records, not the end
+                self._take_done(pld)
             elif t == 4:                                 # a periodic sample, not end-of-stream:
                 self.perf = dict(zip(self.PERF_FIELDS,   # consume it, or poll() stops draining
                                      struct.unpack(f"<{len(self.PERF_FIELDS)}q", pld)))
@@ -736,13 +784,8 @@ class _Bvm:
                 continue
             if t == 0:
                 self.stats.append(_stat_df(pld)); continue
-            if t == 2:                                   # per-frame cost records (Done in bvm.c)
-                nd = struct.unpack_from("<I", pld, 0)[0]; off = 4
-                for _ in range(nd):
-                    rec = struct.unpack_from("<QQQqqqiiii", pld, off)
-                    off += self.DONE_SZ
-                    locs[rec[0]] = (rec[1], rec[2])
-                    self.frames.append(rec)
+            if t == 2:
+                locs.update(self._take_done(pld))
         rc = self.p.wait()
         if self.errors and self.strict:                  # partial failure is an ERROR, never silent
             import errno as _e
@@ -1055,6 +1098,49 @@ def store_files(out):
     return paths
 
 
+def _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap):
+    """EXTENT rows for split members, built set-at-a-time.
+
+    The obvious loop -- for each big member, for each of its pieces, look up the locator and
+    struct.pack an extent -- is ~380k Python iterations on a whole-tree backup (9,346 members
+    x ~40 pieces), and it dominated a footer phase that cost 885 s, 29% of a 50-minute run.
+    Here it is joins and one group_by; the only per-member work left is a numpy .tobytes()
+    and a manifest concat. Returns (rows, lost_paths)."""
+    import numpy as np
+    if not big.height:
+        return [], []
+    lit = (fall.filter((pl.col("type") == 0) & ~pl.col("path").is_in(list(fullpaths)))
+           .select("path", "src_off", "coff", "clen", "in_off_out", "shard", "fid", "size")
+           .sort(["path", "src_off"]))
+    lit = (lit.join(chunk_df, on=["fid", "path"], how="left")
+           if chunk_df is not None and chunk_df.height
+           else lit.with_columns(chunks=pl.lit(None, pl.Binary)))
+    lit = lit.with_columns(out_off=(pl.col("size").cum_sum() - pl.col("size")).over("path"))
+    g = lit.group_by("path", maintain_order=True).agg(
+        pl.col("coff"), pl.col("clen"), pl.col("in_off_out"), pl.col("size"),
+        pl.col("out_off"), pl.col("shard"), pl.col("chunks"), pl.len().alias("npiece"))
+    meta = {r["path"]: r for r in big.iter_rows(named=True)}
+    rows, lost = [], []
+    seen = set()
+    for r in g.iter_rows(named=True):
+        m = meta.get(r["path"])
+        if m is None:
+            continue
+        seen.add(r["path"])
+        if r["npiece"] != len(_pieces(0, m["size"], frame_cap)) or min(r["coff"]) < 0:
+            lost.append(r["path"]); continue         # a piece's frame errored: member is lost
+        a = np.empty((r["npiece"], 6), dtype="<u8")  # coff, clen, in_off, len, out_off, shard
+        a[:, 0] = r["coff"]; a[:, 1] = r["clen"]; a[:, 2] = r["in_off_out"]
+        a[:, 3] = r["size"]; a[:, 4] = r["out_off"]; a[:, 5] = r["shard"]
+        rows.append(dict(path=r["path"], size=m["size"], mode=m["mode"], mtime_ns=m["mtime_ns"],
+                         uid=m["uid"], gid=m["gid"], frame=-4, in_off=-1, coff=-1, clen=-1,
+                         digest=-1, link="", chunks=_cat_manifests(r["chunks"]),
+                         extents=struct.pack("<I", EXT_V2 | r["npiece"]) + a.tobytes(),
+                         shard=0))
+    lost += [p for p in meta if p not in seen]       # no pieces at all: every frame errored
+    return rows, lost
+
+
 def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None, strict=True,
            shards=1, frame_cap=None, max_member_bytes=1 << 40):
     """APPEND-ONLY incremental backup of `root` into `out` (a nock snapshot chain).
@@ -1120,6 +1206,7 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     b = _Bvm(bvm_exe, nworkers)
     b.strict = strict                                    # live trees race: strict=False collects
                                                          # per-file errors into the report instead
+    b.frames_fd = os.open(out + ".frames.bin", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     for k, p in enumerate(paths):
         if not os.path.exists(p):
             open(p, "wb").close()
@@ -1318,10 +1405,10 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     # path-keyed `digs` above collapses them. Concatenating the pieces' manifests yields a
     # valid chunking of the whole file (content-defined within each piece, with one forced
     # boundary per frame_cap), which is what keeps a split member deltable next snapshot.
-    pdigs = {}
-    for _s2, _blk, d in b.stats:
-        for rr in d.filter(pl.col("digest") != -1).iter_rows(named=True):
-            pdigs[(int(_blk), rr["path"])] = rr["chunks"]
+    cparts = [d.filter(pl.col("digest") != -1).select("path", "chunks")
+               .with_columns(fid=pl.lit(int(blk), pl.Int64)) for _s2, blk, d in b.stats]
+    chunk_df = (pl.concat([c for c in cparts if c.height])
+                if any(c.height for c in cparts) else None)
     drows = []
     for r, dg, newman, segs in delta_meta:
         ex, oo, ok_ = [], 0, True
@@ -1346,21 +1433,8 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     # SPLIT whole files: one extent per piece           # a delta — keep them apart in the report, manifest = the pieces' manifests concatenated.
     # `digest` stays -1 — the whole-file BLAKE3 would need a second full read, and no reader
     # uses it for extent members (`verify` only re-hashes frame>=0 rows).
-    for r in big.iter_rows(named=True):
-        ex, oo, mans, ok_ = [], 0, [], True
-        for o2, n2 in _pieces(0, r["size"], frame_cap):
-            hit = lit_lookup.get((r["path"], o2))
-            if hit is None:                              # that piece's frame errored: lost
-                ok_ = False; break
-            coff, clen, io_, sh_, fid_ = hit
-            ex.append((coff, clen, io_, n2, oo, sh_)); oo += n2
-            mans.append(pdigs.get((int(fid_), r["path"])))
-        if not ok_:
-            lost_paths.append(r["path"]); continue
-        drows.append(dict(path=r["path"], size=r["size"], mode=r["mode"], mtime_ns=r["mtime_ns"],
-                          uid=r["uid"], gid=r["gid"], frame=-4, in_off=-1, coff=-1, clen=-1,
-                          digest=-1, link="", chunks=_cat_manifests(mans),
-                          extents=_pack_extents(ex), shard=0))
+    _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
+    drows.extend(_r); lost_paths.extend(_lost)
     C13 = STAT_COLS + ["chunks", "extents", "shard"]
     ddf = pl.DataFrame(drows).select(C13) if drows else None
     dirsr = fall.filter(pl.col("type") == 5).select(
@@ -1440,6 +1514,23 @@ def slurm_launch(node, gpus=8, minutes=240, partition="gpu"):
             f"--time={minutes}", "-w", node, "--unbuffered"]
 
 
+def _progress_writer(path, state, stop):
+    """Dump live state to disk every couple of seconds so a SEPARATE process can watch. The
+    planner cannot report progress itself: after dispatch it is blocked in finish() draining
+    tens of thousands of outstanding frames, which is precisely the stretch you want to see.
+    Written temp-and-renamed so a reader never catches a half-written file."""
+    import json
+    while not stop.is_set():
+        try:
+            snap = state()
+            with open(path + ".tmp", "w") as f:
+                json.dump(snap, f)
+            os.replace(path + ".tmp", path)
+        except Exception:
+            pass
+        stop.wait(2.0)
+
+
 def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                  excludes=None, strict=False, sinks_per_node=8, frame_cap=None,
                  launch=slurm_launch, chunk_gb=2, verbose=False,
@@ -1466,15 +1557,54 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     for p in paths:
         open(p, "wb").close()
     ign = load_ignore(root_abs, excludes)
+    t_start = time.time()
+    phase = ["launch"]
+    dispatched = [0]
+    outstanding = [0] * len(nodes)
     bs = []
     for i, nd in enumerate(nodes):
         b = _Bvm(bvm_exe, nworkers, launch=launch(nd))
         b.strict = strict
+        b.frames_fd = os.open(f"{out}.frames.{i}.bin", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         for k in range(sinks_per_node):
             b.sink(k, paths[i * sinks_per_node + k], start=0)
         bs.append(b)
 
+    def _snap():
+        el = time.time() - t_start
+        per = []
+        for i, b in enumerate(bs):
+            p = b.perf or {}
+            per.append(dict(node=nodes[i], outstanding=outstanding[i], batches=len(b.stats),
+                            rd_gb=round(p.get("rd_bytes", 0) / 1e9, 1),
+                            wr_gb=round(p.get("wr_bytes", 0) / 1e9, 1),
+                            comp_in=p.get("comp_in", 0), comp_out=p.get("comp_out", 0),
+                            raw_frames=p.get("n_raw_frames", 0),
+                            raw_gb=round(p.get("raw_bytes", 0) / 1e9, 1),
+                            busy=round(p.get("busy_sum", 0) / max(p.get("q_samples", 1), 1), 1),
+                            jq=round(p.get("jq_sum", 0) / max(p.get("q_samples", 1), 1), 1),
+                            jq_full_pct=round(100 * p.get("jq_full", 0) / max(p.get("q_samples", 1), 1), 1),
+                            opens=p.get("n_open", 0), slow_opens=p.get("slow_open", 0),
+                            workers=p.get("nworkers", nworkers), errors=len(b.errors)))
+        tot_in = sum(x["comp_in"] for x in per); tot_out = sum(x["comp_out"] for x in per)
+        return dict(store=out, elapsed_s=round(el, 1), phase=phase[0], nodes=per,
+                    frames_total=nframes_box[0], frames_dispatched=dispatched[0],
+                    rd_gb=round(sum(x["rd_gb"] for x in per), 1),
+                    wr_gb=round(sum(x["wr_gb"] for x in per), 1),
+                    ratio=round(tot_out / tot_in, 4) if tot_in else None,
+                    raw_gb=round(sum(x["raw_gb"] for x in per), 1),
+                    rd_gbs=round(sum(x["rd_gb"] for x in per) / el, 3) if el else 0,
+                    wr_gbs=round(sum(x["wr_gb"] for x in per) / el, 3) if el else 0)
+
+    nframes_box = [0]
+    import threading as _th
+    _stop = _th.Event()
+    _pw = _th.Thread(target=_progress_writer, args=(out + ".progress.json", _snap, _stop),
+                     daemon=True)
+    _pw.start()
+
     # ---- scan (metadata-bound, one node: it is ~2% of a full backup's wall time) ----
+    phase[0] = "scan"
     t_scan = time.time()
     bs[0].scan_fs(0, root_abs, ignore=ign)
     parts, dparts = [], []
@@ -1539,8 +1669,9 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     ba = np.asarray(bounds, dtype=np.int64)
 
     # ---- dispatch: ~chunk_gb at a time to the least-loaded executor ----
+    phase[0] = "pack"
+    nframes_box[0] = nframes
     t_pack = time.time()
-    outstanding = [0] * nn                               # frames sent minus frames reported
     shard_of = np.zeros(nframes, np.int64)
     per_node_frames, sent_bytes = [0] * nn, [0] * nn
     CH = int(chunk_gb * 1e9)
@@ -1566,18 +1697,20 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                 bs[i].pack_files_df(level, root_abs, part, sink_id=k, tar_compat=0)
         for f in fids:
             shard_of[int(f)] = i * sinks_per_node + int(f) % sinks_per_node
-        outstanding[i] += len(fids); per_node_frames[i] += len(fids)
+        outstanding[i] += len(fids); per_node_frames[i] += len(fids); dispatched[0] = c
         sent_bytes[i] += int(ba[e] - ba[c]) and int(pre[ba[e]] - pre[ba[c]])
         if verbose and c % 200 == 0:
             print(f"    frames {c}/{nframes}  outstanding={outstanding}", flush=True)
         c = e
 
     globals()["_last_bvms"] = bs                         # so a driver can pull the frame costs
+    phase[0] = "drain"
     locs, perfs = {}, []
     for i, b in enumerate(bs):
         locs.update(b.finish())                          # blocks until that executor drains
         perfs.append(b.perf)
     pack_s = time.time() - t_pack
+    phase[0] = "footer"
     t_foot = time.time()
 
     # ---- footer (planner-owned, on shard 0) ----
@@ -1593,14 +1726,15 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                             shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
     lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
     fall = fall.filter(pl.col("coff") >= 0)
-    digs, pdigs = [], {}
+    digs, cparts = [], []
     for b in bs:
         for _s2, blk, d in b.stats:
             dd = d.filter(pl.col("digest") != -1)
             if dd.height:
                 digs.append(dd.select("path", "digest", "chunks"))
-                for rr in dd.iter_rows(named=True):
-                    pdigs[(int(blk), rr["path"])] = rr["chunks"]
+                cparts.append(dd.select("path", "chunks")
+                              .with_columns(fid=pl.lit(int(blk), pl.Int64)))
+    chunk_df = pl.concat(cparts) if cparts else None
     digs = (pl.concat(digs) if digs else pl.DataFrame(
         schema={"path": pl.Utf8, "digest": pl.Int64, "chunks": pl.Binary})
         ).unique(subset="path", keep="last")
@@ -1611,26 +1745,9 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
               .drop("digest").join(digs, on="path", how="left", maintain_order="left")
               .with_columns(digest=pl.col("digest").fill_null(-1),
                             extents=pl.lit(None, pl.Binary)))
-    lit_lookup = {}
-    for rr in fall.filter((pl.col("type") == 0) & ~pl.col("path").is_in(list(fullpaths))).iter_rows(named=True):
-        lit_lookup[(rr["path"], rr["src_off"])] = (rr["coff"], rr["clen"], rr["in_off_out"],
-                                                   rr["shard"], rr["fid"])
     drows = []
-    for r in big.iter_rows(named=True):                  # split members -> EXTENT rows
-        ex, oo, mans, ok_ = [], 0, [], True
-        for o2, n2 in _pieces(0, r["size"], frame_cap):
-            hit = lit_lookup.get((r["path"], o2))
-            if hit is None:
-                ok_ = False; break
-            coff, clen, io_, sh_, fid_ = hit
-            ex.append((coff, clen, io_, n2, oo, sh_)); oo += n2
-            mans.append(pdigs.get((int(fid_), r["path"])))
-        if not ok_:
-            lost_paths.append(r["path"]); continue
-        drows.append(dict(path=r["path"], size=r["size"], mode=r["mode"], mtime_ns=r["mtime_ns"],
-                          uid=r["uid"], gid=r["gid"], frame=-4, in_off=-1, coff=-1, clen=-1,
-                          digest=-1, link="", chunks=_cat_manifests(mans),
-                          extents=_pack_extents(ex), shard=0))
+    _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
+    drows.extend(_r); lost_paths.extend(_lost)
     C13 = STAT_COLS + ["chunks", "extents", "shard"]
     ddf = pl.DataFrame(drows).select(C13) if drows else None
     dirsr = fall.filter(pl.col("type") == 5).select(
@@ -1667,6 +1784,7 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     write_footer(fd, end, ps, prev_off=None, rows_per_batch=1 << 12, part_cuts=True,
                  snap_time_ns=time_ns if time_ns is not None else time.time_ns())
     os.close(fd)
+    phase[0] = "done"; _stop.set()
     footer_s = round(time.time() - t_foot, 1)            # how much is SERIAL after packing?
     fc = frame_costs(bs, pdf)                            # SIDECAR, never inside the archive:
     if fc.height:                                        # telemetry is optional to keep
