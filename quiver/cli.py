@@ -14,7 +14,6 @@ by a Python planner (blocks.py). Verbs:
     rm PATH                  parallel delete
     cp SRC DST               parallel recursive copy (mode+mtime preserved)
     serve ARCHIVE            browse a nock over HTTP
-    migrate ARCHIVE          upgrade a legacy nock footer -> chunked NOCKZC01 in place
 """
 import argparse
 import os
@@ -125,8 +124,6 @@ def main(argv=None):
     a.add_argument("--procs", type=int, default=1, help="fork N bvm unlinker processes (separate WEKA clients)")
     a = sub.add_parser("cp"); a.add_argument("src"); a.add_argument("dst")
     a = sub.add_parser("serve"); a.add_argument("archive"); a.add_argument("--port", type=int, default=8756)
-    a = sub.add_parser("migrate", help="legacy nock footer -> chunked, in place")
-    a.add_argument("archive")
     args = p.parse_args(argv)
     j = args.workers
     fb = args.frame_mb * (1 << 20) if getattr(args, "frame_mb", None) else 1 << 20
@@ -266,9 +263,6 @@ def main(argv=None):
     elif args.cmd == "serve":
         from .nock import zserve
         zserve.main([args.archive, "--port", str(args.port)])
-    elif args.cmd == "migrate":
-        n = blocks.migrate(args.archive)
-        print(f"already chunked" if n == 0 else f"migrated {n:,} members -> chunked")
 
 
 if __name__ == "__main__":

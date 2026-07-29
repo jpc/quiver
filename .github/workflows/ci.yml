@@ -2,17 +2,22 @@ name: ci
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest      # VM runner: io_uring available
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
-      - run: sudo apt-get update && sudo apt-get install -y liburing-dev libzstd-dev
-      - run: pip install polars numpy pyarrow "moto[s3]" flatbuffers boto3
-      - run: PYTHONPATH=. python3 quiver/compiler/gen_templates.py quiver/exec/ipc_gen.h
-      - run: make -C quiver/exec quiver-exec
-      - run: PYTHONPATH=. python3 -m quiver.tests.run_all
-        env:
-          # runners without io_uring (containerized) can force the
-          # portable engine; VM runners run the full matrix
-          QUIVER_FORCE_ENGINE: ""
+        with: {python-version: "3.11"}
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzstd-dev libsodium-dev liburing-dev
+          python -m pip install -U pip polars numpy zstandard blake3 pytest
+      - name: build bvm
+        run: |
+          git clone --depth 1 https://github.com/BLAKE3-team/BLAKE3 /tmp/b3
+          cmake -S /tmp/b3/c -B /tmp/b3/build -DCMAKE_INSTALL_PREFIX=/tmp/b3/inst >/dev/null
+          cmake --build /tmp/b3/build --target install -j >/dev/null
+          make -C quiver/exec bvm ZSTD=/usr SODIUM=/usr URING=/usr BLAKE3=/tmp/b3/inst \
+            || make -C quiver/exec bvm
+      - name: pytest
+        run: PYTHONPATH=. python -m pytest tests/ -q

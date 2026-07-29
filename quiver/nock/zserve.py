@@ -1,5 +1,5 @@
 """
-quiver.nock.zserve — browse a real per-batch-frame (zframe) archive.
+quiver.nock.zserve — browse a nock over HTTP.
 
 A dependency-free HTTP server (stdlib) over a zframe .tar.zstd. It reads
 the nock footer once for the member index, and on demand decompresses a

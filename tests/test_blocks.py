@@ -182,21 +182,6 @@ def test_chunked_footer_random_access(tmp_path):
     assert one[0]["path"][0] == df["path"][50_000]                  # right slice
 
 
-def test_migrate_legacy(bvm, tmp_path):
-    from quiver.nock import zframe, nockidx
-    src = str(tmp_path / "s.tar.zstd")
-    truth = _tar_zstd(src, _sample_members(60))
-    legacy = str(tmp_path / "legacy.nock")
-    zframe.recompress([src], legacy, batch_bytes=32 << 10, level=6)  # OLD engine -> NOCKIDX
-    assert nockidx.read_directory(legacy) is None                   # not chunked yet
-    assert blocks.migrate(legacy) == len(truth)                     # footer-only rewrite
-    assert nockidx.read_directory(legacy) is not None               # now chunked
-    assert blocks.migrate(legacy) == 0                              # idempotent
-    dest = str(tmp_path / "un")
-    assert blocks.unpack_c(legacy, dest, bvm, nworkers=4) == len(truth)
-    assert _tree_md5(dest) == truth                                 # data frames intact
-
-
 # ------------------------------------------------------------------ streaming unpack
 def test_unpack_streaming_multibatch(bvm, tmp_path):
     """Unpack streams the footer batch-by-batch; batches are frame-aligned, so each holds

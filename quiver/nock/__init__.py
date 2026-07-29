@@ -1,4 +1,2 @@
-from .format import BLOCK, RawFormat, TarFormat, plan_layout  # noqa
-from .footer import (extract, finish_archive, index_arrow_shard,  # noqa
-                     index_tar, read_index, write_footer)
-from . import footer  # noqa
+"""quiver.nock — the nock container: a zstd stream whose footer indexes its frames."""
+from . import nockidx  # noqa

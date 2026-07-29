@@ -889,7 +889,12 @@ def _cat_manifests(blobs):
 
 
 def _parse_manifest(m):
-    """chunks binary -> (hashid, [(len, 16B digest), ...])."""
+    """chunks binary -> (hashid, [(len, 16B digest), ...]).
+    [u8 hash_id][3 pad][u32 n][n x (u32 len, 16B id)]; hash_id 2 = BLAKE3-128. The count
+    lives at offset 4 ONLY because of that header — an older 4-byte-header blob would read
+    its first chunk's length as the chunk count and silently mis-delta, so refuse it."""
+    if m[0] != 2:
+        raise ValueError(f"manifest hash_id {m[0]} is not 2 (BLAKE3-128): refusing to parse")
     (n,) = struct.unpack_from("<I", m, 4)
     out = []
     off = 8
@@ -2277,47 +2282,6 @@ def write_footer(sink_fd, cursor, parts, level=3, rows_per_batch=1 << 20, prev_o
                                            forced_cuts=fc, snap_time_ns=snap_time_ns,
                                            prev_commit=prev_commit), cursor)
     return stat
-
-
-def migrate(path):
-    """Convert a legacy (pre-chunked) nock footer to the current chunked NOCKZC01 format
-    IN PLACE — the one-shot upgrade for archives written before the format switch. Reads
-    the old footer once (retired reader; NO data-frame decode), truncates it, and rewrites
-    the chunked footer at data_end = max(coff+clen). The compressed data frames are
-    untouched — (coff,clen,in_off) already match blocks' read model. Returns member count
-    (0 if `path` is already chunked)."""
-    from ..nock import nockidx, zframe
-    if nockidx.read_directory(path) is not None:
-        return 0                                          # already chunked
-    df = zframe.read_index(path)                           # legacy schema (frame_coff/clen)
-    df = df.rename({a: b for a, b in (("frame_coff", "coff"), ("frame_clen", "clen"))
-                    if a in df.columns})
-    if "digest" not in df.columns:
-        df = df.with_columns(digest=pl.lit(-1, pl.Int64))
-    stat = df.select(
-        path="path", size=pl.col("size").cast(pl.Int64), mode=pl.col("mode").cast(pl.Int64),
-        mtime_ns=pl.col("mtime_ns").cast(pl.Int64), uid=pl.col("uid").cast(pl.Int64),
-        gid=pl.col("gid").cast(pl.Int64), frame=pl.col("frame").cast(pl.Int64),
-        in_off=pl.col("in_off").cast(pl.Int64), coff=pl.col("coff").cast(pl.Int64),
-        clen=pl.col("clen").cast(pl.Int64), digest=pl.col("digest").cast(pl.Int64))
-    files = stat.filter(pl.col("frame") >= 0)
-    data_end = int((files["coff"] + files["clen"]).max()) if files.height else 0
-    fsz = os.path.getsize(path)
-    if data_end < fsz:                                    # in-file footer (not a sidecar):
-        with open(path, "rb") as f:                       # data_end = max(coff+clen) can't
-            f.seek(data_end); m = struct.unpack("<I", f.read(4))[0]   # be inside a data
-        if m not in (0x184D2A50, 0xFD2FB528):             # frame, and the footer starts
-            raise RuntimeError(                           # here as a skippable (quiver-exec)
-                f"{path}: data_end={data_end} is not a zstd frame boundary "   # or zstd (py)
-                f"(0x{m:08X}); coff/clen suspect, refusing to migrate")        # frame. Else
-        # else: coff/clen misread would land mid-frame on random bytes -> caught above.
-    fd = os.open(path, os.O_RDWR)
-    try:
-        os.ftruncate(fd, data_end)                        # drop the old footer region
-        write_footer(fd, data_end, [stat])                # append the chunked footer
-    finally:
-        os.close(fd)
-    return files.height
 
 
 def unpack(nocks, dest, bvm_exe, nworkers=16, predicate=None, shuffle=True, at=None,

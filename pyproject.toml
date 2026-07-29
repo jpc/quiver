@@ -9,11 +9,11 @@ description = "Set-at-a-time Unix file tools on io_uring, Polars, and Arrow; noc
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
-dependencies = ["polars>=1.0", "numpy>=1.26"]
+dependencies = ["polars>=1.0", "numpy>=1.26", "zstandard>=0.22", "blake3>=0.4"]
 
 [project.optional-dependencies]
 s3 = ["boto3"]
-dev = ["pyarrow", "moto[s3]", "flatbuffers"]   # test oracles only
+dev = ["pytest", "pyarrow", "flatbuffers"]     # test oracles only
 
 [project.scripts]
 quiver = "quiver.cli:main"

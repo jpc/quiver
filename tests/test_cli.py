@@ -336,8 +336,3 @@ def test_cli_cp_sync_links(bvm, tmp_path):
         assert os.readlink(f"{dst}/sy") == "f"                             # symlink preserved
 
 
-def test_cli_migrate_idempotent(bvm, tmp_path):
-    src, nk = str(tmp_path / "s.tar.zstd"), str(tmp_path / "o.nock")
-    _tar_zstd(src, _members(20))
-    _q("recompress", nk, src)
-    assert "already chunked" in _q("migrate", nk)         # blocks writes chunked already
