@@ -333,3 +333,25 @@ def test_many_members_multi_record_batch(bvm, tmp_path):
     assert r["lost"] == 0, f"lost {r['lost']} members: {r['lost_sample']}"
     comp = blocks.verify_complete(str(nock), root=str(src))
     assert comp["missing"] == 0 and comp["footer"] >= n, comp
+
+
+def test_multinode_locators_stream_during_dispatch(bvm, tmp_path):
+    """bvm flushes frame locators every 2048 frames AND once a second, so on any real job most
+    of them arrive while the planner is still dispatching -- i.e. through poll(), not finish().
+    poll() used to parse them and drop the result, which cost 2,210,967 members' locators on a
+    whole-home backup: 6 TB of correct data on disk with a footer that referenced almost none
+    of it. Single-node backup() never calls poll(), so only a MULTI-executor run reproduces it.
+    Uses two local executors -- no cluster required."""
+    src = tmp_path / "tree"
+    src.mkdir()
+    for i in range(900):                                  # enough frames to force >1 flush
+        (src / f"f{i:04d}.bin").write_bytes(os.urandom(3000) * (1 + i % 7))
+    out = str(tmp_path / "s.nock")
+    r = blocks.backup_multi(str(src), out, bvm, ["a", "b"], nworkers=4, sinks_per_node=2,
+                            chunk_gb=0.000_2, launch=lambda n: [], strict=False)
+    assert r["lost"] == 0, f"lost {r['lost']} members: locators were dropped"
+    idx = blocks.scan_nock(out)
+    assert idx.filter(pl.col("frame") >= 0).height == 900
+    dest = str(tmp_path / "out")
+    assert blocks.unpack(out, dest, bvm, nworkers=4) == 900
+    assert _tree_md5(dest) == _tree_md5(str(src))

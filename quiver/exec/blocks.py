@@ -498,10 +498,28 @@ def perf_report(perf):
         hints.append(summary_q)
         # attribution
         util_w = qbusy / w
-        if jq_full > 0.4 and util_w > 0.55:
-            hints.append(f"BOTTLENECK = WORKERS ({util_w*100:.0f}% engaged, queue saturated "
-                         f"{jq_full*100:.0f}%): this node is the limit — ADD NODES "
-                         f"(per-node fabric/CPU is saturated, more threads won't help)")
+        # "engaged" is NOT "working": a worker blocked in pread counts as busy. Split it, or
+        # a job that is 87% blocked on network-filesystem latency and using 3% of the CPU
+        # reads as "saturated, add nodes" -- when what it actually needs is more requests in
+        # flight, which on this executor means more threads, because one worker runs the whole
+        # open->read->hash->compress->write chain inline and can only have ONE read pending.
+        wall_ns = perf.get("wall_ns", 0) or 1
+        cap_ns = w * wall_ns
+        cpu_ns = perf.get("ns_comp", 0) + perf.get("ns_hash", 0)
+        io_ns = perf.get("ns_read", 0) + perf.get("ns_write", 0) + perf.get("ns_open", 0)
+        cpu_f, io_f = cpu_ns / cap_ns, io_ns / cap_ns
+        hints.append(f"worker time: {cpu_f*100:.0f}% CPU (compress+hash), {io_f*100:.0f}% "
+                     f"blocked on I/O — of {util_w*100:.0f}% engaged")
+        if jq_full > 0.4 and util_w > 0.55 and io_f > 3 * max(cpu_f, 1e-9):
+            hints.append(f"BOTTLENECK = READ LATENCY, not this node: workers are "
+                         f"{util_w*100:.0f}% engaged but only {cpu_f*100:.0f}% of capacity is "
+                         f"CPU — they are waiting, not computing. One worker holds one read at "
+                         f"a time, so concurrency == -j. RAISE -j (memory is frame_cap x "
+                         f"workers) before adding nodes.")
+        elif jq_full > 0.4 and util_w > 0.55:
+            hints.append(f"BOTTLENECK = WORKERS ({util_w*100:.0f}% engaged, {cpu_f*100:.0f}% "
+                         f"CPU, queue saturated {jq_full*100:.0f}%): this node is the limit — "
+                         f"ADD NODES")
         elif jq_empty > 0.5 and util_w < 0.5:
             hints.append(f"BOTTLENECK = PLANNER/SOURCE ({util_w*100:.0f}% engaged, queue empty "
                          f"{jq_empty*100:.0f}%): workers starved — the Python planner or the "
@@ -599,6 +617,8 @@ class _Bvm:
                                                          # so difference them for per-interval rates
         self.frames = []                                 # one cost record per frame (FRAME_COLS)
         self.frames_fd = None                            # set to stream them to disk as well
+        self.locs = {}                                   # frame -> (coff, clen), ACCUMULATED:
+                                                         # they arrive throughout the run now
         # DEDICATED stdout reader: bvm workers emit STAT/ERROR messages at ANY time (pack
         # digests, scan batches); if the planner only reads between sends, the stdout pipe
         # fills, workers block in emit under g_out_mu, the command loop stops reading stdin,
@@ -733,14 +753,13 @@ class _Bvm:
         frame already on disk are still there."""
         nd = struct.unpack_from("<I", pld, 0)[0]
         body = pld[4:4 + nd * self.DONE_SZ]
-        out = {}
         for i in range(nd):
             rec = struct.unpack_from("<QQQqqqiiii", body, i * self.DONE_SZ)
-            out[rec[0]] = (rec[1], rec[2])
-            self.frames.append(rec)
+            self.locs[rec[0]] = (rec[1], rec[2])         # keep them HERE, not in a return value:
+            self.frames.append(rec)                      # poll() discarded what it returned,
+                                                         # which lost 2.2M members' locators
         if self.frames_fd is not None:
             os.write(self.frames_fd, body)               # fixed-width; a torn tail is one record
-        return out
 
     def poll(self):
         """Consume whatever this executor has emitted SO FAR (one BSTAT per completed
@@ -772,7 +791,7 @@ class _Bvm:
     def finish(self):
         """Close stdin (no more plans), drain, return {frame_id: (coff, clen)}."""
         self.p.stdin.close()
-        locs = {}
+        locs = self.locs
         while True:
             t, pld = self._q.get()
             if t is None:
@@ -785,7 +804,7 @@ class _Bvm:
             if t == 0:
                 self.stats.append(_stat_df(pld)); continue
             if t == 2:
-                locs.update(self._take_done(pld))
+                self._take_done(pld)
         rc = self.p.wait()
         if self.errors and self.strict:                  # partial failure is an ERROR, never silent
             import errno as _e
