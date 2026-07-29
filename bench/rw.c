@@ -33,7 +33,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 
-static int g_direct = 1;
+static int g_direct = 1, g_paced = 0;
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 
 enum { M_READ, M_WRITE, M_RW };
@@ -77,7 +77,7 @@ static void *run(void *p){
             pthread_mutex_unlock(&a->smu[s]);
             ssize_t w = pwrite(a->sfd[s], buf, k, o);
             if (w > 0) a->wr += w;
-            if (!g_direct && w > 0) {                  /* pace writeback as bvm does: flush the
+            if (g_paced && w > 0) {                    /* pace writeback as bvm does: flush the
                                                         * RANGE just written, every 64 MB */
                 a->pend += w;
                 if (a->pend >= (64 << 20)) {
@@ -101,7 +101,12 @@ int main(int argc, char **argv){
     double gbt = argc > 3 ? atof(argv[3]) : 2.0;
     size_t chunk = (size_t)(argc > 4 ? atoi(argv[4]) : 8) << 20;
     int nsink = argc > 5 ? atoi(argv[5]) : 16;
-    g_direct = !(argc > 6 && !strcmp(argv[6], "buffered"));
+    /* three modes, because "buffered" is not one thing: with writeback pacing every 64 MB a
+     * write is near-synchronous, which is what bvm does; without it the page cache absorbs the
+     * write and only the final fsync pays -- and that fsync IS inside the timed region here,
+     * so the unpaced number is durable and honest, not fictional. */
+    g_direct = !(argc > 6 && strncmp(argv[6], "buf", 3) == 0);
+    g_paced  = (argc > 6 && !strcmp(argv[6], "buffered"));
     size_t bytes = (size_t)(gbt * 1e9);
     mkdir(dir, 0755);
 
@@ -128,7 +133,8 @@ int main(int argc, char **argv){
 
     printf("rw: %d threads x %.1f GB, %zu MB chunks, %d sinks, dir=%s\n",
            nthr, gbt, chunk >> 20, nsink, dir);
-    printf("  mode: %s\n", g_direct ? "O_DIRECT" : "buffered + 64 MB ranged writeback");
+    printf("  mode: %s\n", g_direct ? "O_DIRECT"
+           : g_paced ? "buffered + 64 MB paced writeback" : "buffered, fsync at end");
     const char *names[] = {"read", "write", "rw"};
     for (int m = 0; m < 3; m++){
         int *sfd = calloc(nsink, sizeof(int));
