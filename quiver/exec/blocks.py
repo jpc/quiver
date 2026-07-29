@@ -1585,7 +1585,21 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                             jq=round(p.get("jq_sum", 0) / max(p.get("q_samples", 1), 1), 1),
                             jq_full_pct=round(100 * p.get("jq_full", 0) / max(p.get("q_samples", 1), 1), 1),
                             opens=p.get("n_open", 0), slow_opens=p.get("slow_open", 0),
-                            workers=p.get("nworkers", nworkers), errors=len(b.errors)))
+                            workers=p.get("nworkers", nworkers), errors=len(b.errors),
+                            # the rest of the pipeline's queues, so the whole path is visible
+                            jq_cap=p.get("jq_cap", 0),
+                            jq_empty_pct=round(100 * p.get("jq_empty", 0) / max(p.get("q_samples", 1), 1), 1),
+                            scanq=round(p.get("dq_sum", 0) / max(p.get("q_samples", 1), 1), 1),
+                            packbuf_pct=round(100 * p.get("pack_used_sum", 0)
+                                              / max(p.get("q_samples", 1), 1)
+                                              / max(p.get("pack_budget", 1), 1), 1),
+                            blockbuf_pct=round(100 * p.get("blk_live_sum", 0)
+                                               / max(p.get("q_samples", 1), 1)
+                                               / max(p.get("blk_budget", 1), 1), 1),
+                            # where worker time actually goes, this interval
+                            ns_read=p.get("ns_read", 0), ns_comp=p.get("ns_comp", 0),
+                            ns_write=p.get("ns_write", 0), ns_hash=p.get("ns_hash", 0),
+                            ns_open=p.get("ns_open", 0), ns_idle=p.get("ns_idle", 0)))
         tot_in = sum(x["comp_in"] for x in per); tot_out = sum(x["comp_out"] for x in per)
         return dict(store=out, elapsed_s=round(el, 1), phase=phase[0], nodes=per,
                     frames_total=nframes_box[0], frames_dispatched=dispatched[0],

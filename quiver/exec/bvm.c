@@ -665,7 +665,8 @@ static void blk_retire(uint64_t id){ pthread_mutex_lock(&g_blk_mu); BBlock *b=bl
 typedef struct { ZSTD_CCtx *c; ZSTD_DCtx *d; uint8_t *cb; size_t ccap; uint8_t *ob; size_t ocap;
                  uint8_t *mb; size_t mbcap; uint8_t *ctb; size_t ctcap; uint8_t *sb; size_t sbcap;
                  int64_t files; int err;
-                 int id; int64_t jt0; int32_t jjq, jbusy; } W;   /* per-frame cost accounting */
+                 int id; int64_t jt0; int32_t jjq, jbusy;         /* per-frame cost accounting */
+                 int ffd; char fpath[4096]; } W;                  /* last source fd, kept open */
 /* STREAMING whole-file BLAKE3 + CDC manifest, in a fixed window instead of the whole file.
  * The manifest job used to materialize the entire file to hash it — the same unbounded
  * allocation that made a giant member OOM the pack path. BLAKE3 is incremental and FastCDC
@@ -877,6 +878,7 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
 int g_busy;                                      /* workers currently EXECUTING a job */
 static void *worker(void *arg) {
     W *w = arg; char full[4096];
+    w->ffd = -1;
     for (;;) {
         Job *j = jq_pop(&g_jq); if (!j) break;
         w->jt0 = now_ns() - g_start_ns;                  /* queue state AT START, not at end: */
@@ -933,16 +935,31 @@ static void *worker(void *arg) {
                 else if (rl + pl + 1 >= sizeof full) { w->err = -ENAMETOOLONG; emit_err(m->path, -ENAMETOOLONG); }
                 else {
                     memcpy(full + rl, m->path, pl); full[rl + pl] = 0;
-                    int64_t to = now_ns();
-                    int fd = open(full, O_RDONLY);
-                    int64_t od = now_ns() - to; ST(ns_open, od); ST(n_open, 1);
-                    if (od > 500000) ST(slow_open, 1);
-                    if (fd < 0) { w->err = -errno; emit_err(full, -errno); }
+                    /* KEEP THE FD. A split member's pieces are separate members, so a 30 GB
+                     * file used to cost ~1,900 open/close pairs on the same inode -- one per
+                     * piece. Pieces are dispatched in order across N workers, so each worker
+                     * sees this file again every Nth piece: a one-entry cache hits for exactly
+                     * the big files that generate the pieces. */
+                    int fd;
+                    if (w->ffd >= 0 && !strcmp(w->fpath, full)) {
+                        fd = w->ffd;
+                    } else {
+                        if (w->ffd >= 0) close(w->ffd);
+                        int64_t to = now_ns();
+                        fd = open(full, O_RDONLY);
+                        int64_t od = now_ns() - to; ST(ns_open, od); ST(n_open, 1);
+                        if (od > 500000) ST(slow_open, 1);
+                        w->ffd = fd;
+                        if (fd >= 0) { memcpy(w->fpath, full, rl + pl + 1); }
+                    }
+                    if (fd < 0) { w->ffd = -1; w->err = -errno; emit_err(full, -errno); }
                     else { ssize_t r; int64_t tr = now_ns();  /* read AT MOST psz from src_off */
                         while (got < psz && (r = pread(fd, w->ob + blen + got, psz - got, m->out_off + got)) > 0) got += r;
                         ST(ns_read, now_ns() - tr); ST(rd_bytes, got);
-                        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   /* one-shot read */
-                        close(fd);
+                        /* Drop ONLY what we read. offset 0 / len 0 means the WHOLE FILE: with
+                         * pieces of one file in flight on many workers at once, every piece
+                         * evicted every other piece's pages -- and the readahead with them. */
+                        (void)posix_fadvise(fd, m->out_off, psz, POSIX_FADV_DONTNEED);
                         if (got != psz) { w->err = -EIO; emit_err(full, -EIO); }   /* shrunk/short: report */
                     }
                 }
@@ -1890,6 +1907,7 @@ int main(int argc, char **argv) {
     jq_finish(&g_jq);
     int64_t err = 0, files = 0;
     for (int i = 0; i < nw; i++) { pthread_join(th[i], 0); files += ws[i].files; if (ws[i].err && !err) err = ws[i].err;
+        if (ws[i].ffd >= 0) close(ws[i].ffd);            /* the kept source fd */
         ZSTD_freeCCtx(ws[i].c); ZSTD_freeDCtx(ws[i].d); free(ws[i].cb); free(ws[i].ob); free(ws[i].mb); free(ws[i].ctb); free(ws[i].sb); }
     __atomic_store_n(&g_sampling, 0, __ATOMIC_RELAXED); pthread_join(smp, 0);
     emit_stats();                                    /* final sample: the run's totals */
