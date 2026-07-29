@@ -201,6 +201,36 @@ def verify_complete(nock, root=None, at=None):
     return out
 
 
+def store_stats(nock, at=None):
+    """Where a store's bytes actually went: per-frame compression ratio, weighted by payload.
+    Reads only the footer. The payload-weighted number is the one that matters -- on a real
+    home tree the MEDIAN frame sits at 0.95 while the weighted ratio is 0.83, because the
+    compressible material is concentrated in relatively few large frames, so tuning on
+    per-frame medians misleads. Frames whose declared content size does not match the payload
+    the footer assigns them are reported separately: they are not compression, they are loss."""
+    import numpy as np
+    df = scan_nock(nock, at=at).filter(pl.col("frame") >= 0)
+    if "shard" not in df.columns:
+        df = df.with_columns(shard=pl.lit(0, pl.Int64))
+    fr = df.group_by("shard", "coff", "clen").agg(pl.col("size").sum().alias("pay"))
+    p = fr["pay"].to_numpy().astype(float); c = fr["clen"].to_numpy().astype(float)
+    good = (p > 0) & (c > 64)                            # tiny clen + huge payload = a lost member
+    bogus = int((~good & (p > 0)).sum())
+    r = c[good] / p[good]
+    EDGES = [0, .05, .1, .2, .3, .4, .5, .6, .7, .8, .9, .95, .99, 1.001, 1e9]
+    hist = []
+    for i in range(len(EDGES) - 1):
+        m = (r >= EDGES[i]) & (r < EDGES[i + 1])
+        if m.sum():
+            hist.append(dict(lo=EDGES[i], hi=EDGES[i + 1], frames=int(m.sum()),
+                             payload=float(p[good][m].sum()), stored=float(c[good][m].sum())))
+    return dict(frames=int(good.sum()), bogus_frames=bogus,
+                payload=float(p[good].sum()), stored=float(c[good].sum()),
+                ratio=float(c[good].sum() / p[good].sum()) if good.sum() else None,
+                median_frame_ratio=float(np.median(r)) if r.size else None,
+                bogus_payload=float(p[~good].sum()), hist=hist)
+
+
 def verify(nock, sample=None):
     """Integrity check: re-hash every member body (BLAKE3) against the footer `digest`
     column (-1 rows = packed before digests, skipped). `sample` = check only that many
@@ -209,6 +239,13 @@ def verify(nock, sample=None):
     import random as _r
     import blake3 as _b3
     df = scan_nock(nock).filter(pl.col("frame") >= 0)
+    # STRUCTURAL PASS over EVERY frame, before any sampling. A zstd frame header declares its
+    # content size, so comparing it against the payload the footer claims lives there costs 18
+    # bytes of read per frame and catches a whole class of silent loss that digest checking
+    # cannot: a member that failed to buffer (ENOMEM on a giant file) left a 9-byte EMPTY frame
+    # with digest -1, so `verify` skipped it as undigested and the run reported lost=0. Two such
+    # frames sat in a 4.9 TB home backup claiming 55.7 TB of payload between them.
+    short = []
     if "shard" not in df.columns:
         df = df.with_columns(shard=pl.lit(0, pl.Int64))
     frames = df.group_by("shard", "coff", "clen", maintain_order=True).agg(
@@ -220,6 +257,17 @@ def verify(nock, sample=None):
     checked = mism = undig = bad = 0; badpaths = []
     fhs = [open(p, "rb") for p in store_files(nock)]
     try:
+        for k in range(frames.height):                   # ALL frames, not just the sample
+            r = frames.row(k, named=True)
+            want = int(sum(r["size"]))
+            f = fhs[r["shard"]]
+            f.seek(r["coff"])
+            try:
+                got = zstd.frame_content_size(f.read(18))
+            except Exception:
+                got = -1
+            if got >= 0 and got != want:
+                short.append((r["path"][0] if r["path"] else "?", want, got, int(r["clen"])))
         for k in idx:
             r = frames.row(k, named=True)
             f = fhs[r["shard"]]
@@ -242,7 +290,8 @@ def verify(nock, sample=None):
         for f in fhs:
             f.close()
     return dict(checked=checked, mismatched=mism, undigested=undig,
-                frames=len(idx), bad_frames=bad, bad=badpaths)
+                frames=len(idx), bad_frames=bad, bad=badpaths,
+                truncated=len(short), truncated_sample=short[:5])
 
 
 def rm(root, workers=32, bvm_exe=None, procs=1):

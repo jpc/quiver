@@ -68,7 +68,7 @@ int main(int argc, char **argv){
     if (argc < 2){ fprintf(stderr, "usage: %s <corpus> [--levels L] [--caps MB] [--tol %%] [--threads N]\n", argv[0]); return 1; }
     const char *path = argv[1];
     long levels[32], caps[32];
-    char dl[] = "1,3,6,9,12,15,19", dc[] = "1,2,4,8,16,32,64,128,256";
+    char dl[] = "1,3,6,9,12,15,19", dc[] = "1,2,4,8,16,32,64,128,256,1024,4096";
     int nl = parse_list(dl, levels, 32), nc = parse_list(dc, caps, 32);
     double tol = 0.5;
     int nthr = 0;

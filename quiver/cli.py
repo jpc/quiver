@@ -99,6 +99,8 @@ def main(argv=None):
     a.add_argument("--sinks", type=int, default=1, metavar="N",
                    help="write data across N sink files (out, out.1, ...); parallel "
                         "filesystems serialize concurrent writes to one inode")
+    a = sub.add_parser("stats", help="where a store's bytes went: compression ratio histogram")
+    a.add_argument("archive")
     a = sub.add_parser("snapshots", help="list a backup chain's snapshots")
     a.add_argument("archive")
     a = sub.add_parser("restore", help="restore a snapshot (default: latest)")
@@ -217,6 +219,20 @@ def main(argv=None):
         print(r)
         for line in perf[1]:
             print("  •", line)
+    elif args.cmd == "stats":
+        st = blocks.store_stats(args.archive)
+        print(f"{st['frames']:,} frames   payload {st['payload']/1e12:.3f} TB -> "
+              f"stored {st['stored']/1e12:.3f} TB   ratio {st['ratio']:.4f}")
+        if st["bogus_frames"]:
+            print(f"  !! {st['bogus_frames']} frame(s) too small to hold the "
+                  f"{st['bogus_payload']/1e12:.3f} TB the footer assigns them — run `verify`")
+        print(f"  median frame {st['median_frame_ratio']:.4f}  (payload-weighted "
+              f"{st['ratio']:.4f} — tune on the weighted one)")
+        tot = st["payload"] or 1
+        for h in st["hist"]:
+            lab = f"{h['lo']:.2f}-{h['hi']:.2f}" if h["hi"] <= 1.001 else ">1.00 raw"
+            print(f"  {lab:<12}{h['frames']:>9,}{h['payload']/1e12:>10.3f} TB"
+                  f"{100*h['payload']/tot:>7.1f}%  " + "#" * int(50 * h["payload"] / tot))
     elif args.cmd == "snapshots":
         from .nock import nockidx
         snaps = nockidx.snapshots(args.archive)
