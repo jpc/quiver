@@ -1012,7 +1012,7 @@ def store_files(out):
 
 
 def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None, strict=True,
-           shards=1, frame_cap=None):
+           shards=1, frame_cap=None, max_member_bytes=1 << 40):
     """APPEND-ONLY incremental backup of `root` into `out` (a nock snapshot chain).
     Snapshot N appends ONLY new bytes: unchanged files carry their prior footer rows
     verbatim (lazy references into old frames — never recompressed, never read); changed
@@ -1176,6 +1176,15 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     # reuses the delta path verbatim: each piece is a `src_off` run in its own frame, and the
     # member becomes an EXTENT row (frame -4) stitching them — which `unpack` already restores,
     # `gc` already remaps, and the next snapshot can already delta against.
+    # SPARSE-FILE GUARD. Splitting a member into frame_cap pieces means an oversized
+    # APPARENT size no longer OOMs -- it reads that many bytes of zeros instead. WEKA
+    # reports neither SEEK_HOLE/SEEK_DATA (EINVAL) nor FIEMAP (EOPNOTSUPP) nor honest
+    # st_blocks, so there is no way to detect the holes: a 50 TiB sparse disk image
+    # silently became 3.28M pieces and 86% of a whole-tree backup plan. Refuse it loudly
+    # instead; raise max_member_bytes if you really do have a member that big.
+    huge = full.filter(pl.col("size") > max_member_bytes)
+    if huge.height:
+        full = full.filter(pl.col("size") <= max_member_bytes)
     big = full.filter(pl.col("size") > frame_cap)
     small = full.filter(pl.col("size") <= frame_cap)
     typed = pl.concat([
@@ -1373,6 +1382,7 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                 dirs=dirsr.height, links=linksr.height,
                 errors=len(b.errors), error_sample=b.errors[:5],
                 lost=len(lost_paths), lost_sample=lost_paths[:5],
+                skipped_huge=huge.height, skipped_huge_sample=huge["path"].to_list()[:5],
                 perf=perf_report(b.perf))
 
 
@@ -1385,7 +1395,8 @@ def slurm_launch(node, gpus=8, minutes=240, partition="gpu"):
 
 def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                  excludes=None, strict=False, sinks_per_node=8, frame_cap=None,
-                 launch=slurm_launch, chunk_gb=2, verbose=False):
+                 launch=slurm_launch, chunk_gb=2, verbose=False,
+                 max_member_bytes=1 << 40):
     """ONE planner, N executors, one store. Each node runs a bvm over the shared filesystem
     and owns its own sink files, so nothing is serialized on a single inode or a single host's
     fabric; the planner keeps the footer, which is what makes the result ONE archive rather
@@ -1442,6 +1453,15 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     scan_s = time.time() - t_scan
 
     # ---- typed member stream, oversized members split (same rule as backup()) ----
+    # SPARSE-FILE GUARD. Splitting a member into frame_cap pieces means an oversized
+    # APPARENT size no longer OOMs -- it reads that many bytes of zeros instead. WEKA
+    # reports neither SEEK_HOLE/SEEK_DATA (EINVAL) nor FIEMAP (EOPNOTSUPP) nor honest
+    # st_blocks, so there is no way to detect the holes: a 50 TiB sparse disk image
+    # silently became 3.28M pieces and 86% of a whole-tree backup plan. Refuse it loudly
+    # instead; raise max_member_bytes if you really do have a member that big.
+    huge = files.filter(pl.col("size") > max_member_bytes)
+    if huge.height:
+        files = files.filter(pl.col("size") <= max_member_bytes)
     big = files.filter(pl.col("size") > frame_cap)
     small = files.filter(pl.col("size") <= frame_cap)
     typed = pl.concat([
@@ -1601,7 +1621,9 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                 bytes_per_node=[int(x) for x in sent_bytes],
                 full=small.height, split=big.height, dirs=dirsr.height, links=linksr.height,
                 errors=sum(len(b.errors) for b in bs), lost=len(lost_paths),
-                lost_sample=lost_paths[:5], perf=[perf_report(p) for p in perfs if p])
+                lost_sample=lost_paths[:5], skipped_huge=huge.height,
+                skipped_huge_sample=huge["path"].to_list()[:5],
+                perf=[perf_report(p) for p in perfs if p])
 
 
 def _obj_store(url):
