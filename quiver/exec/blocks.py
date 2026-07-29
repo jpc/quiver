@@ -1848,44 +1848,55 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
             b.sink(k, paths[i * sinks_per_node + k], start=0)
 
     def _snap():
+        """Live state for the on-disk dump. Every queue counter bvm emits is CUMULATIVE, so
+        dividing by total samples gives the run's average, not the present -- a dashboard then
+        reports "scan queue: 812 dirs" long after the walk finished, and a job-queue that was
+        full early reads as full forever. Difference the last two 1 Hz samples instead, which
+        is what the reader actually wants to see."""
         el = time.time() - t_start
         per = []
         for i, b in enumerate(bs):
             p = b.perf or {}
+            ser = b.perf_series
+            q = ser[-2] if len(ser) >= 2 else None       # previous sample, for the interval
+            def d(k):                                    # per-interval delta
+                return (p.get(k, 0) - q.get(k, 0)) if q else p.get(k, 0)
+            qs = max(d("q_samples"), 1)
+            dt_i = max((d("wall_ns") or 0) / 1e9, 1e-9)
             per.append(dict(node=nodes[i], outstanding=outstanding[i], batches=len(b.stats),
                             rd_gb=round(p.get("rd_bytes", 0) / 1e9, 1),
                             wr_gb=round(p.get("wr_bytes", 0) / 1e9, 1),
+                            rd_gbs=round(d("rd_bytes") / 1e9 / dt_i, 3),
+                            wr_gbs=round(d("wr_bytes") / 1e9 / dt_i, 3),
                             comp_in=p.get("comp_in", 0), comp_out=p.get("comp_out", 0),
                             raw_frames=p.get("n_raw_frames", 0),
                             raw_gb=round(p.get("raw_bytes", 0) / 1e9, 1),
-                            busy=round(p.get("busy_sum", 0) / max(p.get("q_samples", 1), 1), 1),
-                            jq=round(p.get("jq_sum", 0) / max(p.get("q_samples", 1), 1), 1),
-                            jq_full_pct=round(100 * p.get("jq_full", 0) / max(p.get("q_samples", 1), 1), 1),
+                            # --- present state, from the last interval only ---
+                            busy=round(d("busy_sum") / qs, 1),
+                            jq=round(d("jq_sum") / qs, 1),
+                            jq_full_pct=round(100 * d("jq_full") / qs, 1),
+                            jq_empty_pct=round(100 * d("jq_empty") / qs, 1),
+                            scanq=round(d("dq_sum") / qs, 1),
+                            packbuf_pct=round(100 * d("pack_used_sum") / qs
+                                              / max(p.get("pack_budget", 1), 1), 1),
+                            blockbuf_pct=round(100 * d("blk_live_sum") / qs
+                                               / max(p.get("blk_budget", 1), 1), 1),
+                            jq_cap=p.get("jq_cap", 0),
                             opens=p.get("n_open", 0), slow_opens=p.get("slow_open", 0),
                             workers=p.get("nworkers", nworkers), errors=len(b.errors),
-                            # the rest of the pipeline's queues, so the whole path is visible
-                            jq_cap=p.get("jq_cap", 0),
-                            jq_empty_pct=round(100 * p.get("jq_empty", 0) / max(p.get("q_samples", 1), 1), 1),
-                            scanq=round(p.get("dq_sum", 0) / max(p.get("q_samples", 1), 1), 1),
-                            packbuf_pct=round(100 * p.get("pack_used_sum", 0)
-                                              / max(p.get("q_samples", 1), 1)
-                                              / max(p.get("pack_budget", 1), 1), 1),
-                            blockbuf_pct=round(100 * p.get("blk_live_sum", 0)
-                                               / max(p.get("q_samples", 1), 1)
-                                               / max(p.get("blk_budget", 1), 1), 1),
-                            # where worker time actually goes, this interval
-                            ns_read=p.get("ns_read", 0), ns_comp=p.get("ns_comp", 0),
-                            ns_write=p.get("ns_write", 0), ns_hash=p.get("ns_hash", 0),
-                            ns_open=p.get("ns_open", 0), ns_idle=p.get("ns_idle", 0)))
+                            # where worker time went IN THIS INTERVAL
+                            ns_read=d("ns_read"), ns_comp=d("ns_comp"), ns_write=d("ns_write"),
+                            ns_hash=d("ns_hash"), ns_open=d("ns_open"), ns_idle=d("ns_idle")))
         tot_in = sum(x["comp_in"] for x in per); tot_out = sum(x["comp_out"] for x in per)
         return dict(store=out, elapsed_s=round(el, 1), phase=phase[0], nodes=per,
                     frames_total=nframes_box[0], frames_dispatched=dispatched[0],
+                    interval=True,                       # values are per-interval, not run means
                     rd_gb=round(sum(x["rd_gb"] for x in per), 1),
                     wr_gb=round(sum(x["wr_gb"] for x in per), 1),
                     ratio=round(tot_out / tot_in, 4) if tot_in else None,
                     raw_gb=round(sum(x["raw_gb"] for x in per), 1),
-                    rd_gbs=round(sum(x["rd_gb"] for x in per) / el, 3) if el else 0,
-                    wr_gbs=round(sum(x["wr_gb"] for x in per) / el, 3) if el else 0)
+                    rd_gbs=round(sum(x["rd_gbs"] for x in per), 3),
+                    wr_gbs=round(sum(x["wr_gbs"] for x in per), 3))
 
     nframes_box = [0]
     import threading as _th

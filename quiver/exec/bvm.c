@@ -55,7 +55,7 @@ static unsigned char g_key[crypto_secretstream_xchacha20poly1305_KEYBYTES]; stat
  * reserved offset) or a TCP SOCKET stream (frame written as [frame_id][clen][bytes],
  * receiver assigns offsets) — several socket sinks give parallel data connections
  * for networked rsync, frames sharded across them. */
-typedef struct { int fd; int is_sock; int enc; int64_t cursor; pthread_mutex_t mu;
+typedef struct { int fd; int is_sock; int enc; int64_t cursor; int64_t flushed; pthread_mutex_t mu;
                  int64_t unflushed;                      /* page-cache hygiene high-water */
                  crypto_secretstream_xchacha20poly1305_state st; } Sink;
 static Sink g_sinks[64]; static int g_nsinks;
@@ -952,14 +952,25 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
         }
         ST(ns_write, now_ns() - tw); ST(wr_bytes, cl);
         /* STREAMING-WRITE HYGIENE: we never re-read the sink; without this, TBs of dirty
-         * page cache accrue against the job's CGROUP (which counts cache, not just RSS)
-         * and the kernel OOMs the process at ~healthy RSS. Kick writeback + drop clean
-         * pages every 256MB. */
-        pthread_mutex_lock(&sk->mu); sk->unflushed += cl; int flush = sk->unflushed >= (256 << 20);
-        if (flush) sk->unflushed = 0; pthread_mutex_unlock(&sk->mu);
-        if (flush) {
-            (void)!sync_file_range(sk->fd, 0, 0, SYNC_FILE_RANGE_WRITE);
-            (void)posix_fadvise(sk->fd, 0, 0, POSIX_FADV_DONTNEED);
+         * page cache accrue against the job's CGROUP (which counts cache, not just RSS) and
+         * the kernel OOMs the process at ~healthy RSS.
+         *
+         * Flush the RANGE JUST WRITTEN, not the whole file. offset 0 / len 0 means the entire
+         * sink, so every 256 MB the kernel was asked to walk and write back a file that grows
+         * to 128 GB -- work quadratic in shard size, performed ~512 times per shard. It is the
+         * same mistake the read path had (fadvise 0,0 evicting a whole file per piece), and it
+         * is why workers sat 75-92% of their time in write() while the fabric idled: writes ran
+         * at 1.33 GB/s against a 2.93 GB/s concurrent ceiling. */
+        pthread_mutex_lock(&sk->mu);
+        sk->unflushed += cl;
+        int64_t lo = -1, hi = -1;
+        if (sk->unflushed >= (256 << 20)) {
+            lo = sk->flushed; hi = sk->cursor; sk->flushed = hi; sk->unflushed = 0;
+        }
+        pthread_mutex_unlock(&sk->mu);
+        if (lo >= 0 && hi > lo) {
+            (void)!sync_file_range(sk->fd, lo, hi - lo, SYNC_FILE_RANGE_WRITE);
+            (void)posix_fadvise(sk->fd, lo, hi - lo, POSIX_FADV_DONTNEED);
         }
         if (wrc) {                                          /* real ENOSPC/EIO (short writes now looped) */
             char fb[64]; snprintf(fb, sizeof fb, "frame %llu", (unsigned long long)frame_id);
