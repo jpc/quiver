@@ -1,113 +1,125 @@
 #!/usr/bin/env python3
-"""Isolate footer assembly so it can be optimized without re-running a backup.
+"""Replay THE WHOLE footer phase from an existing store, so it can be optimized on its own.
 
-The footer phase is now the single largest part of a whole-tree run -- 1093 s of 2357, 46% --
-and it is entirely serial after packing. Iterating on it through 40-minute backups is not
-viable, so this reconstructs the planner's inputs from an EXISTING store's footer and replays
-each stage under a timer. Same row counts, same shapes, same code; no cluster, no data moved.
+On a whole-tree run the footer is serial after all packing and took 1093 s of 2357 (46%).
+Iterating on that through 40-minute backups is not viable, and timing hand-picked stages was
+worse than useless -- every stage I guessed at came back near zero while the real cost sat
+somewhere I had not thought to look. So this reconstructs the planner's inputs from a store's
+own footer and calls blocks.assemble_footer() itself: same function, same row counts, same
+shapes, no backup and no cluster.
 
-    ./footerbench.py /path/to/store.nock            # breakdown by stage
-    ./footerbench.py /path/to/store.nock --rows 400000   # a fast subset while iterating
+    ./footerbench.py /path/to/store.nock                    # replay, timed
+    ./footerbench.py /path/to/store.nock --rows 300000      # subset, for fast iteration
+    ./footerbench.py /path/to/store.nock --profile          # cProfile the phase
 
-Stages timed separately, because "the footer is slow" was never actionable:
-  load        read the existing footer (setup, not part of the phase)
-  packed      build the direct-member rows + join their digests
-  extents     _split_extent_rows: EXTENT rows for split members
-  pack_footer nockidx.pack_footer: batch, zstd-compress, build the directory
-  telemetry   frame_costs + write_parquet -- added for diagnosis, now on the critical path
+What is reconstructed, and how faithfully:
+  pdf/bounds/pre  exact -- the member table and frame cuts come straight from the footer
+  locs/shard_of   exact -- every frame's locator is in the footer
+  allst           SHAPED -- bvm emits one Arrow batch per frame, so the batches are rebuilt
+                  by grouping members on frame. Row counts and batch counts match the real
+                  run, which is what the cost depends on.
 """
 import argparse, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
 import polars as pl
 from quiver.exec import blocks
-from quiver.nock import nockidx
 
 
-class T:
-    def __init__(self): self.t = {}
-    def __call__(self, name):
-        self.name = name; return self
-    def __enter__(self): self.t0 = time.time(); return self
-    def __exit__(self, *a):
-        self.t[self.name] = time.time() - self.t0
-        print(f"  {self.name:<12}{self.t[self.name]:>9.2f}s", flush=True)
+def rebuild(store, rows=None):
+    """Store footer -> the arguments assemble_footer() takes."""
+    df = blocks.scan_nock(store)
+    if "shard" not in df.columns:
+        df = df.with_columns(shard=pl.lit(0, pl.Int64))
+    if rows:
+        df = df.head(rows)
+    files = df.filter(pl.col("frame") >= 0).sort(["frame", "in_off"])
+    ext = df.filter(pl.col("frame") == -4)
+    dirs = df.filter(pl.col("frame") == -1)
+    links = df.filter(pl.col("frame").is_in([-2, -3]))
+
+    # the plan: direct members, plus one row per PIECE of every split member
+    piece = []
+    for r in ext.iter_rows(named=True):
+        for coff, clen, io_, ln, oo, sh in blocks._parse_extents(r["extents"]):
+            piece.append(dict(path=r["path"], size=ln, mode=r["mode"], mtime_ns=r["mtime_ns"],
+                              uid=r["uid"], gid=r["gid"], in_off=0, link="", type=0,
+                              src_off=oo, coff=coff, clen=clen, shard=sh))
+    direct = files.select(
+        path="path", size="size", mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid",
+        in_off="in_off", link=pl.lit("", pl.Utf8), type=pl.lit(0, pl.UInt8),
+        src_off=pl.lit(0, pl.Int64), coff="coff", clen="clen", shard="shard")
+    dirrows = dirs.select(
+        path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
+        gid="gid", in_off=pl.lit(0, pl.Int64), link=pl.lit("", pl.Utf8),
+        type=pl.lit(5, pl.UInt8), src_off=pl.lit(0, pl.Int64),
+        coff=pl.lit(0, pl.Int64), clen=pl.lit(0, pl.Int64), shard=pl.lit(0, pl.Int64))
+    pf = pl.DataFrame(piece).select(direct.columns).cast(direct.schema) if piece else None
+    typed = pl.concat([x for x in (dirrows, direct, pf) if x is not None and x.height])
+
+    # frames: one per distinct (shard, coff, clen), in plan order
+    key = typed.select("shard", "coff", "clen")
+    newf = ((key["coff"] != key["coff"].shift(1)) | (key["shard"] != key["shard"].shift(1))
+            | (key["clen"] != key["clen"].shift(1))).fill_null(True).to_numpy()
+    fid = np.cumsum(newf) - 1
+    typed = typed.with_columns(fid=pl.Series(fid.astype(np.int64)))
+    bounds = [0] + (np.flatnonzero(newf)[1:].tolist()) + [typed.height]
+    nframes = len(bounds) - 1
+    first = typed.filter(pl.Series(newf))
+    locs = {i: (int(c), int(l)) for i, (c, l) in
+            enumerate(zip(first["coff"].to_list(), first["clen"].to_list()))}
+    shard_of = np.asarray(first["shard"].to_list(), dtype=np.int64)
+
+    sizes = np.where(typed["type"].to_numpy() == 0, typed["size"].to_numpy(), 0)
+    pre = np.zeros(sizes.size + 1, np.int64); np.cumsum(sizes, out=pre[1:])
+
+    cap = 16 << 20
+    big = ext.select("path", "size", "mode", "mtime_ns", "uid", "gid")
+    small = files.select("path", "size", "mode", "mtime_ns", "uid", "gid")
+
+    # allst: bvm sends ONE Arrow batch per frame; rebuild that shape by grouping on frame
+    st = (files.select("path", "digest", "chunks", "frame")
+          .with_columns(fid=pl.col("frame").cast(pl.Int64)))
+    return dict(pdf=typed.drop("coff", "clen", "shard"), bounds=bounds, pre=pre, locs=locs,
+                shard_of=shard_of, big=big, small=small, links=links, allst=st,
+                paths=blocks.store_files(store), frame_cap=cap, nframes=nframes)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("store")
-    ap.add_argument("--rows", type=int, help="subset the member table (fast iteration)")
+    ap.add_argument("--rows", type=int)
     ap.add_argument("--rows-per-batch", type=int, default=1 << 12)
-    ap.add_argument("--level", type=int, default=3, help="footer batch zstd level")
-    ap.add_argument("--no-telemetry", action="store_true")
+    ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--out", default="/tmp/footerbench.footer")
     a = ap.parse_args()
-    t = T()
 
-    with t("load"):
-        df = blocks.scan_nock(a.store)
-        if a.rows:
-            df = df.head(a.rows)
-    files = df.filter(pl.col("frame") >= 0)
-    ext = df.filter(pl.col("frame") == -4)
-    dirs = df.filter(pl.col("frame") == -1)
-    links = df.filter(pl.col("frame").is_in([-2, -3]))
-    print(f"  ({files.height:,} direct, {ext.height:,} extent, {dirs.height:,} dirs, "
-          f"{links.height:,} links)")
+    t0 = time.time()
+    A = rebuild(a.store, a.rows)
+    print(f"  rebuilt inputs in {time.time()-t0:.1f}s: {A['pdf'].height:,} plan rows, "
+          f"{A['nframes']:,} frames, {A['big'].height:,} split members, "
+          f"{A['allst'].height:,} stat rows", flush=True)
 
-    C13 = blocks.STAT_COLS + ["chunks", "extents", "shard"]
-    for c, dt in (("chunks", pl.Binary), ("extents", pl.Binary), ("shard", pl.Int64)):
-        for nm in ("files", "ext", "dirs", "links"):
-            v = locals()[nm]
-            if c not in v.columns:
-                locals()[nm] = v.with_columns(pl.lit(None, dt).alias(c))
+    def go():
+        return blocks.assemble_footer(a.out, A["pdf"], A["bounds"], A["pre"], A["locs"],
+                                      A["shard_of"], A["big"], A["small"], A["links"],
+                                      A["allst"], A["paths"], A["frame_cap"],
+                                      rows_per_batch=a.rows_per_batch)
+    if a.profile:
+        import cProfile, pstats, io as _io
+        pr = cProfile.Profile(); pr.enable()
+        t0 = time.time(); r = go(); dt = time.time() - t0
+        pr.disable()
+        s = _io.StringIO(); pstats.Stats(pr, stream=s).sort_stats("cumulative").print_stats(18)
+        print(s.getvalue())
+    else:
+        t0 = time.time(); r = go(); dt = time.time() - t0
 
-    # --- the stages, as backup_multi runs them ---------------------------------------
-    with t("packed"):
-        digs = files.select("path", "digest", "chunks").unique(subset="path", keep="last")
-        packed = (files.with_columns(digest=pl.lit(-1, pl.Int64))
-                  .drop("digest").join(digs, on="path", how="left", maintain_order="left")
-                  .with_columns(digest=pl.col("digest").fill_null(-1)))
-        packed = packed.select([c for c in C13 if c in packed.columns])
-
-    with t("extents"):
-        if ext.height:
-            # rebuild the piece table the way the planner has it, then run the real builder
-            rows = []
-            for r in ext.head(2000).iter_rows(named=True):
-                for i, (coff, clen, io_, ln, oo, sh) in enumerate(
-                        blocks._parse_extents(r["extents"])):
-                    rows.append(dict(path=r["path"], src_off=oo, coff=coff, clen=clen,
-                                     in_off_out=io_, shard=sh, fid=i, size=ln, type=0))
-            fall = pl.DataFrame(rows) if rows else pl.DataFrame()
-            big = ext.head(2000).select("path", "size", "mode", "mtime_ns", "uid", "gid")
-            if fall.height:
-                r_, l_ = blocks._split_extent_rows(big, fall, set(), None, 16 << 20)
-                print(f"    ({len(r_):,} extent rows rebuilt from {fall.height:,} pieces)")
-
-    with t("pack_footer"):
-        parts = [p for p in (packed,) if p.height]
-        stat = pl.concat(parts, how="vertical_relaxed")
-        disk = stat.rename({x: y for x, y in (("coff", "frame_coff"), ("clen", "frame_clen"))
-                            if x in stat.columns})
-        blob = nockidx.pack_footer(disk, 0, rows_per_batch=a.rows_per_batch, level=a.level)
-        print(f"    ({len(blob)/1e6:.1f} MB footer, {a.rows_per_batch} rows/batch, "
-              f"level {a.level})")
-
-    if not a.no_telemetry:
-        fb = a.store + ".frames.0.bin"
-        if os.path.exists(fb):
-            with t("telemetry"):
-                fc = blocks.read_frames_live(fb)
-                if fc.height:
-                    fc.write_parquet("/tmp/footerbench.parquet")
-                    print(f"    ({fc.height:,} frame records -> parquet)")
-
-    tot = sum(v for k, v in t.t.items() if k != "load")
-    print(f"\n  total (excluding load): {tot:.2f}s")
-    for k, v in sorted(t.t.items(), key=lambda kv: -kv[1]):
-        if k != "load":
-            print(f"    {k:<12}{100*v/tot:>6.1f}%")
+    print(f"  assemble_footer: {dt:.2f}s   footer {r['footer_bytes']/1e6:.1f} MB   "
+          f"{r['extent_rows']:,} extent rows   {len(r['lost_paths']):,} lost")
+    if A["nframes"]:
+        print(f"  scaled to 556,370 frames: {dt * 556370 / A['nframes']:.0f}s")
 
 
 if __name__ == "__main__":

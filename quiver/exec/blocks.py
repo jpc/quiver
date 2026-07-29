@@ -807,7 +807,7 @@ class _Bvm:
                    "n_open", "ns_open", "slow_open", "n_meta", "ns_meta",
                    "n_unlink", "ns_unlink", "scan_entries", "ns_scan_stat",
                    "ns_idle", "ns_emit", "ns_qfull", "n_raw_frames", "raw_bytes",
-                   "cfr_bytes", "n_probe", "probe_in",
+                   "cfr_bytes", "n_probe", "probe_in", "ring_batches", "ring_members",
                    "q_samples", "jq_sum", "jq_full", "jq_empty", "dq_sum", "busy_sum",
                    "pack_used_sum", "blk_live_sum", "jq_cap", "pack_budget", "blk_budget",
                    "wall_ns", "nworkers")
@@ -1285,6 +1285,85 @@ def _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap):
                          shard=0))
     lost += [p for p in meta if p not in seen]       # no pieces at all: every frame errored
     return rows, lost
+
+
+def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
+                    allst, paths, frame_cap, time_ns=None, rows_per_batch=1 << 12):
+    """THE footer phase, as one callable: plan + locators -> the footer file on disk.
+
+    Extracted from backup_multi so it can be replayed and profiled without running a backup
+    (bench/footerbench.py). It is worth isolating: on a whole-tree run this phase is serial
+    after all packing and took 1093 s of 2357 -- 46% -- and every guess about where that time
+    went was wrong until it could be run on its own.
+
+    Returns dict(lost_paths, ends, extent_rows, footer_bytes)."""
+    import numpy as np
+    nframes = len(bounds) - 1
+    gcum = pre
+    fstart = gcum[np.asarray(bounds[:-1], dtype=np.int64)]
+    in_off = gcum[:-1] - np.repeat(fstart, np.diff(bounds))
+    missing = [k for k in range(nframes) if k not in locs]
+    coff_a = np.fromiter((locs.get(k, (-1, 0))[0] for k in range(nframes)), np.int64, nframes)
+    clen_a = np.fromiter((locs.get(k, (-1, 0))[1] for k in range(nframes)), np.int64, nframes)
+    fall = pdf.with_columns(in_off_out=pl.Series(in_off),
+                            coff=pl.Series(np.repeat(coff_a, np.diff(bounds))),
+                            clen=pl.Series(np.repeat(clen_a, np.diff(bounds))),
+                            shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
+    lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
+    fall = fall.filter(pl.col("coff") >= 0)
+    dd = (allst.filter(pl.col("digest") != -1) if allst is not None
+          else pl.DataFrame(schema={"path": pl.Utf8, "digest": pl.Int64,
+                                    "chunks": pl.Binary, "fid": pl.Int64}))
+    chunk_df = dd.select("path", "chunks", "fid") if dd.height else None
+    digs = dd.select("path", "digest", "chunks").unique(subset="path", keep="last")
+    fullpaths = set(small["path"].to_list())
+    packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
+              .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),
+                            digest=pl.lit(-1, pl.Int64)).select(STAT_COLS + ["shard"])
+              .drop("digest").join(digs, on="path", how="left", maintain_order="left")
+              .with_columns(digest=pl.col("digest").fill_null(-1),
+                            extents=pl.lit(None, pl.Binary)))
+    drows = []
+    _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
+    drows.extend(_r); lost_paths.extend(_lost)
+    C13 = STAT_COLS + ["chunks", "extents", "shard"]
+    ddf = pl.DataFrame(drows).select(C13) if drows else None
+    dirsr = fall.filter(pl.col("type") == 5).select(
+        path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
+        gid="gid", frame=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64),
+        coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64),
+        link=pl.lit("", pl.Utf8), chunks=pl.lit(None, pl.Binary), extents=pl.lit(None, pl.Binary),
+        shard=pl.lit(0, pl.Int64))
+    linksr = links.select(
+        path="path", size="size", mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid",
+        frame=pl.when(pl.col("in_off") == 1).then(-3).otherwise(-2).cast(pl.Int64),
+        in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64),
+        digest=pl.lit(-1, pl.Int64), link="link", chunks=pl.lit(None, pl.Binary),
+        extents=pl.lit(None, pl.Binary), shard=pl.lit(0, pl.Int64))
+    # SEPARATE FOOTER. With several shards nothing is gained by hiding the index inside one
+    # of them: it forced the footer to be written after shard 0's last frame, and made shard 0
+    # the only shard that is both data and index. Its own file has base offset 0 and no
+    # ordering relationship to any shard at all. nockidx.footer_path() finds it.
+    # Per-shard data end from the LOCATORS, not from stat(): the planner never wrote these
+    # files — remote executors did — and a distributed filesystem happily serves the planner
+    # a cached size from before those writes (measured: 11 of 12 shards reported ~0 while
+    # holding 247 MB). The footer's own locators are authoritative and cost nothing.
+    ends = [0] * len(paths)
+    for k in range(nframes):
+        if k in locs:
+            sh_ = int(shard_of[k])
+            ends[sh_] = max(ends[sh_], int(locs[k][0] + locs[k][1]))
+    end = 0                                              # the footer file starts at 0
+    fd = os.open(fpath, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    ps = [packed.select(C13), dirsr.select(C13), linksr.select(C13)]
+    if ddf is not None:
+        ps.append(ddf)
+    write_footer(fd, end, ps, prev_off=None, rows_per_batch=rows_per_batch, part_cuts=True,
+                 snap_time_ns=time_ns if time_ns is not None else time.time_ns())
+    os.close(fd)
+    return dict(lost_paths=lost_paths, ends=ends, extent_rows=len(drows),
+                dirs=dirsr.height, links=linksr.height,
+                footer_bytes=os.path.getsize(fpath))
 
 
 def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None, strict=True,
@@ -1926,70 +2005,11 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     t_foot = time.time()
 
     # ---- footer (planner-owned, on shard 0) ----
-    gcum = pre
-    fstart = gcum[np.asarray(bounds[:-1], dtype=np.int64)]
-    in_off = gcum[:-1] - np.repeat(fstart, np.diff(bounds))
-    missing = [k for k in range(nframes) if k not in locs]
-    coff_a = np.fromiter((locs.get(k, (-1, 0))[0] for k in range(nframes)), np.int64, nframes)
-    clen_a = np.fromiter((locs.get(k, (-1, 0))[1] for k in range(nframes)), np.int64, nframes)
-    fall = pdf.with_columns(in_off_out=pl.Series(in_off),
-                            coff=pl.Series(np.repeat(coff_a, np.diff(bounds))),
-                            clen=pl.Series(np.repeat(clen_a, np.diff(bounds))),
-                            shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
-    lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
-    fall = fall.filter(pl.col("coff") >= 0)
-    allst = _stats_table(bs)                             # ONE table across every executor
-    dd = (allst.filter(pl.col("digest") != -1) if allst is not None
-          else pl.DataFrame(schema={"path": pl.Utf8, "digest": pl.Int64,
-                                    "chunks": pl.Binary, "fid": pl.Int64}))
-    chunk_df = dd.select("path", "chunks", "fid") if dd.height else None
-    digs = dd.select("path", "digest", "chunks").unique(subset="path", keep="last")
-    fullpaths = set(small["path"].to_list())
-    packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
-              .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),
-                            digest=pl.lit(-1, pl.Int64)).select(STAT_COLS + ["shard"])
-              .drop("digest").join(digs, on="path", how="left", maintain_order="left")
-              .with_columns(digest=pl.col("digest").fill_null(-1),
-                            extents=pl.lit(None, pl.Binary)))
-    drows = []
-    _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
-    drows.extend(_r); lost_paths.extend(_lost)
-    C13 = STAT_COLS + ["chunks", "extents", "shard"]
-    ddf = pl.DataFrame(drows).select(C13) if drows else None
-    dirsr = fall.filter(pl.col("type") == 5).select(
-        path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
-        gid="gid", frame=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64),
-        coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64),
-        link=pl.lit("", pl.Utf8), chunks=pl.lit(None, pl.Binary), extents=pl.lit(None, pl.Binary),
-        shard=pl.lit(0, pl.Int64))
-    linksr = links.select(
-        path="path", size="size", mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid",
-        frame=pl.when(pl.col("in_off") == 1).then(-3).otherwise(-2).cast(pl.Int64),
-        in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64),
-        digest=pl.lit(-1, pl.Int64), link="link", chunks=pl.lit(None, pl.Binary),
-        extents=pl.lit(None, pl.Binary), shard=pl.lit(0, pl.Int64))
-    # SEPARATE FOOTER. With several shards nothing is gained by hiding the index inside one
-    # of them: it forced the footer to be written after shard 0's last frame, and made shard 0
-    # the only shard that is both data and index. Its own file has base offset 0 and no
-    # ordering relationship to any shard at all. nockidx.footer_path() finds it.
-    # Per-shard data end from the LOCATORS, not from stat(): the planner never wrote these
-    # files — remote executors did — and a distributed filesystem happily serves the planner
-    # a cached size from before those writes (measured: 11 of 12 shards reported ~0 while
-    # holding 247 MB). The footer's own locators are authoritative and cost nothing.
-    ends = [0] * len(paths)
-    for k in range(nframes):
-        if k in locs:
-            sh_ = int(shard_of[k])
-            ends[sh_] = max(ends[sh_], int(locs[k][0] + locs[k][1]))
-    end = 0                                              # the footer file starts at 0
     fpath = out + ".footer"
-    fd = os.open(fpath, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-    ps = [packed.select(C13), dirsr.select(C13), linksr.select(C13)]
-    if ddf is not None:
-        ps.append(ddf)
-    write_footer(fd, end, ps, prev_off=None, rows_per_batch=1 << 12, part_cuts=True,
-                 snap_time_ns=time_ns if time_ns is not None else time.time_ns())
-    os.close(fd)
+    _fr = assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
+                          _stats_table(bs), paths, frame_cap, time_ns)
+    lost_paths, ends = _fr["lost_paths"], _fr["ends"]
+    n_dirs, n_links, n_extents = _fr["dirs"], _fr["links"], _fr["extent_rows"]
     phase[0] = "done"; _stop.set()
     footer_s = round(time.time() - t_foot, 1)            # how much is SERIAL after packing?
     fc = frame_costs(bs, pdf)                            # SIDECAR, never inside the archive:
@@ -2001,7 +2021,7 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                 store_bytes=sum(ends) + footer_bytes, data_per_shard=ends,
                 frames=nframes, frames_per_node=per_node_frames,
                 bytes_per_node=[int(x) for x in sent_bytes],
-                full=small.height, split=big.height, dirs=dirsr.height, links=linksr.height,
+                full=small.height, split=big.height, dirs=n_dirs, links=n_links,
                 errors=sum(len(b.errors) for b in bs), lost=len(lost_paths),
                 lost_sample=lost_paths[:5], skipped_huge=huge.height,
                 skipped_huge_sample=huge["path"].to_list()[:5],

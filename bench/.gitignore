@@ -7,6 +7,7 @@ unlink_threads
 fsops
 cfr
 rw
+smallread
 framecap
 numa_zstd
 results/smoke/

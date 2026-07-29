@@ -209,6 +209,7 @@ typedef struct {
     int64_t scan_entries, ns_scan_stat;
     int64_t ns_idle, ns_emit, ns_qfull;         /* worker starvation / stdout backpressure / planner-ahead */
     int64_t n_raw_frames, raw_bytes;            /* incompressible: codec skipped (raw fs path) */
+    int64_t ring_batches, ring_members;         /* small members prefetched via io_uring */
     int64_t n_probe, probe_in;                  /* stratified incompressibility probe windows */
     int64_t cfr_bytes;                          /* unpacked via copy_file_range (zero-copy) */
     /* QUEUE OCCUPANCY (100Hz sampler): Little's-law bottleneck attribution — a bounded
@@ -666,13 +667,105 @@ typedef struct { ZSTD_CCtx *c; ZSTD_DCtx *d; uint8_t *cb; size_t ccap; uint8_t *
                  uint8_t *mb; size_t mbcap; uint8_t *ctb; size_t ctcap; uint8_t *sb; size_t sbcap;
                  int64_t files; int err;
                  int id; int64_t jt0; int32_t jjq, jbusy;         /* per-frame cost accounting */
-                 int ffd; char fpath[4096]; } W;                  /* last source fd, kept open */
+                 int ffd; char fpath[4096];                       /* last source fd, kept open */
+                 struct io_uring ring; int ring_ok;               /* small-member batch reader */
+                 int64_t *boff, *bgot; uint32_t bcap; } W;        /* per-member slot / bytes read */
 /* STREAMING whole-file BLAKE3 + CDC manifest, in a fixed window instead of the whole file.
  * The manifest job used to materialize the entire file to hash it — the same unbounded
  * allocation that made a giant member OOM the pack path. BLAKE3 is incremental and FastCDC
  * never looks more than CDC_MAXSZ ahead, so a window comfortably larger than that produces
  * byte-identical results at O(window) memory. Returns 0, or -errno. */
 #define MANIFEST_WIN (8u << 20)
+/* ---- SMALL-MEMBER BATCH READS -------------------------------------------------
+ * One open+read+close round trip per file is what a worker pays for a small member. Batching
+ * the same work through io_uring is 2.03x at 31 KB on real data (bench/smallread.c, buffered,
+ * cold, disjoint sets) -- and 0.95x at 64 KB, 0.98x at 128 KB, 0.90x at 512 KB. The win is
+ * real but NARROW, so this is a size-triggered path, not a new I/O model: members above the
+ * crossover keep the plain pread loop, where uring measured 1.00x exactly.
+ *
+ * The batch already exists. A frame targets ~1 MB of member bytes, so at 31 KB it holds ~32
+ * members -- queue depth follows the job rather than a fixed constant, since there is nothing
+ * to gain from a 256-deep ring for a 32-member frame.
+ *
+ * Reads land directly at each member's planner-assigned slot offset, so nothing is copied.
+ * A member that fails here is simply left with bgot = 0; the caller zero-fills and emit_errs
+ * exactly as the synchronous path does, and the cum-sum layout never shifts.
+ */
+#define RING_MAX_MEMBER (48 << 10)     /* measured crossover: above this uring does not pay */
+#define RING_MIN_MEMBERS 8             /* fewer than this and the setup outweighs the batch */
+#define RING_QD_CAP 64
+
+static int ring_prefetch(W *w, Job *j, const char *root, size_t rl) {
+    uint32_t n = j->nmemb, small = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        Member *m = &j->memb[i];
+        if (m->mtype == 0 && m->size > 0 && m->size <= RING_MAX_MEMBER) small++;
+    }
+    if (small < RING_MIN_MEMBERS || getenv("BVM_NO_RING")) return 0;   /* not worth a batch */
+    uint32_t qd = small < RING_QD_CAP ? small : RING_QD_CAP;
+    if (!w->ring_ok) {
+        if (io_uring_queue_init(RING_QD_CAP, &w->ring, 0) < 0) return 0;
+        w->ring_ok = 1;
+    }
+    int *fds = malloc(sizeof(int) * qd);
+    uint32_t *slot = malloc(sizeof(uint32_t) * qd);
+    char **names = malloc(sizeof(char *) * qd);
+    uint32_t i = 0, done = 0;
+    while (i < n) {
+        uint32_t k = 0;
+        while (i < n && k < qd) {                        /* collect the next batch */
+            Member *m = &j->memb[i];
+            if (m->mtype == 0 && m->size > 0 && m->size <= RING_MAX_MEMBER) {
+                size_t pl = strlen(m->path);
+                names[k] = malloc(rl + pl + 1);
+                memcpy(names[k], root, rl); memcpy(names[k] + rl, m->path, pl);
+                names[k][rl + pl] = 0;
+                slot[k] = i; fds[k] = -1; k++;
+            }
+            i++;
+        }
+        if (!k) break;
+        for (uint32_t x = 0; x < k; x++) {               /* phase 1: every open at once */
+            struct io_uring_sqe *s = io_uring_get_sqe(&w->ring);
+            io_uring_prep_openat(s, AT_FDCWD, names[x], O_RDONLY, 0);
+            io_uring_sqe_set_data64(s, x);
+        }
+        io_uring_submit(&w->ring);
+        for (uint32_t x = 0; x < k; x++) {
+            struct io_uring_cqe *cq;
+            if (io_uring_wait_cqe(&w->ring, &cq) < 0) break;
+            fds[io_uring_cqe_get_data64(cq)] = cq->res;
+            io_uring_cqe_seen(&w->ring, cq);
+        }
+        uint32_t live = 0;                               /* phase 2: every read at once */
+        for (uint32_t x = 0; x < k; x++) {
+            if (fds[x] < 0) continue;
+            Member *m = &j->memb[slot[x]];
+            struct io_uring_sqe *s = io_uring_get_sqe(&w->ring);
+            io_uring_prep_read(s, fds[x], w->ob + w->boff[slot[x]], (unsigned)m->size,
+                               (unsigned long long)m->out_off);
+            io_uring_sqe_set_data64(s, x);
+            live++;
+        }
+        if (live) io_uring_submit(&w->ring);
+        for (uint32_t x = 0; x < live; x++) {
+            struct io_uring_cqe *cq;
+            if (io_uring_wait_cqe(&w->ring, &cq) < 0) break;
+            uint32_t y = (uint32_t)io_uring_cqe_get_data64(cq);
+            w->bgot[slot[y]] = cq->res > 0 ? cq->res : 0;
+            done++;
+            io_uring_cqe_seen(&w->ring, cq);
+        }
+        for (uint32_t x = 0; x < k; x++) {
+            if (fds[x] >= 0) close(fds[x]);
+            free(names[x]);
+        }
+    }
+    free(fds); free(slot); free(names);
+    ST(n_open, small); ST(ring_batches, 1); ST(ring_members, done);
+    return (int)done;
+}
+
 static int manifest_stream(int fd, W *w, int64_t *dg_out, size_t *mlen_out, int64_t *nread){
     blake3_hasher hs; blake3_hasher_init(&hs);
     if (ensure(&w->ob, &w->ocap, MANIFEST_WIN)) return -ENOMEM;
@@ -906,6 +999,29 @@ static void *worker(void *arg) {
              * silently desyncing the footer's offsets from the bytes). */
             char full[4096]; size_t rl = strlen(j->root); memcpy(full, j->root, rl);
             if (rl && full[rl - 1] != '/') full[rl++] = '/';   /* root/ + rel */
+            /* Pass 1: the planner's layout is deterministic, so every member's slot offset is
+             * known before a byte is read. That is what lets the small members be fetched as
+             * ONE batch straight into their slots. */
+            if (j->nmemb > w->bcap) {
+                w->boff = realloc(w->boff, sizeof(int64_t) * j->nmemb);
+                w->bgot = realloc(w->bgot, sizeof(int64_t) * j->nmemb);
+                w->bcap = j->nmemb;
+            }
+            {
+                size_t at = 0; int ok = 1;
+                for (uint32_t i = 0; i < j->nmemb; i++) {
+                    Member *m = &j->memb[i];
+                    int64_t psz = m->mtype == 0 ? m->size : 0;
+                    int64_t hl = j->tar_compat
+                        ? tar_hlen2(strlen(m->path), m->link ? strlen(m->link) : 0) : 0;
+                    w->boff[i] = (int64_t)(at + hl);
+                    w->bgot[i] = -1;                     /* -1 = not prefetched */
+                    at += hl + psz + (j->tar_compat ? (((psz + 511) & ~511LL) - psz) : 0);
+                }
+                if (!ensure(&w->ob, &w->ocap, at)) ring_prefetch(w, j, full, rl);
+                else ok = 0;
+                (void)ok;
+            }
             size_t blen = 0;
             int frame_lost = 0;                          /* slot never materialized -> see below */
             BC sb = {0};                                 /* stat blob = TYPED BSTAT Arrow batch:
@@ -932,6 +1048,10 @@ static void *worker(void *arg) {
                                           m->mode, m->uid, m->gid, (uint64_t)psz, m->mtime / 1000000000LL);
                 int64_t body_off = blen; int64_t got = 0;
                 if (m->mtype != 0) { }                   /* dir/link: no body to read */
+                else if (w->bgot[i] >= 0) {              /* already fetched in the batch above */
+                    got = w->bgot[i];
+                    if (got != psz) { w->err = -EIO; emit_err(m->path, -EIO); }
+                }
                 else if (rl + pl + 1 >= sizeof full) { w->err = -ENAMETOOLONG; emit_err(m->path, -ENAMETOOLONG); }
                 else {
                     memcpy(full + rl, m->path, pl); full[rl + pl] = 0;
@@ -1377,7 +1497,7 @@ static int g_nworkers;
  * are metadata-bound, 9k multi-GB files are bandwidth-bound) and reports a single blurred
  * bottleneck for both. */
 static void emit_stats(void) {
-    int64_t st_[40] = { g_st.rd_bytes, g_st.wr_bytes, g_st.comp_in, g_st.comp_out,
+    int64_t st_[42] = { g_st.rd_bytes, g_st.wr_bytes, g_st.comp_in, g_st.comp_out,
         g_st.dcomp_out, g_st.ns_read, g_st.ns_comp, g_st.ns_dcomp, g_st.ns_write,
         g_st.ns_hash, g_st.n_open, g_st.ns_open, g_st.slow_open, g_st.n_meta,
         g_st.ns_meta, g_st.n_unlink, g_st.ns_unlink, g_st.scan_entries,
