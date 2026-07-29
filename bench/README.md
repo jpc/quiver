@@ -25,6 +25,7 @@ The report ends with **recommended settings computed from your run** (`--shards`
 | `hashes` | BLAKE3 / BLAKE2b / SHA-256 / SipHash | chunk-id + digest algorithm |
 | `crypto` | AES-GCM / XChaCha20-Poly1305 / keyed BLAKE2b | encryption headroom |
 | `cfr` | stored-frame write shapes: buffered copy vs `writev` vs `copy_file_range` | incompressible pack path |
+| `rw` | read and write concurrently vs each alone — the ceiling a backup actually faces | is the job near the limit? |
 | `framecap` | compression ratio vs (zstd level x frame cap) on YOUR corpora | `--frame-cap-mb` |
 | `numa` | fully-loaded compression vs CPU/memory placement | whether to pin workers |
 | `multinode` | aggregate bandwidth with N nodes writing at once | how many nodes to use |

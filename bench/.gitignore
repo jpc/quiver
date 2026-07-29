@@ -6,6 +6,7 @@ scanprobe
 unlink_threads
 fsops
 cfr
+rw
 framecap
 numa_zstd
 results/smoke/

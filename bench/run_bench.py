@@ -371,10 +371,31 @@ def bench_framecap(args, out):
     out["framecap"] = res
 
 
+def bench_rw(args, out):
+    """Read and write AT THE SAME TIME. Every other ceiling here is single-direction, but a
+    backup does both, so neither one says whether its combined rate is near the limit. Same
+    threads, same files, three modes; the only variable is whether the other direction runs."""
+    d = os.path.join(args.dir, "bench_rw")
+    exe = os.path.join(HERE, "rw")
+    txt = sh(wrap(f"{exe} {d} {max(args.threads)} {args.gb} 8 {max(args.sinks)}", args))
+    res = {}
+    for m in ("read", "write", "rw"):
+        mm = re.search(rf"^\s+{m}\s+read\s+([0-9.]+) GB/s\s+write\s+([0-9.]+) GB/s\s+"
+                       rf"combined\s+([0-9.]+)", txt, re.M)
+        if mm:
+            res[m] = dict(read=float(mm.group(1)), write=float(mm.group(2)),
+                          combined=float(mm.group(3)))
+            print(f"    {m:<6} read {res[m]['read']:>6.2f}  write {res[m]['write']:>6.2f}  "
+                  f"combined {res[m]['combined']:>6.2f} GB/s", flush=True)
+    shutil.rmtree(d, ignore_errors=True)
+    out["rw"] = res
+
+
 BENCHES = {"fsbw": bench_fsbw, "read": bench_read, "dirspread": bench_dirspread,
            "scan": bench_scan, "cdc": bench_cdc, "hashes": bench_hashes,
            "crypto": bench_crypto, "numa": bench_numa, "multinode": bench_multinode,
-           "cfr": bench_cfr, "framecap": bench_framecap, "quiver": bench_quiver}
+           "cfr": bench_cfr, "framecap": bench_framecap, "rw": bench_rw,
+           "quiver": bench_quiver}
 
 
 # ---------------------------------------------------------------- report
