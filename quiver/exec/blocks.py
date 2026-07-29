@@ -643,19 +643,49 @@ def _ipc_bytes(df):
     return buf.getvalue()
 
 
+class _SockProc:
+    """Makes a TCP-connected executor look exactly like a Popen to the rest of _Bvm: the
+    protocol is identical, only the transport differs. Closing stdin must half-close the
+    socket rather than tear it down -- the executor still has its whole output to send."""
+    def __init__(self, conn, peer=""):
+        self.conn, self.peer = conn, peer
+        self.stdout = conn.makefile("rb")
+        outer = self
+
+        class _W:
+            def write(self, b): return outer.conn.sendall(b) or len(b)
+            def flush(self): pass
+            def close(self):
+                try: outer.conn.shutdown(1)          # SHUT_WR: "no more commands"
+                except OSError: pass
+        self.stdin = _W()
+
+    def wait(self):
+        try: self.conn.close()
+        except OSError: pass
+        return 0
+
+    def kill(self):
+        try: self.conn.close()
+        except OSError: pass
+
+
 class _Bvm:
     """A session with the unified bvm command-stream executor: open sources (tars /
     fs subtrees), send COPY/PACK/SCATTER plans, read STAT/SRC_EOF/DONE. One process
     can hold many sources at once (shared pool + block budget)."""
-    def __init__(self, bvm_exe, nworkers=16, budget_mb=512, launch=None):
+    def __init__(self, bvm_exe, nworkers=16, budget_mb=512, launch=None, sock=None):
         """`launch` puts the executor on ANOTHER HOST: a command prefix such as
         ["srun", "-w", "node7", ...] or ["ssh", "node7"]. bvm speaks its whole protocol
         over stdin/stdout, and srun/ssh forward both, so a remote executor is the same
         object as a local one — the planner does not know the difference. Sinks and source
         trees must be paths both ends can see (a shared filesystem)."""
         import subprocess
-        argv = list(launch or []) + [bvm_exe, str(nworkers), str(budget_mb)]
-        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        if sock is not None:                             # already-connected executor (--connect)
+            self.p = sock
+        else:
+            argv = list(launch or []) + [bvm_exe, str(nworkers), str(budget_mb)]
+            self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.errors = []                                 # (path, -errno) per-op failures from bvm
         self._sock_sinks = set()                         # sinks whose receiver reassembles BY NAME
         self.strict = True                               # False: finish() reports, doesn't raise
@@ -809,6 +839,32 @@ class _Bvm:
                                                          # which lost 2.2M members' locators
         if self.frames_fd is not None:
             os.write(self.frames_fd, body)               # fixed-width; a torn tail is one record
+
+    def ping(self, timeout=120):
+        """Round-trip a trivial command so the planner learns whether this executor actually
+        STARTED. Under a scheduler a launch can sit queued indefinitely; the planner then
+        picks it (zero outstanding wins every least-loaded tie-break), writes to a pipe
+        nobody is draining, fills 64 KB, and blocks -- with the executors that DID start
+        sitting idle. Observed: 2 of 3 nodes up, 4 minutes, 2.4 GB moved."""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="quiver-ping-")
+        try:
+            self.scan_fs(0xFFFF, d)
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    t, _pld = self._q.get(timeout=max(0.1, end - time.time()))
+                except queue.Empty:
+                    return False
+                if t is None:
+                    return False                         # process died
+                if t == 1:
+                    return True                          # SRC_EOF: it is alive and draining
+            return False
+        except (BrokenPipeError, OSError):
+            return False
+        finally:
+            os.rmdir(d)
 
     def poll(self):
         """Consume whatever this executor has emitted SO FAR (one BSTAT per completed
@@ -1166,6 +1222,28 @@ def store_files(out):
     return paths
 
 
+def _stats_table(bvms):
+    """Every executor's BSTAT batches as ONE DataFrame.
+
+    bvm emits one Arrow batch per FRAME, so a whole-tree run leaves ~185,000 small frames per
+    executor. Filtering and selecting each one costs 0.85 ms -- trivial alone, 470 s across
+    three executors, which was 43% of a footer phase that had become 46% of the run. Concat
+    is not the expensive part (0.3 s for 60k); doing per-frame work 185,000 times is. So:
+    concatenate first, then filter once, and attach the frame id by repeating each batch's id
+    over its own height instead of a with_columns per batch."""
+    import numpy as np
+    dfs, blks = [], []
+    for b in bvms:
+        for _sid, blk, d in b.stats:
+            if d.height:
+                dfs.append(d); blks.append(int(blk))
+    if not dfs:
+        return None
+    heights = np.fromiter((d.height for d in dfs), np.int64, len(dfs))
+    fid = np.repeat(np.asarray(blks, dtype=np.int64), heights)
+    return pl.concat(dfs, how="vertical_relaxed").with_columns(fid=pl.Series(fid))
+
+
 def _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap):
     """EXTENT rows for split members, built set-at-a-time.
 
@@ -1451,11 +1529,11 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()         if missing else []
     if missing:                                          # errored frames: their bytes are NOT in
         fall = fall.filter(pl.col("coff") >= 0)          # the store — drop members, report lost
-    digs = [d.filter(pl.col("digest") != -1).select("path", "digest", "chunks")
-            for _s2, _blk, d in b.stats]
-    digs = (pl.concat(digs) if digs else pl.DataFrame(
-        schema={"path": pl.Utf8, "digest": pl.Int64, "chunks": pl.Binary})
-        ).unique(subset="path", keep="last")
+    allst = _stats_table([b])                            # ONE table, then filter once
+    dd = (allst.filter(pl.col("digest") != -1) if allst is not None
+          else pl.DataFrame(schema={"path": pl.Utf8, "digest": pl.Int64,
+                                    "chunks": pl.Binary, "fid": pl.Int64}))
+    digs = dd.select("path", "digest", "chunks").unique(subset="path", keep="last")
     fullpaths = set(small["path"].to_list())            # big files get EXTENT rows, not direct
     packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
               .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),
@@ -1473,10 +1551,7 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     # path-keyed `digs` above collapses them. Concatenating the pieces' manifests yields a
     # valid chunking of the whole file (content-defined within each piece, with one forced
     # boundary per frame_cap), which is what keeps a split member deltable next snapshot.
-    cparts = [d.filter(pl.col("digest") != -1).select("path", "chunks")
-               .with_columns(fid=pl.lit(int(blk), pl.Int64)) for _s2, blk, d in b.stats]
-    chunk_df = (pl.concat([c for c in cparts if c.height])
-                if any(c.height for c in cparts) else None)
+    chunk_df = dd.select("path", "chunks", "fid") if dd.height else None
     drows = []
     for r, dg, newman, segs in delta_meta:
         ex, oo, ok_ = [], 0, True
@@ -1575,6 +1650,42 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                 perf=perf_report(b.perf))
 
 
+def slurm_executors(nodes, bvm_exe, nworkers, budget_mb=512, gpus=8, minutes=240,
+                    partition="gpu", timeout=300, verbose=True):
+    """Start k executors in ONE all-or-nothing allocation and take their command streams over
+    TCP. `srun -N k -n k` is gang-scheduled, so either every node is granted or none is --
+    which is the failure mode one-srun-per-node cannot express: a partial allocation leaves
+    the planner dispatching into a pipe nobody drains. The k tasks share one stdout, so they
+    cannot speak the protocol over pipes; each connects back here instead and gets a private
+    full-duplex channel. Returns [_Bvm, ...] and the srun Popen (kill it when done)."""
+    import socket, subprocess
+    k = len(nodes)
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("0.0.0.0", 0)); ls.listen(k)
+    host, port = socket.gethostname(), ls.getsockname()[1]
+    argv = ["srun", "-p", partition, "-G", str(gpus * k), "-N", str(k), "-n", str(k),
+            "--ntasks-per-node=1", "--mem=0", f"--time={minutes}", "--unbuffered",
+            "-w", ",".join(nodes), bvm_exe, str(nworkers), str(budget_mb),
+            "--connect", f"{host}:{port}"]
+    proc = subprocess.Popen(argv)
+    ls.settimeout(timeout)
+    bs = []
+    try:
+        for _ in range(k):
+            conn, addr = ls.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            b = _Bvm(bvm_exe, nworkers, budget_mb, sock=_SockProc(conn, addr[0]))
+            bs.append(b)
+            if verbose:
+                print(f"    executor {len(bs)}/{k} connected from {addr[0]}", flush=True)
+    except socket.timeout:
+        proc.kill()
+        raise RuntimeError(f"only {len(bs)}/{k} executors connected within {timeout}s")
+    finally:
+        ls.close()
+    return bs, proc
+
+
 def slurm_launch(node, gpus=8, minutes=240, partition="gpu"):
     """A `launch` prefix that puts one bvm on `node`. --unbuffered is NOT optional: without
     it srun buffers the task's stdout and the planner's first read blocks forever."""
@@ -1602,7 +1713,7 @@ def _progress_writer(path, state, stop):
 def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                  excludes=None, strict=False, sinks_per_node=8, frame_cap=None,
                  launch=slurm_launch, chunk_gb=2, verbose=False,
-                 max_member_bytes=1 << 40):
+                 max_member_bytes=1 << 40, start_timeout=120, executors=None):
     """ONE planner, N executors, one store. Each node runs a bvm over the shared filesystem
     and owns its own sink files, so nothing is serialized on a single inode or a single host's
     fabric; the planner keeps the footer, which is what makes the result ONE archive rather
@@ -1621,22 +1732,41 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     if frame_cap is None:
         frame_cap = (16 if level <= 6 else 32 if level <= 15 else 64) << 20
     nn = len(nodes)
-    paths = shard_paths(out, nn * sinks_per_node)        # node i owns [i*spn, (i+1)*spn)
-    for p in paths:
-        open(p, "wb").close()
     ign = load_ignore(root_abs, excludes)
     t_start = time.time()
     phase = ["launch"]
     dispatched = [0]
     outstanding = [0] * len(nodes)
-    bs = []
-    for i, nd in enumerate(nodes):
-        b = _Bvm(bvm_exe, nworkers, launch=launch(nd))
+    # `executors` = already-connected executors (slurm_executors: one allocation, TCP command
+    # streams). Otherwise one child per node over pipes.
+    bs = list(executors) if executors else [
+        _Bvm(bvm_exe, nworkers, launch=launch(nd)) for nd in nodes]
+    for i, b in enumerate(bs):
         b.strict = strict
         b.frames_fd = os.open(f"{out}.frames.{i}.bin", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    live, dead = [], []
+    for i, b in enumerate(bs):                           # never dispatch to an executor that
+        (live if (executors or b.ping(start_timeout)) else dead).append((i, b))
+    if dead:
+        print(f"    {len(dead)} executor(s) never started ({', '.join(nodes[i] for i, _ in dead)})"
+              f" — continuing on {len(live)}", flush=True)
+        for _i, b in dead:
+            try: b.p.kill()
+            except Exception: pass
+    if not live:
+        raise RuntimeError("no executor started")
+    nodes = [nodes[i] for i, _ in live]
+    bs = [b for _i, b in live]
+    nn = len(bs)
+    outstanding = [0] * nn
+    paths = shard_paths(out, nn * sinks_per_node)         # after the liveness check: a node
+    for p in paths:                                       # that never started must not own
+        open(p, "wb").close()                             # a slice of the shard space
+    # sinks are assigned AFTER the liveness check, so a node that never started does not own
+    # a slice of the shard space (its files would stay empty and its frames would be lost)
+    for i, b in enumerate(bs):
         for k in range(sinks_per_node):
             b.sink(k, paths[i * sinks_per_node + k], start=0)
-        bs.append(b)
 
     def _snap():
         el = time.time() - t_start
@@ -1808,18 +1938,12 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                             shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
     lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
     fall = fall.filter(pl.col("coff") >= 0)
-    digs, cparts = [], []
-    for b in bs:
-        for _s2, blk, d in b.stats:
-            dd = d.filter(pl.col("digest") != -1)
-            if dd.height:
-                digs.append(dd.select("path", "digest", "chunks"))
-                cparts.append(dd.select("path", "chunks")
-                              .with_columns(fid=pl.lit(int(blk), pl.Int64)))
-    chunk_df = pl.concat(cparts) if cparts else None
-    digs = (pl.concat(digs) if digs else pl.DataFrame(
-        schema={"path": pl.Utf8, "digest": pl.Int64, "chunks": pl.Binary})
-        ).unique(subset="path", keep="last")
+    allst = _stats_table(bs)                             # ONE table across every executor
+    dd = (allst.filter(pl.col("digest") != -1) if allst is not None
+          else pl.DataFrame(schema={"path": pl.Utf8, "digest": pl.Int64,
+                                    "chunks": pl.Binary, "fid": pl.Int64}))
+    chunk_df = dd.select("path", "chunks", "fid") if dd.height else None
+    digs = dd.select("path", "digest", "chunks").unique(subset="path", keep="last")
     fullpaths = set(small["path"].to_list())
     packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
               .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),

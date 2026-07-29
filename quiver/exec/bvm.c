@@ -1688,7 +1688,25 @@ static void track(pthread_t t){ if(g_nsrc==g_srccap){ g_srccap=g_srccap?g_srccap
 static char *readstr(uint8_t **p){ uint16_t l=RD(uint16_t,*p); char *s=malloc(l+1); memcpy(s,*p,l); s[l]=0; *p+=l; return s; }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: bvm <nworkers> <budget_mb>\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: bvm <nworkers> <budget_mb> [--connect host:port]\n"); return 2; }
+    /* --connect: take the COMMAND STREAM over TCP instead of stdin/stdout, by dup2'ing the
+     * socket onto fd 0 and 1 -- every line of the protocol below then works unchanged.
+     *
+     * Why: one executor per srun means one ALLOCATION per executor, and a partial allocation
+     * is silent. Observed: 2 of 3 nodes granted, the third queued behind another job, and the
+     * planner picked it (zero outstanding wins every least-loaded tie-break), wrote to a pipe
+     * nobody was draining, and blocked -- two live nodes idle for four minutes. One
+     * `srun -N k -n k` is all-or-nothing, but its k tasks share ONE stdout, so the planner
+     * could not tell them apart. A socket per task solves both: gang-scheduled allocation,
+     * and a private full-duplex channel each. */
+    for (int i = 3; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--connect")) continue;
+        int s = tcp_connect(argv[i + 1]);
+        if (s < 0) { fprintf(stderr, "bvm: cannot connect to %s\n", argv[i + 1]); return 3; }
+        if (dup2(s, 0) < 0 || dup2(s, 1) < 0) { perror("dup2"); return 3; }
+        if (s > 2) close(s);
+        break;
+    }
     int nw = atoi(argv[1]);
     g_nworkers = nw;                                 /* emit_stats() runs on the sampler thread */ g_budget = atoll(argv[2]) << 20; if (g_budget <= 0) g_budget = 512LL << 20;
     for (int i = 0; i < 1024; i++) g_nock_fds[i] = -1;
