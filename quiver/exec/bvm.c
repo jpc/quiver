@@ -691,7 +691,7 @@ typedef struct { ZSTD_CCtx *c; ZSTD_DCtx *d; uint8_t *cb; size_t ccap; uint8_t *
                  int64_t files; int err;
                  int id; int64_t jt0; int32_t jjq, jbusy;         /* per-frame cost accounting */
                  int ffd; char fpath[4096];                       /* last source fd, kept open */
-                 struct io_uring ring; int ring_ok;               /* small-member batch reader */
+                 struct io_uring ring; int ring_ok, ring_direct;  /* small-member batch reader */
                  int64_t *boff, *bgot; uint32_t bcap; } W;        /* per-member slot / bytes read */
 /* STREAMING whole-file BLAKE3 + CDC manifest, in a fixed window instead of the whole file.
  * The manifest job used to materialize the entire file to hash it — the same unbounded
@@ -714,7 +714,17 @@ typedef struct { ZSTD_CCtx *c; ZSTD_DCtx *d; uint8_t *cb; size_t ccap; uint8_t *
  * A member that fails here is simply left with bgot = 0; the caller zero-fills and emit_errs
  * exactly as the synchronous path does, and the cum-sum layout never shifts.
  */
-#define RING_MAX_MEMBER (48 << 10)     /* measured crossover: above this uring does not pay */
+/* Where the ring stops paying, re-measured with bench/uread over real files in disjoint
+ * slices (GB/s, sync vs best ring backend):
+ *     8 KB 0.046 -> 0.227 (4.9x)   128 KB 0.354 -> 2.308 (6.5x)   1 MB 1.985 -> 4.515 (2.3x)
+ *    32 KB 0.122 -> 1.046 (8.6x)   256 KB 0.832 -> 3.250 (3.9x)   4 MB 4.912 -> 3.939 (SYNC WINS)
+ * Below ~1 MB the cost is per-file latency and batching hides it; by 4 MB a single read already
+ * saturates the fabric and the ring only adds overhead. The reversal is somewhere in 2-4 MB, so
+ * this sits at 1 MB -- inside the region measured to win, not on an unmeasured boundary. The
+ * old value was 48 KB, which sent everything from 48 KB to 1 MB down the 3-6x slower path. */
+#define RING_MAX_MEMBER_DEFAULT (1 << 20)
+static size_t g_ring_max = RING_MAX_MEMBER_DEFAULT;   /* BVM_RING_MAX_KB, for A/B-ing the bound */
+#define RING_MAX_MEMBER g_ring_max
 #define RING_MIN_MEMBERS 8             /* fewer than this and the setup outweighs the batch */
 #define RING_QD_CAP 64
 
@@ -728,6 +738,21 @@ static int ring_prefetch(W *w, Job *j, const char *root, size_t rl) {
     uint32_t qd = small < RING_QD_CAP ? small : RING_QD_CAP;
     if (!w->ring_ok) {
         if (io_uring_queue_init(RING_QD_CAP, &w->ring, 0) < 0) return 0;
+        /* DIRECT DESCRIPTORS: openat_direct parks the file in a registered slot instead of the
+         * process fd table, so there is no fd allocation, no table locking and no close()
+         * syscall. Measured 22-47% over the plain-fd batch, margin growing with member size.
+         * register_files_sparse needs kernel 5.19; on 5.15 the equivalent is registering an
+         * explicit all -1 table. If neither works we fall back to the plain-fd path below.
+         * NOT linked chains: on 5.15 a FIXED_FILE read resolves its file at prep time, before
+         * a linked open has installed the slot, so open->read->close returns ECANCELED/EBADF
+         * at every queue depth. Phased is what this kernel supports. */
+        w->ring_direct = 0;
+        if (io_uring_register_files_sparse(&w->ring, RING_QD_CAP) == 0) w->ring_direct = 1;
+        else {
+            int tbl[RING_QD_CAP];
+            for (int t = 0; t < RING_QD_CAP; t++) tbl[t] = -1;
+            if (io_uring_register_files(&w->ring, tbl, RING_QD_CAP) == 0) w->ring_direct = 1;
+        }
         w->ring_ok = 1;
     }
     int *fds = malloc(sizeof(int) * qd);
@@ -750,14 +775,19 @@ static int ring_prefetch(W *w, Job *j, const char *root, size_t rl) {
         if (!k) break;
         for (uint32_t x = 0; x < k; x++) {               /* phase 1: every open at once */
             struct io_uring_sqe *s = io_uring_get_sqe(&w->ring);
-            io_uring_prep_openat(s, AT_FDCWD, names[x], O_RDONLY, 0);
+            if (w->ring_direct)                          /* into registered slot x, not an fd */
+                io_uring_prep_openat_direct(s, AT_FDCWD, names[x], O_RDONLY, 0, x);
+            else
+                io_uring_prep_openat(s, AT_FDCWD, names[x], O_RDONLY, 0);
             io_uring_sqe_set_data64(s, x);
         }
         io_uring_submit(&w->ring);
         for (uint32_t x = 0; x < k; x++) {
             struct io_uring_cqe *cq;
             if (io_uring_wait_cqe(&w->ring, &cq) < 0) break;
-            fds[io_uring_cqe_get_data64(cq)] = cq->res;
+            /* direct: res is 0 on success and the SLOT is x, so record x (not a real fd) */
+            uint32_t ix = (uint32_t)io_uring_cqe_get_data64(cq);
+            fds[ix] = w->ring_direct ? (cq->res == 0 ? (int)ix : -1) : cq->res;
             io_uring_cqe_seen(&w->ring, cq);
         }
         uint32_t live = 0;                               /* phase 2: every read at once */
@@ -767,6 +797,7 @@ static int ring_prefetch(W *w, Job *j, const char *root, size_t rl) {
             struct io_uring_sqe *s = io_uring_get_sqe(&w->ring);
             io_uring_prep_read(s, fds[x], w->ob + w->boff[slot[x]], (unsigned)m->size,
                                (unsigned long long)m->out_off);
+            if (w->ring_direct) s->flags |= IOSQE_FIXED_FILE;   /* fds[x] is a slot index */
             io_uring_sqe_set_data64(s, x);
             live++;
         }
@@ -779,10 +810,23 @@ static int ring_prefetch(W *w, Job *j, const char *root, size_t rl) {
             done++;
             io_uring_cqe_seen(&w->ring, cq);
         }
-        for (uint32_t x = 0; x < k; x++) {
-            if (fds[x] >= 0) close(fds[x]);
-            free(names[x]);
+        if (w->ring_direct) {                            /* phase 3: free the slots on the ring */
+            uint32_t nc = 0;
+            for (uint32_t x = 0; x < k; x++) if (fds[x] >= 0) {
+                struct io_uring_sqe *s = io_uring_get_sqe(&w->ring);
+                io_uring_prep_close_direct(s, x);
+                io_uring_sqe_set_data64(s, x); nc++;
+            }
+            if (nc) io_uring_submit(&w->ring);
+            for (uint32_t x = 0; x < nc; x++) {
+                struct io_uring_cqe *cq;
+                if (io_uring_wait_cqe(&w->ring, &cq) < 0) break;
+                io_uring_cqe_seen(&w->ring, cq);
+            }
+        } else {
+            for (uint32_t x = 0; x < k; x++) if (fds[x] >= 0) close(fds[x]);
         }
+        for (uint32_t x = 0; x < k; x++) free(names[x]);
     }
     free(fds); free(slot); free(names);
     ST(n_open, small); ST(ring_batches, 1); ST(ring_members, done);
@@ -1879,6 +1923,8 @@ int main(int argc, char **argv) {
     }
     { const char *fm = getenv("BVM_FLUSH_MB"); if (fm) g_flush_bytes = atoll(fm) << 20; }
     g_sink_direct = getenv("BVM_SINK_DIRECT") != NULL;
+    { const char *e = getenv("BVM_RING_MAX_KB");   /* A/B the ring bound without a rebuild */
+      if (e && atol(e) > 0) g_ring_max = (size_t)atol(e) << 10; }
     int nw = atoi(argv[1]);
     g_nworkers = nw;                                 /* emit_stats() runs on the sampler thread */ g_budget = atoll(argv[2]) << 20; if (g_budget <= 0) g_budget = 512LL << 20;
     for (int i = 0; i < 1024; i++) g_nock_fds[i] = -1;

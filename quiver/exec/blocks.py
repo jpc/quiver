@@ -1899,6 +1899,12 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
                                                / max(p.get("blk_budget", 1), 1), 1),
                             jq_cap=p.get("jq_cap", 0),
                             opens=p.get("n_open", 0), slow_opens=p.get("slow_open", 0),
+                            # ring_prefetch counts its opens in n_open but never times them, so
+                            # slow_opens/opens is DILUTED by ring opens that can never land in
+                            # the numerator. Report the ring counters so the sync-open count is
+                            # derivable and the two eras stay comparable.
+                            ring_batches=p.get("ring_batches", 0),
+                            ring_members=p.get("ring_members", 0),
                             workers=p.get("nworkers", nworkers), errors=len(b.errors),
                             # where worker time went IN THIS INTERVAL
                             ns_read=d("ns_read"), ns_comp=d("ns_comp"), ns_write=d("ns_write"),
