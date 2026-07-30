@@ -11,3 +11,5 @@ smallread
 framecap
 numa_zstd
 results/smoke/
+dwrite
+dwriteq

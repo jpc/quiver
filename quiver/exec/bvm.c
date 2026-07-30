@@ -1547,6 +1547,12 @@ static void emit_stats(void) {
         g_st.ns_meta, g_st.n_unlink, g_st.ns_unlink, g_st.scan_entries,
         g_st.ns_scan_stat, g_st.ns_idle, g_st.ns_emit, g_st.ns_qfull,
         g_st.n_raw_frames, g_st.raw_bytes, g_st.cfr_bytes, g_st.n_probe, g_st.probe_in,
+        /* ring_batches/ring_members were added to PERF_FIELDS on the planner side but never
+         * emitted here, so the initializer supplied 40 of 42 values. sizeof matched (the array
+         * is [42], zero-filled), nothing errored, and EVERY field from q_samples on was read
+         * two positions early -- wall_ns and nworkers landed on the zero fill, which is what
+         * made util/queue percentages nonsense (and the live dashboard's dirs + full/empty%). */
+        g_st.ring_batches, g_st.ring_members,
         g_st.q_samples, g_st.jq_sum, g_st.jq_full, g_st.jq_empty, g_st.dq_sum,
         g_st.busy_sum, g_st.pack_used_sum, g_st.blk_live_sum,
         (int64_t)g_jq.cap, g_pack_budget, g_budget,

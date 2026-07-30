@@ -4,12 +4,14 @@ SODIUM ?= /mnt/weka/jpc/miniconda3/envs/brouhaha
 BLAKE3 ?= /mnt/weka/jpc/tmp/blake3-install
 CFLAGS ?= -O2 -pthread -w
 
-all: fsbw fsops cfr rw smallread framecap chunking hashes crypto scanprobe unlink_threads numa_zstd
+all: fsbw fsops cfr rw dwrite dwriteq smallread framecap chunking hashes crypto scanprobe unlink_threads numa_zstd
 
 fsbw: fsbw.c ; $(CC) $(CFLAGS) -o $@ $<
 fsops: fsops.c ; $(CC) $(CFLAGS) -o $@ $<
 cfr: cfr.c ; $(CC) $(CFLAGS) -o $@ $<
 rw: rw.c ; $(CC) $(CFLAGS) -o $@ $<
+dwrite: dwrite.c ; $(CC) $(CFLAGS) -o $@ $<
+dwriteq: dwriteq.c ; $(CC) $(CFLAGS) -I$(URING)/include -o $@ $< $(URING)/lib/liburing.a
 URING ?= /mnt/weka/jpc/tmp/liburing-install
 smallread: smallread.c ; $(CC) $(CFLAGS) -I$(URING)/include -o $@ $< $(URING)/lib/liburing.a
 framecap: framecap.c ; $(CC) $(CFLAGS) -I$(ZSTD)/include -o $@ $< $(ZSTD)/lib/libzstd.a

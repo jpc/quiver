@@ -1739,7 +1739,10 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                 errors=len(b.errors), error_sample=b.errors[:5],
                 lost=len(lost_paths), lost_sample=lost_paths[:5],
                 skipped_huge=huge.height, skipped_huge_sample=huge["path"].to_list()[:5],
-                perf=perf_report(b.perf))
+                perf=perf_report(b.perf),
+                # the RAW counters too: perf_report() summarises to rates, but attributing a
+                # regression needs ns_write vs ns_comp vs raw_bytes side by side.
+                perf_raw=dict(b.perf))
 
 
 def slurm_executors(nodes, bvm_exe, nworkers, budget_mb=512, gpus=8, minutes=240,
