@@ -85,13 +85,30 @@ def pack_footer(df, base_off: int, rows_per_batch: int = 1 << 20, level: int = 3
     # chain (absolute offsets — the batches are immutable skippable frames, still in the
     # file/address space). Snapshot N's footer then rewrites only the batches whose rows
     # changed: the bup-tree-sharing analog, and S3-layerable (offsets survive the object map).
-    for lo, hi in spans:
+    # PARALLEL PER BATCH. Each batch is already independently zstd-compressed into its own
+    # skippable frame, so serializing/compressing/hashing them is embarrassingly parallel --
+    # only the offset accumulation is sequential, and that is done after, in span order, so
+    # the bytes are identical to the serial path. Measured 29.2 s of a 63.2 s footer build on
+    # a whole-tree run, which is fully SERIAL after packing. ZstdCompressor is not safe to
+    # share across threads, so each task makes its own.
+    def _one(span):
+        lo, hi = span
         buf = _io.BytesIO(); df[lo:hi].write_ipc(buf)
-        comp = cctx.compress(buf.getvalue())
+        comp = _z.ZstdCompressor(level=level).compress(buf.getvalue())
+        return lo, hi, comp, hashlib.blake2b(comp, digest_size=32).digest()
+
+    if len(spans) > 4 and not os.environ.get("QUIVER_FOOTER_SERIAL"):
+        from concurrent.futures import ThreadPoolExecutor
+        _nt = min(len(spans), (os.cpu_count() or 8))
+        with ThreadPoolExecutor(max_workers=_nt) as _ex:
+            done = list(_ex.map(_one, spans))
+    else:
+        done = [_one(sp) for sp in spans]
+    for lo, hi, comp, leaf in done:
         payload_off = base_off + len(out) + 8            # past this frame's skip header
         out += struct.pack("<II", SKIP_MAGIC, len(comp)) + comp
         dirents.append((payload_off, len(comp), lo, hi - lo))
-        leaves.append(hashlib.blake2b(comp, digest_size=32).digest())
+        leaves.append(leaf)
     d = bytearray(struct.pack("<I", len(dirents)))
     for off, clen, first, nrow in dirents:
         d += struct.pack("<QQQQ", off, clen, first, nrow)

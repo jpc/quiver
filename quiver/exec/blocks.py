@@ -2072,6 +2072,13 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     # measured 9 s against a real 73.7 s and the difference had to be inferred.
     _t = time.time()
     _allst = _stats_table(bs)
+    # DROP the per-frame batches once they are one table: ~248k small DataFrames pinned in the
+    # planner is real memory pressure going into the most expensive SERIAL phase, and nothing
+    # downstream reads b.stats again. (assemble_footer runs ~8x slower in the live process
+    # than the same inputs replayed in a fresh one -- bench/footerbench.py -- so heap state is
+    # implicated even though the row counts match.)
+    for _b in bs:
+        _b.stats = []
     stats_s = round(time.time() - _t, 1)
     _t = time.time()
     _fr = assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
