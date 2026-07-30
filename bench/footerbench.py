@@ -73,13 +73,32 @@ def rebuild(store, rows=None):
     sizes = np.where(typed["type"].to_numpy() == 0, typed["size"].to_numpy(), 0)
     pre = np.zeros(sizes.size + 1, np.int64); np.cumsum(sizes, out=pre[1:])
 
-    cap = 16 << 20
+    # frame_cap MUST match the run that wrote the store: _split_extent_rows declares a member
+    # lost when its piece count disagrees with _pieces(size, frame_cap). Hardcoding 16 MB against
+    # a store packed at 64 MB made every split member "lost", so the extent path never ran and
+    # the replay measured a footer it does not have. Infer it from the widest piece present.
+    cap = int(max((ln for r in ext.iter_rows(named=True)
+                   for _c, _l, _io, ln, _oo, _sh in blocks._parse_extents(r["extents"])),
+                  default=blocks.DEFAULT_FRAME_CAP))
     big = ext.select("path", "size", "mode", "mtime_ns", "uid", "gid")
     small = files.select("path", "size", "mode", "mtime_ns", "uid", "gid")
 
-    # allst: bvm sends ONE Arrow batch per frame; rebuild that shape by grouping on frame
-    st = (files.select("path", "digest", "chunks", "frame")
-          .with_columns(fid=pl.col("frame").cast(pl.Int64)))
+    # allst: bvm sends ONE Arrow batch per frame; rebuild that shape by grouping on frame.
+    # SPLIT MEMBERS MUST BE IN HERE TOO. Their manifests ride one of their piece frames in a
+    # real run; leaving them out made _split_extent_rows resolve nothing -- the replay
+    # reported "0 extent rows, 5,822 lost" where the run had 5,822 split members, so the whole
+    # extent path went unmeasured and the replay came in at 9.3 s against a real 73.7 s.
+    pf_fid = (typed.filter(pl.col("type") == 0)
+                   .group_by("path").agg(pl.col("fid").min().alias("pfid")))
+    extst = (ext.select("path", "digest", "chunks")
+                .join(pf_fid, on="path", how="inner")
+                .with_columns(frame=pl.col("pfid"), fid=pl.col("pfid"))
+                .select("path", "digest", "chunks", "frame", "fid"))
+    st = pl.concat([
+        files.select("path", "digest", "chunks", "frame")
+             .with_columns(fid=pl.col("frame").cast(pl.Int64)),
+        extst,
+    ])
     return dict(pdf=typed.drop("coff", "clen", "shard"), bounds=bounds, pre=pre, locs=locs,
                 shard_of=shard_of, big=big, small=small, links=links, allst=st,
                 paths=blocks.store_files(store), frame_cap=cap, nframes=nframes)

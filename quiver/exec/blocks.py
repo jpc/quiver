@@ -1311,6 +1311,15 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
 
     Returns dict(lost_paths, ends, extent_rows, footer_bytes)."""
     import numpy as np
+    # STAGE TIMERS. bench/footerbench.py replays this in ~8 s with faithful inputs, writing to
+    # the same filesystem, while the real run spends 65 s here. The cost lives in the state of
+    # the LIVE process -- allst arrives as ~248k separate Arrow batches, so its string columns
+    # are badly fragmented for the joins below -- and replay cannot reproduce it. Measure here
+    # rather than infer from the difference, which has been wrong three times.
+    _T = {}
+    _tk = [time.time()]
+    def _lap(name):
+        _T[name] = round(time.time() - _tk[0], 2); _tk[0] = time.time()
     nframes = len(bounds) - 1
     gcum = pre
     fstart = gcum[np.asarray(bounds[:-1], dtype=np.int64)]
@@ -1322,6 +1331,7 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
                             coff=pl.Series(np.repeat(coff_a, np.diff(bounds))),
                             clen=pl.Series(np.repeat(clen_a, np.diff(bounds))),
                             shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
+    _lap("locators")
     lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
     fall = fall.filter(pl.col("coff") >= 0)
     dd = (allst.filter(pl.col("digest") != -1) if allst is not None
@@ -1329,16 +1339,20 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
                                     "chunks": pl.Binary, "fid": pl.Int64}))
     chunk_df = dd.select("path", "chunks", "fid") if dd.height else None
     digs = dd.select("path", "digest", "chunks").unique(subset="path", keep="last")
+    _lap("digests")
     fullpaths = set(small["path"].to_list())
+    _lap("fullpaths_set")
     packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
               .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),
                             digest=pl.lit(-1, pl.Int64)).select(STAT_COLS + ["shard"])
               .drop("digest").join(digs, on="path", how="left", maintain_order="left")
               .with_columns(digest=pl.col("digest").fill_null(-1),
                             extents=pl.lit(None, pl.Binary)))
+    _lap("packed_join")
     drows = []
     _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
     drows.extend(_r); lost_paths.extend(_lost)
+    _lap("extent_rows")
     C13 = STAT_COLS + ["chunks", "extents", "shard"]
     ddf = pl.DataFrame(drows).select(C13) if drows else None
     dirsr = fall.filter(pl.col("type") == 5).select(
@@ -1361,6 +1375,7 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
     # files — remote executors did — and a distributed filesystem happily serves the planner
     # a cached size from before those writes (measured: 11 of 12 shards reported ~0 while
     # holding 247 MB). The footer's own locators are authoritative and cost nothing.
+    _lap("dirs_links")
     ends = [0] * len(paths)
     for k in range(nframes):
         if k in locs:
@@ -1374,7 +1389,8 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
     write_footer(fd, end, ps, prev_off=None, rows_per_batch=rows_per_batch, part_cuts=True,
                  snap_time_ns=time_ns if time_ns is not None else time.time_ns())
     os.close(fd)
-    return dict(lost_paths=lost_paths, ends=ends, extent_rows=len(drows),
+    _lap("write_footer")
+    return dict(lost_paths=lost_paths, ends=ends, extent_rows=len(drows), stages=_T,
                 dirs=dirsr.height, links=linksr.height,
                 footer_bytes=os.path.getsize(fpath))
 
@@ -1506,13 +1522,24 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     pack_rows = []                                       # typed PACK rows (fid assigned later)
     delta_meta = []                                      # (path, row, new_manifest, segments)
     appended_literals = 0
+    n_nomanifest = [0]                                   # prior members with no usable manifest
     for r in deltable.iter_rows(named=True):
         if r["path"] not in man or man[r["path"]][1] is None:
             full = pl.concat([full, deltable.filter(pl.col("path") == r["path"])])
             continue
+        # The OLD manifest can be absent or empty -- a member the prior run stored without a
+        # digest, or a zero-chunk blob. There is nothing to delta against, so re-pack it whole
+        # instead of indexing into an empty buffer (this crashed the first real incremental
+        # against a 4.9 TB store with IndexError in _parse_manifest). The NEW manifest is
+        # already guarded above; this is the same fallback for the other side.
+        oldman = r["chunks_p"]
+        if oldman is None or len(oldman) < 8:
+            full = pl.concat([full, deltable.filter(pl.col("path") == r["path"])])
+            n_nomanifest[0] += 1
+            continue
         dg, newman, nsz = man[r["path"]]
         _hid, newch = _parse_manifest(newman)
-        _hid2, oldch = _parse_manifest(r["chunks_p"])
+        _hid2, oldch = _parse_manifest(oldman)
         loc = _old_chunk_locator({"frame": r["frame_p"], "coff": r["coff_p"], "clen": r["clen_p"],
                                   "in_off": r["in_off_p"], "extents": r["extents_p"],
                                   "shard": r["shard_p"]})
@@ -1735,6 +1762,7 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                 reused_batches=len(reuse_ents), rewritten_carried=carried.height,
                 full=small.height, split=big.height,
                 delta=ndelta, literal_bytes=appended_literals,
+                no_manifest=n_nomanifest[0],
                 dirs=dirsr.height, links=linksr.height,
                 errors=len(b.errors), error_sample=b.errors[:5],
                 lost=len(lost_paths), lost_sample=lost_paths[:5],
@@ -2039,8 +2067,17 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
 
     # ---- footer (planner-owned, on shard 0) ----
     fpath = out + ".footer"
+    # TIME THESE SEPARATELY. _stats_table() used to be evaluated inside the call's argument
+    # list, so it was inside footer_s but invisible to bench/footerbench.py -- the replay
+    # measured 9 s against a real 73.7 s and the difference had to be inferred.
+    _t = time.time()
+    _allst = _stats_table(bs)
+    stats_s = round(time.time() - _t, 1)
+    _t = time.time()
     _fr = assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
-                          _stats_table(bs), paths, frame_cap, time_ns)
+                          _allst, paths, frame_cap, time_ns)
+    build_s = round(time.time() - _t, 1)
+    footer_stages = _fr.get("stages", {})
     lost_paths, ends = _fr["lost_paths"], _fr["ends"]
     n_dirs, n_links, n_extents = _fr["dirs"], _fr["links"], _fr["extent_rows"]
     phase[0] = "done"; _stop.set()
@@ -2051,6 +2088,8 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     footer_bytes = os.path.getsize(fpath)                    # the planner wrote this one
     return dict(nodes=list(nodes), sinks=len(paths), scan_s=round(scan_s, 1),
                 pack_s=round(pack_s, 1), footer_s=footer_s,
+                footer_stats_s=stats_s, footer_build_s=build_s,
+                footer_stages=footer_stages,
                 store_bytes=sum(ends) + footer_bytes, data_per_shard=ends,
                 frames=nframes, frames_per_node=per_node_frames,
                 bytes_per_node=[int(x) for x in sent_bytes],
