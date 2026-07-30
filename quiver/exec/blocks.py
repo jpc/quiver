@@ -1354,10 +1354,12 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
     drows.extend(_r); lost_paths.extend(_lost)
     _lap("extent_rows")
     C13 = STAT_COLS + ["chunks", "extents", "shard"]
-    # COLUMNAR, not row-wise: pl.DataFrame(list_of_dicts) walks every row inferring types, and
-    # these rows carry `chunks` blobs that are whole concatenated manifests (the largest
-    # member's is ~223 MB in one cell). Cheap either way in a fresh process -- this span costs
-    # 0.07 s replayed vs 22.4 s live -- so the shape is defensive, not the fix.
+    # COLUMNAR, not row-wise. pl.DataFrame(list_of_dicts) walks every row inferring types, and
+    # these rows carry `chunks` blobs that are whole concatenated manifests -- the largest
+    # member's is ~223 MB in a single cell. Measured on a 4-node whole-tree run this span went
+    # 22.44 s -> 0.90 s. bench/footerbench.py replays it in 0.07 s EITHER WAY, because a
+    # replayed store's chunks are small; the replay cannot see this cost at all, which is why
+    # it took stage timers in the live run to find it.
     ddf = None
     if drows:
         ddf = pl.DataFrame({k: [r_[k] for r_ in drows] for k in drows[0]}).select(C13)
