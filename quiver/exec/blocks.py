@@ -1708,7 +1708,15 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
     drows.extend(_r); lost_paths.extend(_lost)
     C13 = STAT_COLS + ["chunks", "extents", "shard"]
-    ddf = pl.DataFrame(drows).select(C13) if drows else None
+    # COLUMNAR, not row-wise -- same defect and same fix as assemble_footer(): these rows
+    # carry `chunks` blobs that are whole concatenated manifests (the largest member's is
+    # ~223 MB in one cell), and pl.DataFrame(list_of_dicts) infers types row by row over them.
+    # Measured 22.44 s -> 0.90 s on the multi-node path. NOTE: this is a straight duplicate of
+    # assemble_footer's footer construction -- the two should be collapsed, or the next footer
+    # fix has to be made twice again.
+    ddf = None
+    if drows:
+        ddf = pl.DataFrame({k: [r_[k] for r_ in drows] for k in drows[0]}).select(C13)
     dirsr = fall.filter(pl.col("type") == 5).select(
         path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
         gid="gid", frame=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64),
