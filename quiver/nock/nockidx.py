@@ -183,9 +183,43 @@ def iter_batches(path: str, batches=None, at: int | None = None):
             yield pl.read_ipc(io.BytesIO(dctx.decompress(f.read(clen))))
 
 
+# Columns added to the STAT schema after stores existed in the wild, with the value that
+# reproduces the old behaviour. An append-only chain REUSES the previous snapshot's batches by
+# reference, so one incremental written by newer code leaves a footer holding both widths --
+# and a plain concat then refuses the whole store. That is exactly what happened to a 4.9 TB
+# home backup: two incrementals completed reporting `lost 0`, and every read of the result
+# failed with "unable to append to a DataFrame of width 14 with a DataFrame of width 15".
+# `shard` is 0 rather than null because a pre-sharding store had exactly one sink.
+_SCHEMA_BACKFILL = {"shard": (pl.Int64, 0)}
+
+
+def _align_batches(dfs):
+    """Make batches from different schema eras concatenable, widest-schema-wins."""
+    if len(dfs) < 2:
+        return dfs
+    cols = max((d.columns for d in dfs), key=len)
+    if all(d.columns == cols for d in dfs):
+        return dfs
+    out = []
+    for d in dfs:
+        missing = [c for c in cols if c not in d.columns]
+        unknown = [c for c in missing if c not in _SCHEMA_BACKFILL]
+        if unknown:                                       # refuse rather than invent values
+            raise ValueError(f"{'/'.join(unknown)}: batch is missing columns with no known "
+                             f"backfill; this store was written by an incompatible version")
+        if missing:
+            dt, val = zip(*((_SCHEMA_BACKFILL[c][0], _SCHEMA_BACKFILL[c][1]) for c in missing))
+            d = d.with_columns([pl.lit(v, t).alias(c) for c, t, v in zip(missing, dt, val)])
+        out.append(d.select(cols))
+    return out
+
+
 def read_footer(path: str, at: int | None = None) -> pl.DataFrame:
-    """Full STAT table from a chunked footer (concatenates all batches)."""
-    dfs = list(iter_batches(path, at=at))
+    """Full STAT table from a chunked footer (concatenates all batches).
+
+    Batches may span schema eras: the snapshot chain reuses older batches by reference, so a
+    store incrementally backed up by newer code holds both. See _align_batches."""
+    dfs = _align_batches(list(iter_batches(path, at=at)))
     return pl.concat(dfs) if dfs else pl.DataFrame()
 
 
