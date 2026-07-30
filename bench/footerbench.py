@@ -137,6 +137,8 @@ def main():
 
     print(f"  assemble_footer: {dt:.2f}s   footer {r['footer_bytes']/1e6:.1f} MB   "
           f"{r['extent_rows']:,} extent rows   {len(r['lost_paths']):,} lost")
+    if r.get("stages"):                                  # same stage timers the real run reports
+        print("  stages: " + "  ".join(f"{k} {v}" for k, v in r["stages"].items()))
     if A["nframes"]:
         print(f"  scaled to 556,370 frames: {dt * 556370 / A['nframes']:.0f}s")
 

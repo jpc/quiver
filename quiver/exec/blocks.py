@@ -1354,13 +1354,21 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
     drows.extend(_r); lost_paths.extend(_lost)
     _lap("extent_rows")
     C13 = STAT_COLS + ["chunks", "extents", "shard"]
-    ddf = pl.DataFrame(drows).select(C13) if drows else None
+    # COLUMNAR, not row-wise: pl.DataFrame(list_of_dicts) walks every row inferring types, and
+    # these rows carry `chunks` blobs that are whole concatenated manifests (the largest
+    # member's is ~223 MB in one cell). Cheap either way in a fresh process -- this span costs
+    # 0.07 s replayed vs 22.4 s live -- so the shape is defensive, not the fix.
+    ddf = None
+    if drows:
+        ddf = pl.DataFrame({k: [r_[k] for r_ in drows] for k in drows[0]}).select(C13)
+    _lap("ddf_build")
     dirsr = fall.filter(pl.col("type") == 5).select(
         path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
         gid="gid", frame=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64),
         coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64),
         link=pl.lit("", pl.Utf8), chunks=pl.lit(None, pl.Binary), extents=pl.lit(None, pl.Binary),
         shard=pl.lit(0, pl.Int64))
+    _lap("dirsr")
     linksr = links.select(
         path="path", size="size", mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid",
         frame=pl.when(pl.col("in_off") == 1).then(-3).otherwise(-2).cast(pl.Int64),
@@ -1375,7 +1383,7 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
     # files — remote executors did — and a distributed filesystem happily serves the planner
     # a cached size from before those writes (measured: 11 of 12 shards reported ~0 while
     # holding 247 MB). The footer's own locators are authoritative and cost nothing.
-    _lap("dirs_links")
+    _lap("linksr")
     ends = [0] * len(paths)
     for k in range(nframes):
         if k in locs:
