@@ -1562,6 +1562,36 @@ typedef struct ScanCtx {
     BC bc;                                               /* columnar accumulator, flushed at 20000 rows */
 } ScanCtx;
 typedef struct DirJob { ScanCtx *ctx; int dfd; char *rel; uint64_t ino; int32_t depth; struct DirJob *next; } DirJob;
+/* PER-WALKER ACCUMULATOR. Every walker used to append its rows into the ONE ScanCtx.bc while
+ * holding c->mu, so all 233k row-appends of a scan serialized on a single mutex: 64 threads
+ * delivered 1.26 busy cores (117 sleeping, 10.6 in D) and the scan queue sat 2,934 dirs DEEP
+ * -- blocked, not starved. Raising threads did nothing (32/64/128 -> 3.49/3.25/3.24 s).
+ * pwalk2 does the same work on 5.18 cores with per-thread buffers.
+ * Each walker now fills its own BC lock-free and emits it directly (emit_bstat takes g_out_mu
+ * itself and resets the buffer). `owner` tracks which scan the rows belong to, since a walker
+ * may take dirs from different ScanCtxs; switching scans flushes first. */
+typedef struct { BC bc; ScanCtx *owner; } WScan;
+static WScan *g_wscan; static int g_nwscan;
+static pthread_mutex_t g_wsflush = PTHREAD_MUTEX_INITIALIZER;
+
+static void wscan_flush(WScan *ws) {
+    if (ws->owner && ws->bc.n) emit_bstat(ws->owner->sid, -1, &ws->bc);
+}
+/* Flush every walker's rows for `c`. Called only by the thread that saw pending hit 0, so no
+ * walker is mid-append for this scan: each appends BEFORE decrementing pending under c->mu,
+ * and that mutex orders those writes ahead of this sweep. */
+static void wscan_flush_all(ScanCtx *c) {
+    pthread_mutex_lock(&g_wsflush);
+    for (int i = 0; i < g_nwscan; i++)
+        if (g_wscan[i].owner == c) {
+            wscan_flush(&g_wscan[i]);
+            /* CLEAR THE BACK-POINTER. The caller frees the ScanCtx right after the EOF, so a
+             * walker that later picks up a different scan would flush through a dangling
+             * owner (`ws->owner->sid`) -- which showed up as "double free or corruption". */
+            g_wscan[i].owner = NULL;
+        }
+    pthread_mutex_unlock(&g_wsflush);
+}
 /* unbounded linked-list dir queue (unbounded so self-feeding pushes never deadlock a full ring) */
 typedef struct { DirJob *h, *t; int done; int n; pthread_mutex_t mu; pthread_cond_t ne; } DQ;
 static DQ g_dq;
@@ -1654,10 +1684,15 @@ static int ign_match(ScanCtx *c, const char *rel, const char *name, int isdir) {
  * produced it ran OUTSIDE the lock). Dirs carry isdir=1 (emitted, full-stat mode). */
 typedef struct { char *rel; struct stat st; int islnk, hard, isdir; char *tgt; } FEnt;
 
-static void *scan_walker(void *unused) {
+static void *scan_walker(void *arg) {
+    WScan *ws = arg;
     for (;;) {
         DirJob *dj = dq_pop(&g_dq); if (!dj) break;
         ScanCtx *c = dj->ctx; int no = c->names_only;
+        if (ws->owner != c) {                            /* rows must not cross scans */
+            pthread_mutex_lock(&g_wsflush); wscan_flush(ws); ws->owner = c;
+            pthread_mutex_unlock(&g_wsflush);
+        }
         size_t pl = strlen(dj->rel); int32_t cdepth = dj->depth + 1;   /* children's depth */
         FEnt *fe=NULL; long nfe=0, cfe=0;                    /* rows to emit */
         DirJob *kh=NULL, *kt=NULL; long nkids=0;             /* child dirs to enqueue */
@@ -1707,25 +1742,41 @@ static void *scan_walker(void *unused) {
             closedir(dp);
         } else close(dj->dfd);
 
-        pthread_mutex_lock(&c->mu);                          /* append rows + enqueue kids + bookkeep */
+        /* LOCK-FREE row append into this walker's own buffer. c->mu is now taken only for the
+         * hardlink map (which is genuinely shared, and only consulted for nlink>1 entries) and
+         * for the pending counter. */
         for (long i=0;i<nfe;i++) { FEnt *f=&fe[i];
             if (no)
-                bc_add_raw(&c->bc, f->rel, NULL, 0, 0, 0, 0, 0, 0, f->isdir);
+                bc_add_raw(&ws->bc, f->rel, NULL, 0, 0, 0, 0, 0, 0, f->isdir);
             else if (f->isdir || f->islnk)                   /* dir row / symlink row (kind 0, link=target) */
-                bc_add_fs(&c->bc, f->rel, f->tgt, 0, &f->st, dj->ino, cdepth, f->isdir);
-            else { const char *first = f->hard ? imap_get(&c->im, f->st.st_dev, f->st.st_ino) : NULL;
-                if (first)                                   /* HARD LINK (kind 1): points at `first` */
-                    bc_add_fs(&c->bc, f->rel, first, 1, &f->st, dj->ino, cdepth, 0);
-                else { if (f->hard) imap_add(&c->im, f->st.st_dev, f->st.st_ino, f->rel);
-                    bc_add_fs(&c->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0); } }
-            if (c->bc.n >= 20000) scan_flush(c);
+                bc_add_fs(&ws->bc, f->rel, f->tgt, 0, &f->st, dj->ino, cdepth, f->isdir);
+            else if (f->hard) {                              /* shared inode map: needs the lock */
+                pthread_mutex_lock(&c->mu);
+                const char *first = imap_get(&c->im, f->st.st_dev, f->st.st_ino);
+                if (!first) imap_add(&c->im, f->st.st_dev, f->st.st_ino, f->rel);
+                /* copy: `first` points into the map, which another thread may grow */
+                char *fc = first ? strdup(first) : NULL;
+                pthread_mutex_unlock(&c->mu);
+                if (fc) { bc_add_fs(&ws->bc, f->rel, fc, 1, &f->st, dj->ino, cdepth, 0); free(fc); }
+                else bc_add_fs(&ws->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0);
+            }
+            else bc_add_fs(&ws->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0);
+            if (ws->bc.n >= 20000) emit_bstat(c->sid, -1, &ws->bc);
             free(f->rel); free(f->tgt);
         }
+        /* PENDING IS RAISED BEFORE THE KIDS ARE VISIBLE. Pushing first and counting after
+         * lets another walker pop a child, finish it and decrement past zero before this
+         * thread has counted it -- pending transiently hits 0, EOF fires early and the scan
+         * silently truncates (measured: 20,063 rows instead of 233,746, varying per run).
+         * Kids still go on the queue OUTSIDE c->mu; only the counter needs the lock. */
+        pthread_mutex_lock(&c->mu);
         c->pending += nkids;
-        for (DirJob *k=kh; k; ) { DirJob *nx=k->next; dq_push(&g_dq, k); k=nx; }   /* c->mu -> g_dq.mu (never reversed) */
-        long left = --c->pending;                            /* this dir done */
-        if (left==0) { scan_flush(c); emit_eof(c->sid); }
         pthread_mutex_unlock(&c->mu);
+        for (DirJob *k=kh; k; ) { DirJob *nx=k->next; dq_push(&g_dq, k); k=nx; }
+        pthread_mutex_lock(&c->mu);
+        long left = --c->pending;                            /* this dir done */
+        pthread_mutex_unlock(&c->mu);
+        if (left==0) { wscan_flush_all(c); emit_eof(c->sid); }
 
         free(fe); free(dj->rel); free(dj);
         if (left==0) { imap_free(&c->im); bc_free(&c->bc);
@@ -1948,7 +1999,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nw; i++) { ws[i].c = ZSTD_createCCtx(); ws[i].d = ZSTD_createDCtx(); pthread_create(&th[i], 0, worker, &ws[i]); }
     pthread_t smp; pthread_create(&smp, 0, sampler, 0);          /* queue-occupancy sampler */
     int sn = nw; dq_init(&g_dq); pthread_t *sth = calloc(sn, sizeof(pthread_t));   /* parallel scan pool */
-    for (int i = 0; i < sn; i++) pthread_create(&sth[i], 0, scan_walker, 0);
+    g_nwscan = sn; g_wscan = calloc(sn, sizeof *g_wscan);
+    for (int i = 0; i < sn; i++) pthread_create(&sth[i], 0, scan_walker, &g_wscan[i]);
     for (;;) {
         uint32_t len; if (read_full(0, &len, 4) <= 0) break;
         uint8_t *msg = malloc(len); if (read_full(0, msg, len) != 1) { free(msg); break; }
@@ -2140,6 +2192,8 @@ int main(int argc, char **argv) {
     }
     dq_finish(&g_dq);
     for (int i = 0; i < sn; i++) pthread_join(sth[i], 0);          /* scan pool drained */
+    for (int i = 0; i < sn; i++) bc_free(&g_wscan[i].bc);
+    free(g_wscan); g_wscan = NULL; g_nwscan = 0;
     for (int i = 0; i < g_nsrc; i++) pthread_join(g_srcs[i], 0);   /* tar decode done */
     jq_finish(&g_jq);
     int64_t err = 0, files = 0;
