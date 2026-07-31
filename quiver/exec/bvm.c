@@ -1608,7 +1608,21 @@ static _Atomic int64_t sp_readdir, sp_open, sp_stat, sp_bc, sp_emit, sp_dirs, sp
                             __atomic_fetch_add(&(f), now_ns() - _t0, __ATOMIC_RELAXED); } \
                           else { stmt; } } while (0)
 
-typedef struct { BC bc; ScanCtx *owner; } WScan;
+/* BATCHED CHILD-DIRECTORY OPENS. openat is ~1 ms on wekafs -- 23 of the 44 thread-seconds a
+ * scan spends blocked -- and issuing them one at a time leaves a walker with ONE outstanding
+ * metadata op. getdents cannot go on a ring (IORING_OP_GETDENTS was never merged upstream),
+ * so this covers the half that can. Each walker owns a ring; opened lazily, only for
+ * directories with enough children to be worth a submit. */
+#define RING_MIN_DIRS 4
+#define RING_DIR_QD   64
+typedef struct { BC bc; ScanCtx *owner; struct io_uring ring; int ring_ok; } WScan;
+static int wscan_ring(WScan *ws){
+    if (!ws->ring_ok) {
+        if (io_uring_queue_init(RING_DIR_QD, &ws->ring, 0) < 0) { ws->ring_ok = -1; return 0; }
+        ws->ring_ok = 1;
+    }
+    return ws->ring_ok > 0;
+}
 static WScan *g_wscan; static int g_nwscan;
 static pthread_mutex_t g_wsflush = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1733,6 +1747,7 @@ static void *scan_walker(void *arg) {
         }
         size_t pl = strlen(dj->rel); int32_t cdepth = dj->depth + 1;   /* children's depth */
         FEnt *fe=NULL; long nfe=0, cfe=0;                    /* rows to emit */
+        struct { char *cr; struct stat st; int fd; } *pd=NULL; long npd=0, cpd=0;  /* child dirs */
         DirJob *kh=NULL, *kt=NULL; long nkids=0;             /* child dirs to enqueue */
         DIR *dp = fdopendir(dj->dfd);                        /* takes ownership of dfd */
         if (dp) { struct dirent *e; int dfd = dirfd(dp);
@@ -1759,19 +1774,15 @@ static void *scan_walker(void *arg) {
                     if (!isdir && !islnk && !S_ISREG(st.st_mode)) { free(cr); continue; }  /* skip specials */
                 }
                 if (c->nign && ign_match(c, cr, nm, isdir)) { free(cr); continue; }   /* PRUNED */
-                if (isdir) {                                 /* recurse: open fd-relative, defer enqueue */
-                    int cfd; SPT(sp_open, cfd = openat(dfd, nm, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
-                    if (cfd < 0) { free(cr); continue; }
-                    DirJob *k = malloc(sizeof *k); k->ctx=c; k->dfd=cfd; k->next=NULL;
-                    k->ino=(uint64_t)st.st_ino; k->depth=cdepth;
+                if (isdir) {                                 /* defer the open; batched below */
+                    if (npd==cpd){ cpd=cpd?cpd*2:16; pd=realloc(pd,cpd*sizeof(*pd)); }
+                    pd[npd].cr=cr; pd[npd].st=st; pd[npd].fd=-1; npd++;
                     {   /* the dir itself is a row in BOTH modes: full-stat feeds ducl's inode
                          * graph; names-only feeds rm the COMPLETE dir set (EMPTY dirs were
                          * invisible before -> left behind + silent parent-rmdir failures) */
                         if (nfe==cfe){ cfe=cfe?cfe*2:32; fe=realloc(fe,cfe*sizeof(FEnt)); }
                         FEnt *f=&fe[nfe++]; memset(f,0,sizeof *f); f->rel=strdup(cr); f->st=st; f->isdir=1;
                     }
-                    k->rel=cr;
-                    if (kt) kt->next=k; else kh=k; kt=k; nkids++;
                     continue;
                 }
                 if (nfe==cfe){ cfe=cfe?cfe*2:32; fe=realloc(fe,cfe*sizeof(FEnt)); }
@@ -1780,8 +1791,47 @@ static void *scan_walker(void *arg) {
                     if (tl<0){ nfe--; free(cr); continue; } t[tl]=0; f->islnk=1; f->st.st_size=tl; f->tgt=strdup(t); }
                 else if (!no && st.st_nlink>1) f->hard=1;
             }
+            /* open the child dirs while the parent fd is still ours (closedir takes it) */
+            if (npd) {
+                int64_t _o0 = g_scan_prof ? now_ns() : 0;
+                if (npd >= RING_MIN_DIRS && wscan_ring(ws)) {
+                    for (long i=0;i<npd;){
+                        long k = npd-i; if (k > RING_DIR_QD) k = RING_DIR_QD;
+                        for (long j=0;j<k;j++){
+                            const char *bn = strrchr(pd[i+j].cr,'/'); bn = bn?bn+1:pd[i+j].cr;
+                            struct io_uring_sqe *sq = io_uring_get_sqe(&ws->ring);
+                            if (!sq) { k = j; break; }
+                            io_uring_prep_openat(sq, dfd, bn,
+                                                 O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC, 0);
+                            io_uring_sqe_set_data64(sq, (uint64_t)j);
+                        }
+                        if (!k) break;
+                        io_uring_submit(&ws->ring);
+                        for (long j=0;j<k;j++){
+                            struct io_uring_cqe *cq;
+                            if (io_uring_wait_cqe(&ws->ring,&cq)<0) break;
+                            pd[i + (long)io_uring_cqe_get_data64(cq)].fd = cq->res;
+                            io_uring_cqe_seen(&ws->ring,cq);
+                        }
+                        i += k;
+                    }
+                } else {
+                    for (long i=0;i<npd;i++){
+                        const char *bn = strrchr(pd[i].cr,'/'); bn = bn?bn+1:pd[i].cr;
+                        pd[i].fd = openat(dfd, bn, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+                    }
+                }
+                if (g_scan_prof) __atomic_fetch_add(&sp_open, now_ns()-_o0, __ATOMIC_RELAXED);
+                for (long i=0;i<npd;i++){
+                    if (pd[i].fd < 0) { free(pd[i].cr); continue; }
+                    DirJob *k2 = malloc(sizeof *k2); k2->ctx=c; k2->dfd=pd[i].fd; k2->next=NULL;
+                    k2->ino=(uint64_t)pd[i].st.st_ino; k2->depth=cdepth; k2->rel=pd[i].cr;
+                    if (kt) kt->next=k2; else kh=k2; kt=k2; nkids++;
+                }
+            }
+            free(pd); pd=NULL;
             closedir(dp);
-        } else close(dj->dfd);
+        } else { close(dj->dfd); for (long i=0;i<npd;i++) free(pd[i].cr); free(pd); pd=NULL; }
 
         /* LOCK-FREE row append into this walker's own buffer. c->mu is now taken only for the
          * hardlink map (which is genuinely shared, and only consulted for nlink>1 entries) and
@@ -2249,7 +2299,8 @@ int main(int argc, char **argv) {
     }
     dq_finish(&g_dq);
     for (int i = 0; i < sn; i++) pthread_join(sth[i], 0);          /* scan pool drained */
-    for (int i = 0; i < sn; i++) bc_free(&g_wscan[i].bc);
+    for (int i = 0; i < sn; i++) { bc_free(&g_wscan[i].bc);
+        if (g_wscan[i].ring_ok > 0) io_uring_queue_exit(&g_wscan[i].ring); }
     free(g_wscan); g_wscan = NULL; g_nwscan = 0;
     for (int i = 0; i < g_nsrc; i++) pthread_join(g_srcs[i], 0);   /* tar decode done */
     jq_finish(&g_jq);
