@@ -1535,13 +1535,41 @@ static void *rx_reader(void *a) {
  * HARD LINKs to it (link=first path, kind=1 via in_off). Per-scan; shared across the scan's
  * dirs, so guarded by ScanCtx.mu. */
 typedef struct { dev_t dev; ino_t ino; char *path; } Inode;
-typedef struct { Inode *v; int n, cap; } IMap;
+/* HARDLINK MAP. imap_get was a LINEAR SCAN of the whole map, under the scan-wide mutex, for
+ * every entry with nlink>1. That is O(n^2): a Python venv tree is 47% hardlinked (99,130 of
+ * 211,058 files here, because uv/pip hardlink package payloads), so ~99k lookups each walked
+ * a map of tens of thousands -- billions of comparisons, all serialized. It is why the scan
+ * used 1.3 of 64 cores and why per-walker accumulators only bought 13%: the accumulator was
+ * never the constraint, this was. Open-addressed hash index over the same array. */
+typedef struct { Inode *v; int n, cap; int32_t *idx; int icap; } IMap;
+static uint64_t ihash(dev_t d, ino_t i){
+    uint64_t x = (uint64_t)i * 0x9E3779B97F4A7C15ull ^ (uint64_t)d;
+    x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32; return x; }
+static void imap_reindex(IMap *m, int cap){          /* power of two, slot = v index + 1 */
+    free(m->idx); m->idx = calloc(cap, sizeof *m->idx); m->icap = cap;
+    for (int i = 0; i < m->n; i++){
+        uint64_t h = ihash(m->v[i].dev, m->v[i].ino) & (uint64_t)(cap - 1);
+        while (m->idx[h]) h = (h + 1) & (uint64_t)(cap - 1);
+        m->idx[h] = i + 1;
+    } }
 static const char *imap_get(IMap *m, dev_t dev, ino_t ino){
-    for (int i=0;i<m->n;i++) if (m->v[i].dev==dev && m->v[i].ino==ino) return m->v[i].path; return NULL; }
+    if (!m->icap) return NULL;
+    uint64_t h = ihash(dev, ino) & (uint64_t)(m->icap - 1);
+    for (;;){
+        int32_t sl = m->idx[h];
+        if (!sl) return NULL;
+        Inode *e = &m->v[sl - 1];
+        if (e->dev == dev && e->ino == ino) return e->path;
+        h = (h + 1) & (uint64_t)(m->icap - 1);
+    } }
 static void imap_add(IMap *m, dev_t dev, ino_t ino, const char *path){
     if (m->n==m->cap){ m->cap=m->cap?m->cap*2:64; m->v=realloc(m->v,m->cap*sizeof(Inode)); }
-    m->v[m->n].dev=dev; m->v[m->n].ino=ino; m->v[m->n].path=strdup(path); m->n++; }
-static void imap_free(IMap *m){ for (int i=0;i<m->n;i++) free(m->v[i].path); free(m->v); }
+    m->v[m->n].dev=dev; m->v[m->n].ino=ino; m->v[m->n].path=strdup(path); m->n++;
+    if (m->n * 2 >= m->icap) imap_reindex(m, m->icap ? m->icap * 2 : 1024);
+    else { uint64_t h = ihash(dev, ino) & (uint64_t)(m->icap - 1);
+           while (m->idx[h]) h = (h + 1) & (uint64_t)(m->icap - 1);
+           m->idx[h] = m->n; } }
+static void imap_free(IMap *m){ for (int i=0;i<m->n;i++) free(m->v[i].path); free(m->v); free(m->idx); }
 
 /* PARALLEL fs scan (ported from qvm scan): a DIRECTORY is the unit of work, so the persistent
  * walker pool drains ONE scan across many dirs at once — a single-root scan parallelizes (the
@@ -1570,6 +1598,16 @@ typedef struct DirJob { ScanCtx *ctx; int dfd; char *rel; uint64_t ino; int32_t 
  * Each walker now fills its own BC lock-free and emits it directly (emit_bstat takes g_out_mu
  * itself and resets the buffer). `owner` tracks which scan the rows belong to, since a walker
  * may take dirs from different ScanCtxs; switching scans flushes first. */
+/* SCAN STAGE TIMERS (BVM_SCAN_PROF=1). Deliberately NOT on the 42-field stats wire: that
+ * wire mis-decodes silently when the two sides disagree on field count, which already cost a
+ * session of wrong queue numbers. These print to stderr when a scan drains. */
+static int g_scan_prof;
+static _Atomic int64_t sp_readdir, sp_open, sp_stat, sp_bc, sp_emit, sp_dirs, sp_ents, sp_wall;
+#define SP(f, v) do { if (g_scan_prof) __atomic_fetch_add(&(f), (v), __ATOMIC_RELAXED); } while (0)
+#define SPT(f, stmt) do { if (g_scan_prof) { int64_t _t0 = now_ns(); stmt; \
+                            __atomic_fetch_add(&(f), now_ns() - _t0, __ATOMIC_RELAXED); } \
+                          else { stmt; } } while (0)
+
 typedef struct { BC bc; ScanCtx *owner; } WScan;
 static WScan *g_wscan; static int g_nwscan;
 static pthread_mutex_t g_wsflush = PTHREAD_MUTEX_INITIALIZER;
@@ -1698,7 +1736,9 @@ static void *scan_walker(void *arg) {
         DirJob *kh=NULL, *kt=NULL; long nkids=0;             /* child dirs to enqueue */
         DIR *dp = fdopendir(dj->dfd);                        /* takes ownership of dfd */
         if (dp) { struct dirent *e; int dfd = dirfd(dp);
-            while ((e = readdir(dp))) {
+            for (;;) {
+                SPT(sp_readdir, e = readdir(dp));
+                if (!e) break;
                 const char *nm = e->d_name;
                 if (nm[0]=='.' && (!nm[1] || (nm[1]=='.' && !nm[2]))) continue;
                 size_t nl = strlen(nm);
@@ -1712,14 +1752,15 @@ static void *scan_walker(void *arg) {
                 } else {                                     /* full stat */
                     int64_t ts0 = now_ns();
                     int rc_ = fstatat(dfd,nm,&st,AT_SYMLINK_NOFOLLOW);
-                    ST(ns_scan_stat, now_ns() - ts0); ST(scan_entries, 1);
+                    { int64_t _d = now_ns() - ts0; ST(ns_scan_stat, _d); ST(scan_entries, 1);
+                      SP(sp_stat, _d); SP(sp_ents, 1); }
                     if (rc_) { free(cr); continue; }
                     isdir = S_ISDIR(st.st_mode); islnk = S_ISLNK(st.st_mode);
                     if (!isdir && !islnk && !S_ISREG(st.st_mode)) { free(cr); continue; }  /* skip specials */
                 }
                 if (c->nign && ign_match(c, cr, nm, isdir)) { free(cr); continue; }   /* PRUNED */
                 if (isdir) {                                 /* recurse: open fd-relative, defer enqueue */
-                    int cfd = openat(dfd, nm, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+                    int cfd; SPT(sp_open, cfd = openat(dfd, nm, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
                     if (cfd < 0) { free(cr); continue; }
                     DirJob *k = malloc(sizeof *k); k->ctx=c; k->dfd=cfd; k->next=NULL;
                     k->ino=(uint64_t)st.st_ino; k->depth=cdepth;
@@ -1745,6 +1786,7 @@ static void *scan_walker(void *arg) {
         /* LOCK-FREE row append into this walker's own buffer. c->mu is now taken only for the
          * hardlink map (which is genuinely shared, and only consulted for nlink>1 entries) and
          * for the pending counter. */
+        int64_t _bc0 = g_scan_prof ? now_ns() : 0;
         for (long i=0;i<nfe;i++) { FEnt *f=&fe[i];
             if (no)
                 bc_add_raw(&ws->bc, f->rel, NULL, 0, 0, 0, 0, 0, 0, f->isdir);
@@ -1761,9 +1803,11 @@ static void *scan_walker(void *arg) {
                 else bc_add_fs(&ws->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0);
             }
             else bc_add_fs(&ws->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0);
-            if (ws->bc.n >= 20000) emit_bstat(c->sid, -1, &ws->bc);
+            if (ws->bc.n >= 20000) SPT(sp_emit, emit_bstat(c->sid, -1, &ws->bc));
             free(f->rel); free(f->tgt);
         }
+        if (g_scan_prof) { __atomic_fetch_add(&sp_bc, now_ns() - _bc0, __ATOMIC_RELAXED);
+                           __atomic_fetch_add(&sp_dirs, 1, __ATOMIC_RELAXED); }
         /* PENDING IS RAISED BEFORE THE KIDS ARE VISIBLE. Pushing first and counting after
          * lets another walker pop a child, finish it and decrement past zero before this
          * thread has counted it -- pending transiently hits 0, EOF fires early and the scan
@@ -1776,7 +1820,18 @@ static void *scan_walker(void *arg) {
         pthread_mutex_lock(&c->mu);
         long left = --c->pending;                            /* this dir done */
         pthread_mutex_unlock(&c->mu);
-        if (left==0) { wscan_flush_all(c); emit_eof(c->sid); }
+        if (left==0) {
+            wscan_flush_all(c); emit_eof(c->sid);
+            if (g_scan_prof) {
+                int64_t w = now_ns() - __atomic_load_n(&sp_wall, __ATOMIC_RELAXED);
+                fprintf(stderr,
+                  "bvm scan-prof: wall %.2fs  dirs %lld  entries %lld\n"
+                  "  readdir %7.2fs   openat %7.2fs   fstatat %7.2fs\n"
+                  "  bc_add  %7.2fs   emit   %7.2fs   (thread-seconds, summed over walkers)\n",
+                  w/1e9, (long long)sp_dirs, (long long)sp_ents,
+                  sp_readdir/1e9, sp_open/1e9, sp_stat/1e9, sp_bc/1e9, sp_emit/1e9);
+            }
+        }
 
         free(fe); free(dj->rel); free(dj);
         if (left==0) { imap_free(&c->im); bc_free(&c->bc);
@@ -1794,6 +1849,7 @@ static void scan_start(uint32_t sid, const char *root, int names_only, IgnorePat
     ScanCtx *c = calloc(1, sizeof *c); c->sid=sid; c->names_only=names_only; c->pending=1;
     c->ign = ign; c->nign = nign;
     pthread_mutex_init(&c->mu, 0);
+    if (g_scan_prof) __atomic_store_n(&sp_wall, now_ns(), __ATOMIC_RELAXED);
     DirJob *j = malloc(sizeof *j); j->ctx=c; j->dfd=rfd; j->rel=strdup(""); j->next=NULL;
     j->ino=rino; j->depth=0;                                /* root's children get depth 1 (qvm/ducl convention) */
     dq_push(&g_dq, j);
@@ -1974,6 +2030,7 @@ int main(int argc, char **argv) {
     }
     { const char *fm = getenv("BVM_FLUSH_MB"); if (fm) g_flush_bytes = atoll(fm) << 20; }
     g_sink_direct = getenv("BVM_SINK_DIRECT") != NULL;
+    g_scan_prof   = getenv("BVM_SCAN_PROF") != NULL;
     { const char *e = getenv("BVM_RING_MAX_KB");   /* A/B the ring bound without a rebuild */
       if (e && atol(e) > 0) g_ring_max = (size_t)atol(e) << 10; }
     int nw = atoi(argv[1]);
