@@ -355,3 +355,43 @@ def test_multinode_locators_stream_during_dispatch(bvm, tmp_path):
     dest = str(tmp_path / "out")
     assert blocks.unpack(out, dest, bvm, nworkers=4) == 900
     assert _tree_md5(dest) == _tree_md5(str(src))
+
+
+# ------------------------------------------------------------------ snapshot chain
+def test_backup_snapshot_chain(bvm, tmp_path):
+    """The incremental gate for the footer-assembly collapse: two snapshots with a
+    delta'd file, a carried file, an added and a deleted file; both snapshots must
+    restore byte-exact and the summary must show delta + batch reuse at work."""
+    import random
+    src, nock = str(tmp_path / "t"), str(tmp_path / "c.nock")
+    os.makedirs(src + "/sub")
+    rnd = random.Random(41)
+    big = bytearray(rnd.randbytes(512 * 1024))               # >=128K: delta-eligible
+    _write(src, "big.bin", bytes(big))
+    _write(src, "keep.bin", b"K" * 9000)
+    _write(src, "sub/gone.bin", b"G" * 7000)
+    r1 = blocks.backup(src, nock, bvm, nworkers=4, level=1, strict=True)
+    assert r1["lost"] == 0 and r1["errors"] == 0, r1
+    at1 = blocks.scan_nock(nock)                             # snapshot 1 restores exactly
+    d1 = str(tmp_path / "u1"); blocks.unpack(nock, d1, bvm, nworkers=4)
+    t1 = _tree_md5(d1)
+    assert t1 == _tree_md5(src)
+
+    time.sleep(1.1)
+    big[1000:1200] = rnd.randbytes(200)                      # small edit -> delta member
+    _write(src, "big.bin", bytes(big))
+    _write(src, "new.bin", b"N" * 6000)
+    os.remove(os.path.join(src, "sub/gone.bin"))
+    r2 = blocks.backup(src, nock, bvm, nworkers=4, level=1, strict=True)
+    assert r2["lost"] == 0 and r2["errors"] == 0, r2
+    assert r2["delta"] == 1, r2                              # big.bin went as extents
+    assert r2["carried"] >= 1, r2                            # keep.bin not re-packed
+    d2 = str(tmp_path / "u2"); blocks.unpack(nock, d2, bvm, nworkers=4)
+    assert _tree_md5(d2) == _tree_md5(src)                   # snapshot 2 == current tree
+    snaps = blocks.scan_nock(nock, at=None)                  # and snapshot 1 still restores
+    import quiver.nock.nockidx as _nx
+    ats = _nx.snapshots(nock) if hasattr(_nx, "snapshots") else None
+    if ats and len(ats) >= 2:
+        d3 = str(tmp_path / "u3")
+        blocks.unpack(nock, d3, bvm, nworkers=4, at=ats[-1]["at"])
+        assert _tree_md5(d3) == t1

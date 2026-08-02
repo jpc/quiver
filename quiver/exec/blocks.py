@@ -1360,26 +1360,17 @@ def _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap):
     return rows, lost
 
 
-def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
-                    allst, paths, frame_cap, time_ns=None, rows_per_batch=1 << 12):
-    """THE footer phase, as one callable: plan + locators -> the footer file on disk.
-
-    Extracted from backup_multi so it can be replayed and profiled without running a backup
-    (bench/footerbench.py). It is worth isolating: on a whole-tree run this phase is serial
-    after all packing and took 1093 s of 2357 -- 46% -- and every guess about where that time
-    went was wrong until it could be run on its own.
-
-    Returns dict(lost_paths, ends, extent_rows, footer_bytes)."""
+def _footer_rows(pdf, bounds, pre, locs, shard_of, big, small, links, allst, frame_cap,
+                 lap=None, extra_rows_fn=None):
+    """The ONCE-DUPLICATED footer-row core: assemble_footer carried one copy and
+    backup() carried another (its own comment demanded this collapse — "the next
+    footer fix has to be made twice again"). Locators join the plan; members become
+    direct rows (packed), EXTENT rows (splits + whatever `extra_rows_fn` adds —
+    backup's delta members ride there so they share fall, chunk_df and the one
+    columnar build), dir rows and link rows. `lap`: optional stage-timer callback.
+    Returns dict(fall, packed, dirsr, linksr, ddf, lost_paths, ndelta, missing, C13)."""
     import numpy as np
-    # STAGE TIMERS. bench/footerbench.py replays this in ~8 s with faithful inputs, writing to
-    # the same filesystem, while the real run spends 65 s here. The cost lives in the state of
-    # the LIVE process -- allst arrives as ~248k separate Arrow batches, so its string columns
-    # are badly fragmented for the joins below -- and replay cannot reproduce it. Measure here
-    # rather than infer from the difference, which has been wrong three times.
-    _T = {}
-    _tk = [time.time()]
-    def _lap(name):
-        _T[name] = round(time.time() - _tk[0], 2); _tk[0] = time.time()
+    _lap = lap if lap is not None else (lambda name: None)
     nframes = len(bounds) - 1
     gcum = pre
     fstart = gcum[np.asarray(bounds[:-1], dtype=np.int64)]
@@ -1390,7 +1381,8 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
     fall = pdf.with_columns(in_off_out=pl.Series(in_off),
                             coff=pl.Series(np.repeat(coff_a, np.diff(bounds))),
                             clen=pl.Series(np.repeat(clen_a, np.diff(bounds))),
-                            shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
+                            shard=pl.Series(np.repeat(np.asarray(shard_of, dtype=np.int64),
+                                                      np.diff(bounds))))
     _lap("locators")
     lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()
     fall = fall.filter(pl.col("coff") >= 0)
@@ -1409,7 +1401,10 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
               .with_columns(digest=pl.col("digest").fill_null(-1),
                             extents=pl.lit(None, pl.Binary)))
     _lap("packed_join")
-    drows = []
+    drows, ndelta = [], 0
+    if extra_rows_fn is not None:                        # backup's delta EXTENT members
+        _d, _l = extra_rows_fn(fall, chunk_df)
+        drows.extend(_d); lost_paths.extend(_l); ndelta = len(_d)
     _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
     drows.extend(_r); lost_paths.extend(_lost)
     _lap("extent_rows")
@@ -1437,6 +1432,36 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
         in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64),
         digest=pl.lit(-1, pl.Int64), link="link", chunks=pl.lit(None, pl.Binary),
         extents=pl.lit(None, pl.Binary), shard=pl.lit(0, pl.Int64))
+    _lap("linksr")
+    return dict(fall=fall, packed=packed, dirsr=dirsr, linksr=linksr, ddf=ddf,
+                lost_paths=lost_paths, ndelta=ndelta, missing=missing, C13=C13)
+
+
+def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
+                    allst, paths, frame_cap, time_ns=None, rows_per_batch=1 << 12):
+    """THE footer phase, as one callable: plan + locators -> the footer file on disk.
+
+    Extracted from backup_multi so it can be replayed and profiled without running a backup
+    (bench/footerbench.py). It is worth isolating: on a whole-tree run this phase is serial
+    after all packing and took 1093 s of 2357 -- 46% -- and every guess about where that time
+    went was wrong until it could be run on its own.
+
+    Returns dict(lost_paths, ends, extent_rows, footer_bytes)."""
+    import numpy as np
+    # STAGE TIMERS. bench/footerbench.py replays this in ~8 s with faithful inputs, writing to
+    # the same filesystem, while the real run spends 65 s here. The cost lives in the state of
+    # the LIVE process -- allst arrives as ~248k separate Arrow batches, so its string columns
+    # are badly fragmented for the joins below -- and replay cannot reproduce it. Measure here
+    # rather than infer from the difference, which has been wrong three times.
+    _T = {}
+    _tk = [time.time()]
+    def _lap(name):
+        _T[name] = round(time.time() - _tk[0], 2); _tk[0] = time.time()
+    nframes = len(bounds) - 1
+    fr = _footer_rows(pdf, bounds, pre, locs, shard_of, big, small, links, allst,
+                      frame_cap, lap=_lap)
+    packed, dirsr, linksr, ddf = fr["packed"], fr["dirsr"], fr["linksr"], fr["ddf"]
+    lost_paths, C13 = fr["lost_paths"], fr["C13"]
     # SEPARATE FOOTER. With several shards nothing is gained by hiding the index inside one
     # of them: it forced the footer to be written after shard 0's last frame, and made shard 0
     # the only shard that is both data and index. Its own file has base offset 0 and no
@@ -1460,7 +1485,8 @@ def assemble_footer(fpath, pdf, bounds, pre, locs, shard_of, big, small, links,
                  snap_time_ns=time_ns if time_ns is not None else time.time_ns())
     os.close(fd)
     _lap("write_footer")
-    return dict(lost_paths=lost_paths, ends=ends, extent_rows=len(drows), stages=_T,
+    return dict(lost_paths=lost_paths, ends=ends,
+                extent_rows=(ddf.height if ddf is not None else 0), stages=_T,
                 dirs=dirsr.height, links=linksr.height,
                 footer_bytes=os.path.getsize(fpath))
 
@@ -1667,95 +1693,49 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
                                 sink_id=k, tar_compat=0)
         c = e
     locs = b.finish()
-    # ---- footer assembly ----
-    gcum = pre
-    fstart = gcum[np.asarray(bounds[:-1], dtype=np.int64)]
-    in_off = gcum[:-1] - np.repeat(fstart, np.diff(bounds))
-    missing = [k for k in range(nframes) if k not in locs]
-    if missing and strict:
-        raise RuntimeError(f"{len(missing)} frame(s) unrecorded (first: {missing[:3]}); "
-                           f"bvm errors: {b.errors[:3]}")
-    coff_a = np.fromiter((locs.get(k, (-1, 0))[0] for k in range(nframes)), np.int64, nframes)
-    clen_a = np.fromiter((locs.get(k, (-1, 0))[1] for k in range(nframes)), np.int64, nframes)
-    shard_of = np.arange(nframes, dtype=np.int64) % shards
-    fall = pdf.with_columns(in_off_out=pl.Series(in_off),
-                            coff=pl.Series(np.repeat(coff_a, np.diff(bounds))),
-                            clen=pl.Series(np.repeat(clen_a, np.diff(bounds))),
-                            shard=pl.Series(np.repeat(shard_of, np.diff(bounds))))
-    lost_paths = fall.filter((pl.col("type") == 0) & (pl.col("coff") < 0))["path"].to_list()         if missing else []
-    if missing:                                          # errored frames: their bytes are NOT in
-        fall = fall.filter(pl.col("coff") >= 0)          # the store — drop members, report lost
-    allst = _stats_table([b])                            # ONE table, then filter once
-    dd = (allst.filter(pl.col("digest") != -1) if allst is not None
-          else pl.DataFrame(schema={"path": pl.Utf8, "digest": pl.Int64,
-                                    "chunks": pl.Binary, "fid": pl.Int64}))
-    digs = dd.select("path", "digest", "chunks").unique(subset="path", keep="last")
-    fullpaths = set(small["path"].to_list())            # big files get EXTENT rows, not direct
-    packed = (fall.filter((pl.col("type") == 0) & pl.col("path").is_in(list(fullpaths)))
-              .with_columns(frame=pl.col("fid"), in_off=pl.col("in_off_out"),
-                            digest=pl.lit(-1, pl.Int64)).select(STAT_COLS + ["shard"])
-              .drop("digest").join(digs, on="path", how="left", maintain_order="left")
-              .with_columns(digest=pl.col("digest").fill_null(-1),
-                            extents=pl.lit(None, pl.Binary)))
-    # delta rows: extents mixing old frames + new literal frames (locate literals in fall)
-    lit_lookup = {}
-    lf = fall.filter((pl.col("type") == 0) & ~pl.col("path").is_in(list(fullpaths)))
-    for rr in lf.iter_rows(named=True):
-        lit_lookup[(rr["path"], rr["src_off"])] = (rr["coff"], rr["clen"], rr["in_off_out"],
-                                                   rr["shard"], rr["fid"])
-    # per-PIECE manifests, keyed by (frame, path): a split file's pieces share a path, so the
-    # path-keyed `digs` above collapses them. Concatenating the pieces' manifests yields a
-    # valid chunking of the whole file (content-defined within each piece, with one forced
-    # boundary per frame_cap), which is what keeps a split member deltable next snapshot.
-    chunk_df = dd.select("path", "chunks", "fid") if dd.height else None
-    drows = []
-    for r, dg, newman, segs in delta_meta:
-        ex, oo, ok_ = [], 0, True
-        for sg in segs:
-            if sg[0] == "old":
-                ex.append((sg[1], sg[2], sg[3], sg[4], oo, sg[5])); oo += sg[4]
-            else:
-                for o2, n2 in _pieces(sg[1], sg[2], frame_cap):
-                    hit = lit_lookup.get((r["path"], o2))
-                    if hit is None:                      # literal run's frame errored: lost
-                        ok_ = False; break
-                    coff, clen, io_, sh_, _fid = hit
-                    ex.append((coff, clen, io_, n2, oo, sh_)); oo += n2
-                if not ok_:
-                    break
-        if not ok_:
-            lost_paths.append(r["path"]); continue
-        drows.append(dict(path=r["path"], size=r["size"], mode=r["mode"], mtime_ns=r["mtime_ns"],
-                          uid=r["uid"], gid=r["gid"], frame=-4, in_off=-1, coff=-1, clen=-1,
-                          digest=dg, link="", chunks=newman, extents=_pack_extents(ex), shard=0))
-    ndelta = len(drows)                                  # everything past here is a SPLIT, not
-    # SPLIT whole files: one extent per piece           # a delta — keep them apart in the report, manifest = the pieces' manifests concatenated.
-    # `digest` stays -1 — the whole-file BLAKE3 would need a second full read, and no reader
-    # uses it for extent members (`verify` only re-hashes frame>=0 rows).
-    _r, _lost = _split_extent_rows(big, fall, fullpaths, chunk_df, frame_cap)
-    drows.extend(_r); lost_paths.extend(_lost)
-    C13 = STAT_COLS + ["chunks", "extents", "shard"]
-    # COLUMNAR, not row-wise -- same defect and same fix as assemble_footer(): these rows
-    # carry `chunks` blobs that are whole concatenated manifests (the largest member's is
-    # ~223 MB in one cell), and pl.DataFrame(list_of_dicts) infers types row by row over them.
-    # Measured 22.44 s -> 0.90 s on the multi-node path. NOTE: this is a straight duplicate of
-    # assemble_footer's footer construction -- the two should be collapsed, or the next footer
-    # fix has to be made twice again.
-    ddf = None
-    if drows:
-        ddf = pl.DataFrame({k: [r_[k] for r_ in drows] for k in drows[0]}).select(C13)
-    dirsr = fall.filter(pl.col("type") == 5).select(
-        path="path", size=pl.lit(0, pl.Int64), mode="mode", mtime_ns="mtime_ns", uid="uid",
-        gid="gid", frame=pl.lit(-1, pl.Int64), in_off=pl.lit(-1, pl.Int64),
-        coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64), digest=pl.lit(-1, pl.Int64),
-        link=pl.lit("", pl.Utf8), chunks=pl.lit(None, pl.Binary), extents=pl.lit(None, pl.Binary),
-        shard=pl.lit(0, pl.Int64))
-    linksr = links.select(
-        path="path", size="size", mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid",
-        frame=pl.when(pl.col("in_off") == 1).then(-3).otherwise(-2).cast(pl.Int64),
-        in_off=pl.lit(-1, pl.Int64), coff=pl.lit(-1, pl.Int64), clen=pl.lit(-1, pl.Int64),
-        digest=pl.lit(-1, pl.Int64), link="link", chunks=pl.lit(None, pl.Binary),
-        extents=pl.lit(None, pl.Binary), shard=pl.lit(0, pl.Int64))
+    # ---- footer assembly: the shared core + backup's delta hook ----
+    def _delta_rows(fall, chunk_df):
+        """backup-only EXTENT rows: delta members stitching OLD frames + NEW literal
+        runs (located in `fall` by (path, src_off))."""
+        lit_lookup = {}
+        fullpaths_ = set(small["path"].to_list())
+        lf = fall.filter((pl.col("type") == 0) & ~pl.col("path").is_in(list(fullpaths_)))
+        for rr in lf.iter_rows(named=True):
+            lit_lookup[(rr["path"], rr["src_off"])] = (rr["coff"], rr["clen"], rr["in_off_out"],
+                                                       rr["shard"], rr["fid"])
+        drows, lost = [], []
+        for r, dg, newman, segs in delta_meta:
+            ex, oo, ok_ = [], 0, True
+            for sg in segs:
+                if sg[0] == "old":
+                    ex.append((sg[1], sg[2], sg[3], sg[4], oo, sg[5])); oo += sg[4]
+                else:
+                    for o2, n2 in _pieces(sg[1], sg[2], frame_cap):
+                        hit = lit_lookup.get((r["path"], o2))
+                        if hit is None:                  # literal run's frame errored: lost
+                            ok_ = False; break
+                        coff, clen, io_, sh_, _fid = hit
+                        ex.append((coff, clen, io_, n2, oo, sh_)); oo += n2
+                    if not ok_:
+                        break
+            if not ok_:
+                lost.append(r["path"]); continue
+            drows.append(dict(path=r["path"], size=r["size"], mode=r["mode"],
+                              mtime_ns=r["mtime_ns"], uid=r["uid"], gid=r["gid"],
+                              frame=-4, in_off=-1, coff=-1, clen=-1,
+                              digest=dg, link="", chunks=newman,
+                              extents=_pack_extents(ex), shard=0))
+        return drows, lost
+
+    fr = _footer_rows(pdf, bounds, pre, locs,
+                      np.arange(nframes, dtype=np.int64) % shards,
+                      big, small, links, _stats_table([b]), frame_cap,
+                      extra_rows_fn=_delta_rows)
+    if fr["missing"] and strict:
+        raise RuntimeError(f"{len(fr['missing'])} frame(s) unrecorded "
+                           f"(first: {fr['missing'][:3]}); bvm errors: {b.errors[:3]}")
+    packed, dirsr, linksr, ddf = fr["packed"], fr["dirsr"], fr["linksr"], fr["ddf"]
+    lost_paths, ndelta, C13 = fr["lost_paths"], fr["ndelta"], fr["C13"]
     # ---- FOOTER-BATCH REUSE (bup tree-sharing analog): a prior batch's directory entry is
     # copied verbatim iff EVERY row in it is still the CURRENT row for its path (same
     # locator, path not changed/deleted/delta'd) and it holds only data rows. Reused rows
