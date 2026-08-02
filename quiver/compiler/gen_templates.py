@@ -16,13 +16,18 @@ SCHEMAS = {
                ("ino","u64"),("parent_ino","u64"),("dev","u64"),
                ("mode","i32"),("uid","i32"),("gid","i32"),("nlink","i32"),
                ("depth","i32"),("is_dir","u8"),
-               ("digest","i64"),("chunks","large_binary")],
+               ("digest","i64"),("chunks","large_binary"),("err","i32")],
               # digest: whole-file BLAKE3, first 8B as i64 (-1 = absent). chunks: the
               # FastCDC manifest [u8 hash_id][3 pad][u32 n][n x (u32 len, 16B id)] —
               # hash_id 2 = BLAKE3-128; empty for files < 128K (they ARE their single
               # chunk). APPENDED so all existing BSTAT buffer indexes (0-35) stay stable.
+              # err: 0, or -errno when this entry could not be fully read (an unreadable
+              # directory keeps its stat and its row, and says WHY it has no children).
+              # Rides in the batch so failures arrive in tree order with the files they
+              # belong next to, instead of on the separate ERROR(3) channel that _Bvm.read
+              # swallowed -- which is how a scan lost 42% of a mount and still exited 0.
               [["a","bb"],["c","dd"]] + [[1,2]]*6 + [[3,4]]*3 + [[5,6]]*5
-              + [[0,1]] + [[7,8]] + [[b"x",b"yy"]]),
+              + [[0,1]] + [[7,8]] + [[b"x",b"yy"]] + [[0,1]]),
 }
 
 def carr(name, data):

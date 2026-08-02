@@ -37,9 +37,10 @@ def _expand(pattern):
     return sorted(glob.glob(pattern)) or ([pattern] if os.path.exists(pattern) else [])
 
 
-def _shard_ex(tmpl, n):
-    from .exec.blocks import _shard_path
-    return _shard_path(tmpl, 0) + (f" .. {_shard_path(tmpl, n - 1)}" if n > 1 else "")
+def _shard_ex(out, n):
+    from .exec.blocks import shard_paths
+    ps = shard_paths(out, n)                            # one STORE: out, out.1, ... + sidecar
+    return f"{ps[0]} .. {ps[-1]} + {out}.footer" if n > 1 else ps[0]
 
 
 def main(argv=None):

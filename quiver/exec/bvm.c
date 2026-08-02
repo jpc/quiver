@@ -16,12 +16,29 @@
  *   4 OPEN_TAR [u32 sid][i64 frame_bytes][u8 flags: bit0=stat_only bit1=tar_compat][u16 plen][path]
  *   5 SCAN_FS  [u32 sid][u16 plen][root]        (full stat per entry; dir rows too)
  *  14 SCAN_NAMES [u32 sid][u16 plen][root]      (readdir + d_type only, NO lstat — rm/enumerate)
+ *  16 SCAN_DIRS  [u32 sid][u16 plen][root]      (as SCAN_FS, but STREAMING-COMPLETE dir chunks:
+ *        each directory's OWN row is emitted by its own walk carrying child_count in `in_off`
+ *        and dir_total_size in `digest`, batches never split a directory. See scan_walker.)
  *   6 COPY_BLOCK [u64 block][u64 frame][u32 level]
  *   7 PACK_FILES [frame][level][sink][tc][root][n] + COLUMNS mode/size/poff/paths (+hoff/hdrs)
  *   8 SCATTER  [coff][clen][nock_id][n] + COLUMNS in_off/size/mode/mtime/uid/gid/poff/paths
  *   9 FREE/RETIRE [u64 block]   — drop the planner's owner-ref; block frees when no worker is reading it
- *  12 COPY_MEMBERS [u64 block][u64 frame][u32 level][u32 sink][u8 tar_compat][u32 n]( [i64 in_off][i64 size][u32 mode][u16 plen][path] [u32 hlen][hdr]? ) — frame from a member subset of a block
+ *  12 COPY_MEMBERS [u64 block][u64 frame][u32 level][u32 sink][u8 tar_compat] + ARROW batch of
+ *        typed members (in_off/type/mode/size/mtime_ns/uid/gid/path/link -> 20 bufs; headers
+ *        synthesized in C) — frame from a member subset of a block
  *  13 UNLINK   [u8 removedir][u32 n] + COLUMNS poff/paths (io_uring batch)
+ *  17 META  [ARROW batch: path, link, type u8, mode i32, mtime_ns i64, uid i32, gid i32 -> 16 bufs]
+ *        worker-parallel node creation + metadata under DEST — every serial per-row loop
+ *        unpack used to run in Python, batched. By `type`:
+ *          0 meta-only: chown -> chmod -> utimensat on an existing path (the dir epilogue;
+ *            errors tolerated silently — a strict finish() must not die on EPERM noise)
+ *          5 dir:      mkdir (+mkparents; EEXIST fine — ranks share parents)
+ *          2 symlink:  replace + symlink(link) + lchown/utimensat NOFOLLOW
+ *          1 hardlink: replace + link(DEST+link -> DEST+path) (+mkparents)
+ *        types 5/2/1 emit_err on real failure (the Python loops raised there too).
+ *        ORDERING is the planner's: files/dirs/symlinks may interleave freely (mkparents
+ *        makes creation order-independent), but hardlinks need their targets on disk and
+ *        meta-only needs everything final — send those in their own sessions.
  * C->Py:
  *   0 STAT [u32 sid][i64 block][u32 n]( [i64 in_off][i64 size][u32 mode][i64 mtime][u32 uid][u32 gid][u16 plen][path][u16 llen][link] ) — llen>0 = symlink target
  *   1 SRC_EOF [u32 sid]          2 DONE [u32 n]( [u64 frame][u64 coff][u64 clen] )
@@ -35,6 +52,7 @@
 #include <errno.h>
 #include <sys/uio.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -267,6 +285,40 @@ static void wshrink(uint8_t **b, size_t *cap) {
 }
 #define ST(f, v) __atomic_fetch_add(&g_st.f, (int64_t)(v), __ATOMIC_RELAXED)
 
+/* ---- metadata apply (the chown/chmod/utimens idiom, once) -------------------------------
+ * ORDER IS INVARIANT at every site: chown FIRST (it strips setuid/sgid), chmod second
+ * (only the variants that want one), mtime LAST via futimens/utimensat with
+ * ts[0].tv_nsec=UTIME_OMIT (leave atime). All best-effort. The callers own the gates
+ * (g_scatter_meta bits, nonzero uid/gid/mtime) and pass the verdict as flags — a site
+ * that wants no ownership simply omits MF_OWN, so the helpers stay branch-simple. */
+enum { MF_OWN      = 1,    /* apply uid/gid (fchown/chown/lchown) */
+       MF_MODE     = 2,    /* path form: chmod(mode&07777) when mode != 0 (dir/meta-only pass) */
+       MF_TIME     = 4,    /* set mtime */
+       MF_NOFOLLOW = 8,    /* path form: lchown + utimensat(AT_SYMLINK_NOFOLLOW) (symlinks) */
+       MF_ACCT     = 16 }; /* count into ST(n_meta)/ST(ns_meta) (scatter paths do; rx doesn't) */
+static void meta_ts(struct timespec ts[2], int64_t mt) {
+    ts[0].tv_nsec = UTIME_OMIT;
+    ts[1].tv_sec = mt / 1000000000LL; ts[1].tv_nsec = mt % 1000000000LL;
+}
+/* fd form (a file just written): the only chmod is re-raising setuid/sgid after the chown
+ * stripped them — open(O_CREAT, mode) under umask 0 already set the rest. */
+static void apply_meta_fd(int fd, uint32_t mode, uint32_t uid, uint32_t gid, int64_t mt, int flags) {
+    int64_t tm = now_ns(); int did = 0;
+    if (flags & MF_OWN) {
+        (void)!fchown(fd, (uid_t)uid, (gid_t)gid); did = 1;
+        if (mode & 06000) (void)!fchmod(fd, mode & 07777);   /* chown STRIPS setuid/sgid */
+    }
+    if (flags & MF_TIME) { struct timespec ts[2]; meta_ts(ts, mt); (void)!futimens(fd, ts); did = 1; }
+    if (did && (flags & MF_ACCT)) { ST(ns_meta, now_ns() - tm); ST(n_meta, 1); }
+}
+static void apply_meta_path(const char *full, uint32_t mode, uint32_t uid, uint32_t gid, int64_t mt, int flags) {
+    if (flags & MF_OWN) (void)!((flags & MF_NOFOLLOW) ? lchown(full, (uid_t)uid, (gid_t)gid)
+                                                      : chown(full, (uid_t)uid, (gid_t)gid));
+    if ((flags & MF_MODE) && mode) (void)!chmod(full, mode & 07777);   /* after chown (setgid strip) */
+    if (flags & MF_TIME) { struct timespec ts[2]; meta_ts(ts, mt);
+        (void)!utimensat(AT_FDCWD, full, ts, (flags & MF_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0); }
+}
+
 /* ------------------------------------------------------------------ content digests */
 /* Digests: BLAKE3 (static libblake3, runtime-dispatched SSE2/SSE4.1/AVX2/AVX512) — 4.5 GB/s
  * vs BLAKE2b 0.67 (6.7x), tree-structured (natural fit for our Merkle footers + content
@@ -401,6 +453,19 @@ static int64_t arrow_next(const uint8_t **cur, const uint8_t **bufp, int nbufs_e
         return n;
     }
 }
+/* Iterate EVERY record batch of a command's Arrow payload, plus the mandatory
+ * shape-mismatch stanza, written once. A statement pair, not a callback — the body stays
+ * inline because several bodies call jq_push, whose bounded queue IS the backpressure:
+ *     const uint8_t *bp[NB];
+ *     ARROW_FOREACH(p, bp, NB) { ...consume n rows via bp[]... } ARROW_END("PACK_FILES");
+ * `n` (int64_t) is the current batch's row count inside the body. On a malformed or
+ * shape-mismatched stream ARROW_END reports the site's tag and sets g_fatal (refuse,
+ * don't guess — see arrow_next). */
+#define ARROW_FOREACH(cur0, bp, N) \
+    { const uint8_t *_acur = (cur0); int64_t n; \
+      while ((n = arrow_next(&_acur, (bp), (N))) > 0)
+#define ARROW_END(tag) \
+      if (n < 0) { fprintf(stderr, "bvm: " tag " batch shape mismatch\n"); g_fatal = 1; } }
 typedef struct {                                   /* columnar STAT accumulator */
     int64_t *poff; char *pdat; size_t pdcap, plen; /* path: i64 offsets + bytes */
     int64_t *loff; char *ldat; size_t ldcap, llen; /* link */
@@ -408,6 +473,7 @@ typedef struct {                                   /* columnar STAT accumulator 
     uint64_t *ino, *pino, *dev;
     int32_t *mode, *uid, *gid, *nlink, *depth; uint8_t *isdir;
     int64_t *dg;                                   /* whole-file BLAKE3-64 (-1 = absent) */
+    int32_t *err;                                  /* 0, or -errno for an entry we could not read */
     int64_t *koff; uint8_t *kdat; size_t kdcap, klen;   /* chunks manifest: offsets + blob */
     uint32_t n, cap;
 } BC;
@@ -420,7 +486,7 @@ static void bc_reserve(BC *b) {
     b->ino=realloc(b->ino,c*8); b->pino=realloc(b->pino,c*8); b->dev=realloc(b->dev,c*8);
     b->mode=realloc(b->mode,c*4); b->uid=realloc(b->uid,c*4); b->gid=realloc(b->gid,c*4);
     b->nlink=realloc(b->nlink,c*4); b->depth=realloc(b->depth,c*4); b->isdir=realloc(b->isdir,c);
-    b->dg=realloc(b->dg,c*8); b->koff=realloc(b->koff,(c+1)*8);
+    b->dg=realloc(b->dg,c*8); b->koff=realloc(b->koff,(c+1)*8); b->err=realloc(b->err,c*4);
 }
 static void bc_str(char **dat, size_t *cap, size_t *len, const char *s, size_t sl) {
     if (*len + sl > *cap) { size_t c = *cap ? *cap : 65536; while (*len + sl > c) c *= 2; *dat = realloc(*dat, c); *cap = c; }
@@ -436,7 +502,7 @@ static void bc_add_fs(BC *b, const char *path, const char *link, int64_t in_off,
     if (ll) bc_str(&b->ldat, &b->ldcap, &b->llen, link, ll);
     b->loff[b->n+1] = (int64_t)b->llen;
     b->koff[b->n+1] = (int64_t)b->klen;              /* no manifest by default */
-    uint32_t i = b->n; b->dg[i] = -1;
+    uint32_t i = b->n; b->dg[i] = -1; b->err[i] = 0;
     b->in_off[i]=in_off; b->size[i]=st->st_size; b->blocks[i]=st->st_blocks;
     b->mt[i]=(int64_t)st->st_mtim.tv_sec*1000000000LL+st->st_mtim.tv_nsec;
     b->at[i]=(int64_t)st->st_atim.tv_sec*1000000000LL+st->st_atim.tv_nsec;
@@ -455,7 +521,7 @@ static void bc_add_raw(BC *b, const char *path, const char *link, int64_t in_off
     if (ll) bc_str(&b->ldat, &b->ldcap, &b->llen, link, ll);
     b->loff[b->n+1] = (int64_t)b->llen;
     b->koff[b->n+1] = (int64_t)b->klen;              /* no manifest by default */
-    uint32_t i = b->n; b->dg[i] = -1;
+    uint32_t i = b->n; b->dg[i] = -1; b->err[i] = 0;
     b->in_off[i]=in_off; b->size[i]=size; b->blocks[i]=0; b->mt[i]=mtime; b->at[i]=0; b->ct[i]=0;
     b->ino[i]=0; b->pino[i]=0; b->dev[i]=0; b->mode[i]=(int32_t)mode; b->uid[i]=(int32_t)uid;
     b->gid[i]=(int32_t)gid; b->nlink[i]=0; b->depth[i]=0; b->isdir[i]=(uint8_t)isdir; b->n++;
@@ -476,8 +542,19 @@ static void bc_free(BC *b) {
     free(b->in_off); free(b->size); free(b->blocks); free(b->mt); free(b->at); free(b->ct);
     free(b->ino); free(b->pino); free(b->dev); free(b->mode); free(b->uid); free(b->gid);
     free(b->nlink); free(b->depth); free(b->isdir);
-    free(b->dg); free(b->koff); free(b->kdat); memset(b, 0, sizeof *b);
+    free(b->dg); free(b->koff); free(b->kdat); free(b->err); memset(b, 0, sizeof *b);
 }
+/* BSTAT buffer indices, in bc_arrow's WBuf order below. Each column is [validity][data]
+ * (strings: [validity][offsets][data]), so the data buffers sit at fixed slots. rx_reader
+ * indexes the SAME batch by these numbers on the receive side — the two MUST agree; if a
+ * column is added/moved in the BSTAT schema, update BOTH bc_arrow's table and this enum. */
+enum {
+    BSTAT_B_PATH_OFF = 1,  BSTAT_B_PATH_DAT = 2,
+    BSTAT_B_LINK_OFF = 4,  BSTAT_B_LINK_DAT = 5,
+    BSTAT_B_IN_OFF   = 7,  BSTAT_B_SIZE     = 9,  BSTAT_B_MTIME = 13,
+    BSTAT_B_MODE     = 25, BSTAT_B_UID      = 27, BSTAT_B_GID   = 29,
+    BSTAT_B_ISDIR    = 35,
+};
 /* serialize a BC as one in-memory Arrow stream [schema][batch][body][EOS] (BSTAT schema).
  * Does NOT reset the BC. Used for the stdout STAT wire AND the network-apply stat blob
  * (rx parses it with arrow_batch — full typed metadata crosses the data plane). */
@@ -486,16 +563,18 @@ static uint8_t *bc_arrow(BC *b, size_t *outlen) {
     const void *po = b->poff ? (const void *)b->poff : (const void *)&zoff;   /* n==0: one 0 offset */
     const void *lo = b->loff ? (const void *)b->loff : (const void *)&zoff;
     WBuf bufs[BSTAT_N_BUFS] = {
-        {NULL,0},{po,8*(n+1)},{b->pdat,(int64_t)b->plen},
-        {NULL,0},{lo,8*(n+1)},{b->ldat,(int64_t)b->llen},
-        {NULL,0},{b->in_off,8*n}, {NULL,0},{b->size,8*n},  {NULL,0},{b->blocks,8*n},
-        {NULL,0},{b->mt,8*n},     {NULL,0},{b->at,8*n},    {NULL,0},{b->ct,8*n},
+        {NULL,0},[BSTAT_B_PATH_OFF]={po,8*(n+1)},[BSTAT_B_PATH_DAT]={b->pdat,(int64_t)b->plen},
+        {NULL,0},[BSTAT_B_LINK_OFF]={lo,8*(n+1)},[BSTAT_B_LINK_DAT]={b->ldat,(int64_t)b->llen},
+        {NULL,0},[BSTAT_B_IN_OFF]={b->in_off,8*n}, {NULL,0},[BSTAT_B_SIZE]={b->size,8*n},  {NULL,0},{b->blocks,8*n},
+        {NULL,0},[BSTAT_B_MTIME]={b->mt,8*n},      {NULL,0},{b->at,8*n},    {NULL,0},{b->ct,8*n},
         {NULL,0},{b->ino,8*n},    {NULL,0},{b->pino,8*n},  {NULL,0},{b->dev,8*n},
-        {NULL,0},{b->mode,4*n},   {NULL,0},{b->uid,4*n},   {NULL,0},{b->gid,4*n},
-        {NULL,0},{b->nlink,4*n},  {NULL,0},{b->depth,4*n}, {NULL,0},{b->isdir,n},
+        {NULL,0},[BSTAT_B_MODE]={b->mode,4*n},     {NULL,0},[BSTAT_B_UID]={b->uid,4*n},
+        {NULL,0},[BSTAT_B_GID]={b->gid,4*n},
+        {NULL,0},{b->nlink,4*n},  {NULL,0},{b->depth,4*n}, {NULL,0},[BSTAT_B_ISDIR]={b->isdir,n},
         {NULL,0},{b->dg,8*n},
         {NULL,0},{b->koff ? (const void *)b->koff : (const void *)&zoff, 8*(n+1)},
-        {b->kdat,(int64_t)b->klen}};
+        {b->kdat,(int64_t)b->klen},
+        {NULL,0},{b->err,4*n}};
     uint8_t meta[BSTAT_TMPL_LEN]; memcpy(meta, BSTAT_BATCH_TMPL, BSTAT_TMPL_LEN);
     int64_t pos = 0;
     for (int i = 0; i < BSTAT_N_BUFS; i++) {
@@ -580,7 +659,6 @@ static int64_t tar_hlen2(size_t plen, size_t llen) {
     if (llen > 100) h += 512 + (int64_t)((llen + 1 + 511) & ~511ULL);
     return h;
 }
-static int64_t tar_hlen(size_t plen) { return tar_hlen2(plen, 0); }
 /* emit header(s) for one TYPED member at `o`; returns bytes written (== tar_hlen2).
  * mtype: 0 regular file ('0'), 5 dir ('5'), 2 symlink ('2'), 1 hardlink ('1').
  * `link` = target for sym/hardlinks (NULL/"" otherwise). Bodyless types carry size 0. */
@@ -610,15 +688,9 @@ static int64_t tar_emit_hdr2(uint8_t *o, const char *path, const char *link, int
     }
     return (q - o) + 512;
 }
-/* legacy single-type wrapper (regular file) */
-static int64_t tar_emit_hdr(uint8_t *o, const char *path, uint32_t mode, uint32_t uid,
-                            uint32_t gid, uint64_t size, int64_t mtime_s) {
-    return tar_emit_hdr2(o, path, NULL, 0, mode, uid, gid, size, mtime_s);
-}
-
 /* ------------------------------------------------------------------ jobs */
-enum { J_COPY_BLOCK, J_PACK_FILES, J_SCATTER, J_COPY_MEMBERS, J_MANIFEST };
-typedef struct { int64_t in_off, size; uint32_t mode; char *path; uint8_t *hdr; uint32_t hlen;
+enum { J_COPY_BLOCK, J_PACK_FILES, J_SCATTER, J_COPY_MEMBERS, J_MANIFEST, J_SET_META };
+typedef struct { int64_t in_off, size; uint32_t mode; char *path;
                  int64_t mtime; uint32_t uid, gid; uint8_t mtype; char *link;
                  int64_t out_off, fsize; } Member;      /* scatter extent piece (fsize: whole-file size) */
 /* mtype: 0 file, 5 dir, 2 symlink, 1 hardlink (dirs+links: bodyless tar entries) */
@@ -630,7 +702,7 @@ typedef struct {
     int tar_compat;                          /* J_PACK_FILES: write hdr+body+pad (valid tar) */
     int64_t coff, clen;                      /* J_SCATTER */
 } Job;
-static void job_free(Job *j) { if (j->memb) { for (uint32_t i = 0; i < j->nmemb; i++) { free(j->memb[i].path); free(j->memb[i].hdr); free(j->memb[i].link); } free(j->memb); } free(j->root); free(j); }
+static void job_free(Job *j) { if (j->memb) { for (uint32_t i = 0; i < j->nmemb; i++) { free(j->memb[i].path); free(j->memb[i].link); } free(j->memb); } free(j->root); free(j); }
 
 typedef struct { Job **q; int cap, head, tail, n, done; pthread_mutex_t mu; pthread_cond_t ne, nf; } JQ;
 static void jq_init(JQ *q, int cap){ q->q=calloc(cap,sizeof(Job*)); q->cap=cap; q->head=q->tail=q->n=q->done=0;
@@ -687,7 +759,7 @@ static void blk_retire(uint64_t id){ pthread_mutex_lock(&g_blk_mu); BBlock *b=bl
 
 /* ------------------------------------------------------------------ workers */
 typedef struct { ZSTD_CCtx *c; ZSTD_DCtx *d; uint8_t *cb; size_t ccap; uint8_t *ob; size_t ocap;
-                 uint8_t *mb; size_t mbcap; uint8_t *ctb; size_t ctcap; uint8_t *sb; size_t sbcap;
+                 uint8_t *mb; size_t mbcap; uint8_t *ctb; size_t ctcap;
                  int64_t files; int err;
                  int id; int64_t jt0; int32_t jjq, jbusy;         /* per-frame cost accounting */
                  int ffd; char fpath[4096];                       /* last source fd, kept open */
@@ -924,12 +996,11 @@ static size_t zstd_stored_frame(uint8_t *dst, const uint8_t *src, size_t len) {
     return (size_t)(q - dst);
 }
 static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint32_t level, uint32_t sink_id,
-                        uint8_t *stat, uint32_t statlen, int allow_raw) {
+                        uint8_t *stat, uint32_t statlen) {
     /* INCOMPRESSIBLE data (model weights, opus/jpeg...) skips the codec: probe a few 128KB
      * windows at level 1; if they won't shrink, emit a STORED frame (Raw_Blocks) — still a
      * valid zstd frame, so readers/`zstd -dc`/tar-compat are untouched while both encode and
-     * decode run at memcpy speed. (allow_raw kept for call-site symmetry; stored frames are
-     * legal everywhere.)
+     * decode run at memcpy speed (stored frames are legal everywhere).
      *
      * The probe is STRATIFIED, not head-only. A big member is its own frame, so one window at
      * offset 0 decided the fate of the whole file — and plenty of incompressible formats open
@@ -938,7 +1009,6 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
      * PROBE_MAX evenly-spaced windows cost ~2MB of level-1 work no matter how big the member
      * is — a few ms against minutes of pointless codec. The reverse error matters too: a
      * compressible body behind an incompressible header would have been stored raw. */
-    (void)allow_raw;
     int inc = 0;
     if (len >= 262144) {
         /* One window per 2 MB, capped at 16. Scaling per 64 MB gave a 16 MB piece exactly ONE
@@ -983,8 +1053,6 @@ static void do_compress(W *w, uint8_t *src, size_t len, uint64_t frame_id, uint3
      * buffer sized for 3 bytes per 128 KiB (heap corruption, found exactly that way). */
     int direct = inc && !sk->is_sock && !g_sink_direct;
     if (!direct && ensure(&w->cb, &w->ccap, ZSTD_compressBound(len) + SINK_ALIGN)) { w->err = -1; return; }
-    /* stored + file sink: write the frame straight out of `src` with writev (no second
-     * copy, no compressBound scratch). Socket sinks still need a contiguous message. */
     int64_t t0 = now_ns();
     size_t cl;
     if (inc) {
@@ -1068,7 +1136,7 @@ static void *worker(void *arg) {
         __atomic_fetch_add(&g_busy, 1, __ATOMIC_RELAXED);
         if (j->kind == J_COPY_BLOCK) {
             BBlock *b = blk_get(j->block_id);               /* ref held since enqueue -> present */
-            if (b) do_compress(w, b->buf, b->len, j->frame_id, j->level, j->sink_id, NULL, 0, 0);
+            if (b) do_compress(w, b->buf, b->len, j->frame_id, j->level, j->sink_id, NULL, 0);
             blk_release(j->block_id);                        /* release read-ref (free if retired) */
         } else if (j->kind == J_PACK_FILES) {
             int64_t est = 0;
@@ -1189,8 +1257,7 @@ static void *worker(void *arg) {
             }
             if (!frame_lost) {
                 size_t slen; uint8_t *sblob = bc_arrow(&sb, &slen);
-                do_compress(w, w->ob, blen, j->frame_id, j->level, j->sink_id, sblob, (uint32_t)slen,
-                            !j->tar_compat);
+                do_compress(w, w->ob, blen, j->frame_id, j->level, j->sink_id, sblob, (uint32_t)slen);
                 free(sblob);
                 emit_bstat(0, (int64_t)j->frame_id, &sb); /* digests -> planner (footer) */
             }
@@ -1219,13 +1286,53 @@ static void *worker(void *arg) {
             }
             emit_bstat((uint32_t)j->frame_id, 0, &sb);    /* block 0 -> ALWAYS emitted (even empty) */
             bc_free(&sb);
+        } else if (j->kind == J_SET_META) {
+            /* batched node creation + metadata under DEST (op 17 META) — one chunk per job
+             * so the pool parallelizes what were serial per-row WEKA round-trips in Python
+             * (measured: ~530k dirs cost ~10 min single-threaded; the 4-node unpack's wall
+             * was rank 0's serial makedirs/symlink loop). Type semantics in the op table.
+             * Meta order everywhere: chown BEFORE chmod (setgid strip), utimensat LAST. */
+            char full[8192], tgt[8192]; memcpy(full, g_dest, g_destlen); memcpy(tgt, g_dest, g_destlen);
+            int64_t tm = now_ns();
+            for (uint32_t i = 0; i < j->nmemb; i++) {
+                Member *m = &j->memb[i]; size_t pl = strlen(m->path);
+                if (g_destlen + pl + 1 >= sizeof full) { emit_err(m->path, -ENAMETOOLONG); continue; }
+                memcpy(full + g_destlen, m->path, pl); full[g_destlen + pl] = 0;
+                if (m->mtype == 5) {                     /* dir: create only; meta comes LAST (type 0) */
+                    if (mkdir(full, 0777) && errno == ENOENT) { mkparents(full); mkdir(full, 0777); }
+                    if (access(full, F_OK)) emit_err(full, -errno);
+                } else if (m->mtype == 2) {              /* symlink: replace; own meta is safe NOW */
+                    (void)!unlink(full);
+                    if (symlink(m->link, full) && errno == ENOENT) {
+                        mkparents(full);
+                        if (symlink(m->link, full)) { emit_err(full, -errno); continue; }
+                    }
+                    apply_meta_path(full, 0, m->uid, m->gid, m->mtime,
+                                    ((m->uid || m->gid) ? MF_OWN : 0)
+                                    | (m->mtime ? MF_TIME : 0) | MF_NOFOLLOW);
+                } else if (m->mtype == 1) {              /* hardlink: target is DEST-relative */
+                    size_t ll = m->link ? strlen(m->link) : 0;
+                    if (g_destlen + ll + 1 >= sizeof tgt) { emit_err(m->path, -ENAMETOOLONG); continue; }
+                    memcpy(tgt + g_destlen, m->link, ll); tgt[g_destlen + ll] = 0;
+                    (void)!unlink(full);
+                    if (link(tgt, full) && errno == ENOENT) {
+                        mkparents(full);
+                        if (link(tgt, full)) emit_err(full, -errno);
+                    }
+                } else {                                 /* 0: meta-only, tolerant (dir epilogue) */
+                    apply_meta_path(full, m->mode, m->uid, m->gid, m->mtime,
+                                    ((m->uid || m->gid) ? MF_OWN : 0) | MF_MODE
+                                    | (m->mtime ? MF_TIME : 0));
+                }
+            }
+            ST(ns_meta, now_ns() - tm); ST(n_meta, (int64_t)j->nmemb);
         } else if (j->kind == J_COPY_MEMBERS) {
             /* assemble a frame from a SUBSET of a held block's members — IDENTICAL to
              * J_PACK_FILES except the body source is the block, not open()ed files: same
-             * planner-size layout truth, same C-synthesized tar headers (tar_emit_hdr),
+             * planner-size layout truth, same C-synthesized tar headers (tar_emit_hdr2),
              * same zero-fill + emit_err discipline on a bad source range. */
             BBlock *b = blk_get(j->block_id);               /* ref held since enqueue -> present */
-            if (!b) { w->err = -1; blk_release(j->block_id); __atomic_fetch_sub(&g_busy,1,__ATOMIC_RELAXED); job_free(j); continue; }
+            if (!b) { w->err = -1; blk_release(j->block_id); goto job_done; }
             int64_t est = 0;
             for (uint32_t i = 0; i < j->nmemb; i++) {
                 Member *m = &j->memb[i];
@@ -1254,8 +1361,7 @@ static void *worker(void *arg) {
                            sz, m->mode, m->mtime, m->uid, m->gid, m->mtype == 5);
             }
             size_t slen; uint8_t *sblob = bc_arrow(&sb, &slen); bc_free(&sb);
-            do_compress(w, w->ob, blen, j->frame_id, j->level, j->sink_id, sblob, (uint32_t)slen,
-                        !j->tar_compat);
+            do_compress(w, w->ob, blen, j->frame_id, j->level, j->sink_id, sblob, (uint32_t)slen);
             free(sblob);
             pack_release(resv);
             wshrink(&w->ob, &w->ocap); wshrink(&w->cb, &w->ccap);
@@ -1309,25 +1415,17 @@ static void *worker(void *arg) {
                     }
                     ST(ns_write, now_ns() - tw2); ST(wr_bytes, m->size - rem);
                     if (bad) { w->err = -EIO; emit_err(full, -EIO); }
-                    int64_t tm3 = now_ns(); int didm = 0;
-                    if ((g_scatter_meta & 2) && (m->uid || m->gid)) {
-                        (void)!fchown(fd, m->uid, m->gid); didm = 1;
-                        if (m->mode & 06000) (void)!fchmod(fd, m->mode & 07777);
-                    }
-                    if (g_scatter_meta & 1) {
-                        struct timespec ts[2]; ts[0].tv_nsec = UTIME_OMIT;
-                        ts[1].tv_sec = m->mtime / 1000000000LL; ts[1].tv_nsec = m->mtime % 1000000000LL;
-                        futimens(fd, ts); didm = 1;
-                    }
-                    if (didm) { ST(ns_meta, now_ns() - tm3); ST(n_meta, 1); }
+                    apply_meta_fd(fd, m->mode, m->uid, m->gid, m->mtime,
+                                  (((g_scatter_meta & 2) && (m->uid || m->gid)) ? MF_OWN : 0)
+                                  | ((g_scatter_meta & 1) ? MF_TIME : 0) | MF_ACCT);
                     close(fd); w->files++;
                 }
-                __atomic_fetch_sub(&g_busy,1,__ATOMIC_RELAXED); job_free(j); continue;
+                goto job_done;
             }
             int64_t tr0 = now_ns();
             if (ensure(&w->cb, &w->ccap, (size_t)j->clen) || pread(nockfd, w->cb, j->clen, j->coff) != j->clen) {
                 snprintf(fb, sizeof fb, "frame@%lld+%lld", (long long)j->coff, (long long)j->clen);
-                w->err = -EIO; emit_err(fb, -EIO); __atomic_fetch_sub(&g_busy,1,__ATOMIC_RELAXED); job_free(j); continue; }
+                w->err = -EIO; emit_err(fb, -EIO); goto job_done; }
             ST(ns_read, now_ns() - tr0); ST(rd_bytes, j->clen);
             size_t got; uint8_t *body;
             uint32_t fm = j->clen >= 4 ? (uint32_t)w->cb[0] | ((uint32_t)w->cb[1] << 8) |
@@ -1338,13 +1436,13 @@ static void *worker(void *arg) {
                 unsigned long long dsz2 = ZSTD_getFrameContentSize(w->cb, (size_t)j->clen);
                 size_t need2 = (dsz2 != ZSTD_CONTENTSIZE_UNKNOWN && dsz2 != ZSTD_CONTENTSIZE_ERROR)
                                ? (size_t)dsz2 : (size_t)j->clen * 20;
-                if (ensure(&w->ob, &w->ocap, need2 ? need2 : 1)) { w->err = -ENOMEM; __atomic_fetch_sub(&g_busy,1,__ATOMIC_RELAXED); job_free(j); continue; }
+                if (ensure(&w->ob, &w->ocap, need2 ? need2 : 1)) { w->err = -ENOMEM; goto job_done; }
                 int64_t td = now_ns();
                 got = ZSTD_decompressDCtx(w->d, w->ob, w->ocap, w->cb, (size_t)j->clen);
                 ST(ns_dcomp, now_ns() - td); ST(dcomp_out, ZSTD_isError(got) ? 0 : got);
                 if (ZSTD_isError(got)) {
                     snprintf(fb, sizeof fb, "frame@%lld+%lld", (long long)j->coff, (long long)j->clen);
-                    w->err = -EIO; emit_err(fb, -EIO); __atomic_fetch_sub(&g_busy,1,__ATOMIC_RELAXED); job_free(j); continue; }
+                    w->err = -EIO; emit_err(fb, -EIO); goto job_done; }
                 body = w->ob;
             }
             memcpy(full, g_dest, g_destlen);
@@ -1366,20 +1464,13 @@ static void *worker(void *arg) {
                         w->err = -errno; emit_err(full, -errno); }
                     ST(ns_write, now_ns() - tw2); ST(wr_bytes, m->size);
                 } else { w->err = -EIO; emit_err(full, -EIO); }   /* frame shorter than the plan says */
-                int64_t tm = now_ns(); int didmeta = 0;
-                if ((g_scatter_meta & 2) && (m->uid || m->gid)) {
-                    (void)!fchown(fd, m->uid, m->gid); didmeta = 1;   /* best-effort */
-                    if (m->mode & 06000) (void)!fchmod(fd, m->mode & 07777);   /* chown STRIPS setuid/sgid */
-                }
-                if (g_scatter_meta & 1) {                                 /* restore mtime (leave atime) */
-                    struct timespec ts[2]; ts[0].tv_nsec = UTIME_OMIT;
-                    ts[1].tv_sec = m->mtime / 1000000000LL; ts[1].tv_nsec = m->mtime % 1000000000LL;
-                    futimens(fd, ts); didmeta = 1;
-                }
-                if (didmeta) { ST(ns_meta, now_ns() - tm); ST(n_meta, 1); }
+                apply_meta_fd(fd, m->mode, m->uid, m->gid, m->mtime,
+                              (((g_scatter_meta & 2) && (m->uid || m->gid)) ? MF_OWN : 0)
+                              | ((g_scatter_meta & 1) ? MF_TIME : 0) | MF_ACCT);
                 close(fd); w->files++;
             }
         }
+job_done:                                            /* single exit: every early-out jumps here */
         __atomic_fetch_sub(&g_busy, 1, __ATOMIC_RELAXED);
         job_free(j);
     }
@@ -1422,27 +1513,20 @@ static void rx_apply_meta(void) {
             if (link(tgt, full) && errno == ENOENT) { mkparents(full); if (link(tgt, full)) emit_err(full, -errno); }
         } else {                                         /* symlink: target verbatim */
             if (symlink(m->link, full) && errno == ENOENT) { mkparents(full); if (symlink(m->link, full)) emit_err(full, -errno); }
-            if (g_scatter_meta & 2) (void)!lchown(full, (uid_t)m->uid, (gid_t)m->gid);
-            if (g_scatter_meta & 1) {
-                struct timespec ts[2]; ts[0].tv_nsec = UTIME_OMIT;
-                ts[1].tv_sec = m->mt / 1000000000LL; ts[1].tv_nsec = m->mt % 1000000000LL;
-                (void)!utimensat(AT_FDCWD, full, ts, AT_SYMLINK_NOFOLLOW);
-            }
+            apply_meta_path(full, 0, m->uid, m->gid, m->mt,
+                            ((g_scatter_meta & 2) ? MF_OWN : 0)
+                            | ((g_scatter_meta & 1) ? MF_TIME : 0) | MF_NOFOLLOW);
         }
     }
     for (RxM *m = g_rx_dirs; m; m = m->next) {
         size_t pl = strlen(m->path);
         if (g_destlen + pl + 1 >= sizeof full) continue;
         memcpy(full, g_dest, g_destlen); memcpy(full + g_destlen, m->path, pl); full[g_destlen + pl] = 0;
-        if (g_scatter_meta & 2) {
-            (void)!chown(full, (uid_t)m->uid, (gid_t)m->gid);
-        }
-        if (m->mode) (void)!chmod(full, m->mode & 07777);   /* after chown (setgid strip) */
-        if (g_scatter_meta & 1) {
-            struct timespec ts[2]; ts[0].tv_nsec = UTIME_OMIT;
-            ts[1].tv_sec = m->mt / 1000000000LL; ts[1].tv_nsec = m->mt % 1000000000LL;
-            (void)!utimensat(AT_FDCWD, full, ts, 0);
-        }
+        /* NOTE: the dir chmod is NOT g_scatter_meta-gated (only mode!=0), unlike the file
+         * paths — dirs were mkdir'd 0777 and must get their real mode regardless. */
+        apply_meta_path(full, m->mode, m->uid, m->gid, m->mt,
+                        ((g_scatter_meta & 2) ? MF_OWN : 0) | MF_MODE
+                        | ((g_scatter_meta & 1) ? MF_TIME : 0));
     }
 }
 
@@ -1480,12 +1564,12 @@ static void *rx_reader(void *a) {
             const uint8_t *bp[BSTAT_N_BUFS];
             const uint8_t *scur = stat; int64_t nm;
             while ((nm = arrow_next(&scur, bp, BSTAT_N_BUFS)) > 0) {
-            const int64_t *po = (const int64_t *)bp[1]; const char *pd = (const char *)bp[2];
-            const int64_t *lo = (const int64_t *)bp[4]; const char *ld = (const char *)bp[5];
-            const int64_t *io_ = (const int64_t *)bp[7], *sz_ = (const int64_t *)bp[9];
-            const int64_t *mt_ = (const int64_t *)bp[13];
-            const int32_t *md_ = (const int32_t *)bp[25], *ui_ = (const int32_t *)bp[27], *gi_ = (const int32_t *)bp[29];
-            const uint8_t *isd = bp[35];
+            const int64_t *po = (const int64_t *)bp[BSTAT_B_PATH_OFF]; const char *pd = (const char *)bp[BSTAT_B_PATH_DAT];
+            const int64_t *lo = (const int64_t *)bp[BSTAT_B_LINK_OFF]; const char *ld = (const char *)bp[BSTAT_B_LINK_DAT];
+            const int64_t *io_ = (const int64_t *)bp[BSTAT_B_IN_OFF], *sz_ = (const int64_t *)bp[BSTAT_B_SIZE];
+            const int64_t *mt_ = (const int64_t *)bp[BSTAT_B_MTIME];
+            const int32_t *md_ = (const int32_t *)bp[BSTAT_B_MODE], *ui_ = (const int32_t *)bp[BSTAT_B_UID], *gi_ = (const int32_t *)bp[BSTAT_B_GID];
+            const uint8_t *isd = bp[BSTAT_B_ISDIR];
             for (int64_t i = 0; i < nm; i++) {
                 size_t pl = (size_t)(po[i+1] - po[i]), ll = (size_t)(lo[i+1] - lo[i]);
                 if (g_destlen + pl + 1 >= sizeof full) { emit_err("rx path too long", -ENAMETOOLONG); continue; }
@@ -1506,15 +1590,9 @@ static void *rx_reader(void *a) {
                 if (wfd < 0) { emit_err(full, -errno); continue; }
                 if (io_[i] + sz_[i] <= (int64_t)got) { if (write_all(wfd, ob + io_[i], (size_t)sz_[i])) emit_err(full, -errno); }
                 else emit_err(full, -EIO);
-                if ((g_scatter_meta & 2) && (ui_[i] || gi_[i])) {
-                    (void)!fchown(wfd, (uid_t)ui_[i], (gid_t)gi_[i]);
-                    if (md & 06000) (void)!fchmod(wfd, md & 07777);   /* chown strips setuid/sgid */
-                }
-                if (g_scatter_meta & 1) {
-                    struct timespec ts[2]; ts[0].tv_nsec = UTIME_OMIT;
-                    ts[1].tv_sec = mt_[i] / 1000000000LL; ts[1].tv_nsec = mt_[i] % 1000000000LL;
-                    (void)!futimens(wfd, ts);
-                }
+                apply_meta_fd(wfd, md, (uint32_t)ui_[i], (uint32_t)gi_[i], mt_[i],
+                              (((g_scatter_meta & 2) && (ui_[i] || gi_[i])) ? MF_OWN : 0)
+                              | ((g_scatter_meta & 1) ? MF_TIME : 0));
                 close(wfd);
             }
             }
@@ -1581,15 +1659,39 @@ static void imap_free(IMap *m){ for (int i=0;i<m->n;i++) free(m->v[i].path); fre
  * parent_ino/depth) — the inode graph ducl aggregates over; names-only emits files only.
  * One EOF per sid, emitted when the scan's last dir drains. */
 typedef struct IgnorePat { char *pat; uint8_t flags; } IgnorePat;  /* 1=anchored 2=dir_only 4=negate */
+/* DIR-AGGREGATE MODE (SCAN_DIRS). Consumers that need per-directory aggregates -- ducl's
+ * child_count/dir_total_size, and any rsync-style differ that compares a directory as a unit
+ * -- cannot get them from a plain SCAN_FS stream without materializing the whole table: a
+ * directory's row is emitted by its PARENT's walk, so its aggregates are still unknown when
+ * it goes out, and `group_by(parent_ino)` over 162M rows is ~200 GB of RAM.
+ *
+ * The fix is to move WHERE a directory's row is emitted. The walker that opens D already
+ * knows D's complete child list at the moment it finishes readdir -- that is exactly when
+ * pwalk2 accumulates the same numbers -- so in this mode D's row is emitted by D's OWN job,
+ * immediately ahead of D's children, with the aggregates already filled in:
+ *      in_off <- child_count        digest <- dir_total_size
+ * Both fields are dead weight on a directory row otherwise (in_off is 0, digest -1), so the
+ * STAT wire format is unchanged and the pack path, which never sets this mode, is untouched.
+ *
+ * Two invariants this buys, and the reason the mode exists at all:
+ *   - every dir row carries its own aggregates, so a consumer streams and never accumulates;
+ *   - a batch never splits a directory (the 20000-row flush is checked BETWEEN directories),
+ *     so each batch is a whole number of complete [dir row][its children] chunks -- the unit
+ *     a differ wants to hash and compare.
+ * Directories that fail to open still get their row from the parent (child_count 0), so the
+ * row set matches SCAN_FS exactly; only the order and the two fields differ. */
 typedef struct ScanCtx {
-    uint32_t sid; int names_only;
+    uint32_t sid; int names_only, diragg;
+    int rootfd;                                          /* reopen anchor for the EMFILE path */
     IgnorePat *ign; int nign;                            /* .quiverignore: pruned IN THE WALK */
     pthread_mutex_t mu;                                  /* guards pending, im, and the accumulator */
     long pending;                                        /* dirs enqueued for this scan, not yet finished */
     IMap im;                                             /* hardlink map (full-stat) */
     BC bc;                                               /* columnar accumulator, flushed at 20000 rows */
 } ScanCtx;
-typedef struct DirJob { ScanCtx *ctx; int dfd; char *rel; uint64_t ino; int32_t depth; struct DirJob *next; } DirJob;
+/* pino/st are carried only for SCAN_DIRS, which emits this directory's own row from here */
+typedef struct DirJob { ScanCtx *ctx; int dfd; char *rel; uint64_t ino, pino; int32_t depth;
+                        struct stat st; struct DirJob *next; } DirJob;
 /* PER-WALKER ACCUMULATOR. Every walker used to append its rows into the ONE ScanCtx.bc while
  * holding c->mu, so all 233k row-appends of a scan serialized on a single mutex: 64 threads
  * delivered 1.26 busy cores (117 sleeping, 10.6 in D) and the scan queue sat 2,934 dirs DEEP
@@ -1624,10 +1726,18 @@ static int wscan_ring(WScan *ws){
     return ws->ring_ok > 0;
 }
 static WScan *g_wscan; static int g_nwscan;
+/* WHICH WALKER EMITTED THIS BATCH. A directory's rows are contiguous within one
+ * walker but walkers' batches interleave in the stream, so a consumer that wants to
+ * reassemble a split directory chunk has to demultiplex first. Encoded negative
+ * (-idx-2) so it never collides with a pack block id and never trips emit_bstat's
+ * block>=0 rule; -1 keeps meaning "not attributed". Decode: idx = -block - 2. */
+#define WS_BLOCK(ws) ((int64_t)(-((ws) - g_wscan) - 2))
+/* one directory's rows may exceed this only by being split; see scan_walker */
+static uint32_t g_scan_chunk_max = 262144;
 static pthread_mutex_t g_wsflush = PTHREAD_MUTEX_INITIALIZER;
 
 static void wscan_flush(WScan *ws) {
-    if (ws->owner && ws->bc.n) emit_bstat(ws->owner->sid, -1, &ws->bc);
+    if (ws->owner && ws->bc.n) emit_bstat(ws->owner->sid, WS_BLOCK(ws), &ws->bc);
 }
 /* Flush every walker's rows for `c`. Called only by the thread that saw pending hit 0, so no
  * walker is mid-append for this scan: each appends BEFORE decrementing pending under c->mu,
@@ -1734,7 +1844,7 @@ static int ign_match(ScanCtx *c, const char *rel, const char *name, int isdir) {
 
 /* one collected entry (row deferred until under c->mu; the fstatat/readlink RPC that
  * produced it ran OUTSIDE the lock). Dirs carry isdir=1 (emitted, full-stat mode). */
-typedef struct { char *rel; struct stat st; int islnk, hard, isdir; char *tgt; } FEnt;
+typedef struct { char *rel; struct stat st; int islnk, hard, isdir, err; char *tgt; } FEnt;
 
 static void *scan_walker(void *arg) {
     WScan *ws = arg;
@@ -1745,7 +1855,28 @@ static void *scan_walker(void *arg) {
             pthread_mutex_lock(&g_wsflush); wscan_flush(ws); ws->owner = c;
             pthread_mutex_unlock(&g_wsflush);
         }
+        int djerr = 0;                                   /* why THIS dir has no children */
+        /* DEFERRED OPEN. dfd < 0 means this dir was queued under fd pressure (see EMFILE
+         * above): open it now, from the scan root, since by the time it pops the frontier
+         * ahead of it has drained and descriptors are free again. Failing here is a real
+         * failure, so it is reported rather than dropped. */
+        if (dj->dfd < 0) {
+            dj->dfd = openat(c->rootfd, dj->rel, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+            if (dj->dfd < 0 && (errno == EMFILE || errno == ENFILE)) {
+                /* STILL out of descriptors. Dropping it here is what left the full mount
+                 * 18.4M rows short even after the deferred-open path went in: the retry
+                 * inherits the same exhaustion that caused the deferral. Put it BACK on the
+                 * queue -- pending already counts it, so it must not be decremented -- and
+                 * let a walker that has since closed a directory pick it up. The sleep keeps
+                 * a saturated queue from spinning on openat. */
+                usleep(1000);
+                dq_push(&g_dq, dj);
+                continue;
+            }
+            if (dj->dfd < 0) { djerr = -errno; emit_err(dj->rel, djerr); }
+        }
         size_t pl = strlen(dj->rel); int32_t cdepth = dj->depth + 1;   /* children's depth */
+        long dcnt=0; int64_t dtot=0;                         /* SCAN_DIRS: this dir's aggregates */
         FEnt *fe=NULL; long nfe=0, cfe=0;                    /* rows to emit */
         struct { char *cr; struct stat st; int fd; } *pd=NULL; long npd=0, cpd=0;  /* child dirs */
         DirJob *kh=NULL, *kt=NULL; long nkids=0;             /* child dirs to enqueue */
@@ -1774,12 +1905,18 @@ static void *scan_walker(void *arg) {
                     if (!isdir && !islnk && !S_ISREG(st.st_mode)) { free(cr); continue; }  /* skip specials */
                 }
                 if (c->nign && ign_match(c, cr, nm, isdir)) { free(cr); continue; }   /* PRUNED */
+                /* counted AFTER pruning/skips, so the aggregates cover exactly the rows that
+                 * reach the consumer -- which is what a group_by over the output would give */
+                dcnt++; dtot += (int64_t)st.st_size;
                 if (isdir) {                                 /* defer the open; batched below */
                     if (npd==cpd){ cpd=cpd?cpd*2:16; pd=realloc(pd,cpd*sizeof(*pd)); }
                     pd[npd].cr=cr; pd[npd].st=st; pd[npd].fd=-1; npd++;
-                    {   /* the dir itself is a row in BOTH modes: full-stat feeds ducl's inode
+                    if (!c->diragg) {
+                        /* the dir itself is a row in BOTH modes: full-stat feeds ducl's inode
                          * graph; names-only feeds rm the COMPLETE dir set (EMPTY dirs were
-                         * invisible before -> left behind + silent parent-rmdir failures) */
+                         * invisible before -> left behind + silent parent-rmdir failures).
+                         * SCAN_DIRS instead emits it from the child's own job (see below), so
+                         * it can carry aggregates -- except for dirs that fail to open. */
                         if (nfe==cfe){ cfe=cfe?cfe*2:32; fe=realloc(fe,cfe*sizeof(FEnt)); }
                         FEnt *f=&fe[nfe++]; memset(f,0,sizeof *f); f->rel=strdup(cr); f->st=st; f->isdir=1;
                     }
@@ -1819,24 +1956,67 @@ static void *scan_walker(void *arg) {
                     for (long i=0;i<npd;i++){
                         const char *bn = strrchr(pd[i].cr,'/'); bn = bn?bn+1:pd[i].cr;
                         pd[i].fd = openat(dfd, bn, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+                        /* normalize to the ring's convention (-errno), so the failure
+                         * classification below reads one encoding, not two */
+                        if (pd[i].fd < 0) pd[i].fd = -errno;
                     }
                 }
                 if (g_scan_prof) __atomic_fetch_add(&sp_open, now_ns()-_o0, __ATOMIC_RELAXED);
                 for (long i=0;i<npd;i++){
-                    if (pd[i].fd < 0) { free(pd[i].cr); continue; }
+                    /* FD EXHAUSTION IS NOT A PERMISSION ERROR. Every queued DirJob holds its
+                     * directory OPEN, so on a tree with millions of directories the frontier
+                     * runs into RLIMIT_NOFILE (131072 here) and openat starts returning
+                     * EMFILE. That used to be indistinguishable from EACCES: the child was
+                     * dropped, its whole subtree with it, and the scan still exited 0 --
+                     * /mnt/weka came back 94,989,921 rows against pwalk2's 162,516,025, a
+                     * silent 42% loss. Queue it WITHOUT an fd instead; the walker reopens it
+                     * from the scan root when it pops. */
+                    if (pd[i].fd == -EMFILE || pd[i].fd == -ENFILE) {
+                        DirJob *k2 = malloc(sizeof *k2); k2->ctx=c; k2->dfd=-1; k2->next=NULL;
+                        k2->ino=(uint64_t)pd[i].st.st_ino; k2->depth=cdepth; k2->rel=pd[i].cr;
+                        k2->pino=dj->ino; k2->st=pd[i].st;
+                        if (kt) kt->next=k2; else kh=k2; kt=k2; nkids++;
+                        continue;
+                    }
+                    if (pd[i].fd < 0) {
+                        /* a real failure (EACCES on a colleague's home, ENOENT on a race):
+                         * REPORT it -- the planner counts scan errors, so a subtree that goes
+                         * missing now says so instead of just shrinking the row count */
+                        emit_err(pd[i].cr, pd[i].fd);
+                        /* UNREADABLE DIR. It will never run a job of its own, so in SCAN_DIRS
+                         * its row has to come from here or it vanishes from the output -- on a
+                         * shared mount that is every colleague's home directory. The row
+                         * carries the errno so the failure travels WITH the tree. */
+                        if (c->diragg) {
+                            if (nfe==cfe){ cfe=cfe?cfe*2:32; fe=realloc(fe,cfe*sizeof(FEnt)); }
+                            FEnt *f=&fe[nfe++]; memset(f,0,sizeof *f);
+                            f->rel=pd[i].cr; f->st=pd[i].st; f->isdir=1; f->err=pd[i].fd;
+                        } else free(pd[i].cr);
+                        continue;
+                    }
                     DirJob *k2 = malloc(sizeof *k2); k2->ctx=c; k2->dfd=pd[i].fd; k2->next=NULL;
                     k2->ino=(uint64_t)pd[i].st.st_ino; k2->depth=cdepth; k2->rel=pd[i].cr;
+                    k2->pino=dj->ino; k2->st=pd[i].st;       /* SCAN_DIRS: emits its own row */
                     if (kt) kt->next=k2; else kh=k2; kt=k2; nkids++;
                 }
             }
             free(pd); pd=NULL;
             closedir(dp);
-        } else { close(dj->dfd); for (long i=0;i<npd;i++) free(pd[i].cr); free(pd); pd=NULL; }
+        } else { if (!djerr) djerr = dj->dfd < 0 ? djerr : -errno;
+                 close(dj->dfd); for (long i=0;i<npd;i++) free(pd[i].cr); free(pd); pd=NULL; }
 
         /* LOCK-FREE row append into this walker's own buffer. c->mu is now taken only for the
          * hardlink map (which is genuinely shared, and only consulted for nlink>1 entries) and
          * for the pending counter. */
         int64_t _bc0 = g_scan_prof ? now_ns() : 0;
+        if (c->diragg) {
+            /* THIS directory's row, ahead of its children and carrying the aggregates the
+             * readdir above just finished counting. in_off/digest are otherwise unused on a
+             * dir row, so this needs no wire change. */
+            bc_add_fs(&ws->bc, dj->rel, NULL, dcnt, &dj->st, dj->pino, dj->depth, 1);
+            ws->bc.dg[ws->bc.n - 1] = dtot;      /* `dg` is the wire's `digest` column */
+            ws->bc.err[ws->bc.n - 1] = djerr;    /* 0, or why its children are missing */
+        }
         for (long i=0;i<nfe;i++) { FEnt *f=&fe[i];
             if (no)
                 bc_add_raw(&ws->bc, f->rel, NULL, 0, 0, 0, 0, 0, 0, f->isdir);
@@ -1853,9 +2033,24 @@ static void *scan_walker(void *arg) {
                 else bc_add_fs(&ws->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0);
             }
             else bc_add_fs(&ws->bc, f->rel, NULL, 0, &f->st, dj->ino, cdepth, 0);
-            if (ws->bc.n >= 20000) SPT(sp_emit, emit_bstat(c->sid, -1, &ws->bc));
+            if (f->err && ws->bc.n) { ws->bc.err[ws->bc.n - 1] = f->err;
+                /* an unreadable dir still reports 0 children, not bc_add_fs's digest
+                 * sentinel: -1 would reach ducl as a dir_total_size of -1 */
+                if (c->diragg && f->isdir) ws->bc.dg[ws->bc.n - 1] = 0; }
+            /* SCAN_DIRS flushes BETWEEN directories (checked after the loop) so a batch is a
+             * whole number of complete chunks -- but NOT unconditionally. /mnt/weka's largest
+             * directory holds 3,324,245 entries and 16 exceed 1M; buffering one whole would
+             * put ~0.5 GB in a single walker, times however many walkers hit a big directory
+             * at once. So a directory this large IS split, and stays reassemblable because
+             * its row carries child_count and precedes its children: a consumer reads N rows
+             * after a dir row to get its chunk. That only works if it can tell the walkers
+             * apart (their batches interleave in the stream), which is what the block field
+             * carries -- see emit_bstat's caller below. */
+            if (ws->bc.n >= g_scan_chunk_max) SPT(sp_emit, emit_bstat(c->sid, WS_BLOCK(ws), &ws->bc));
+            else if (!c->diragg && ws->bc.n >= 20000) SPT(sp_emit, emit_bstat(c->sid, -1, &ws->bc));
             free(f->rel); free(f->tgt);
         }
+        if (c->diragg && ws->bc.n >= 20000) SPT(sp_emit, emit_bstat(c->sid, WS_BLOCK(ws), &ws->bc));
         if (g_scan_prof) { __atomic_fetch_add(&sp_bc, now_ns() - _bc0, __ATOMIC_RELAXED);
                            __atomic_fetch_add(&sp_dirs, 1, __ATOMIC_RELAXED); }
         /* PENDING IS RAISED BEFORE THE KIDS ARE VISIBLE. Pushing first and counting after
@@ -1884,24 +2079,31 @@ static void *scan_walker(void *arg) {
         }
 
         free(fe); free(dj->rel); free(dj);
-        if (left==0) { imap_free(&c->im); bc_free(&c->bc);
+        if (left==0) { imap_free(&c->im); bc_free(&c->bc); if (c->rootfd >= 0) close(c->rootfd);
             for (int gi2 = 0; gi2 < c->nign; gi2++) free(c->ign[gi2].pat);
             free(c->ign); pthread_mutex_destroy(&c->mu); free(c); }
     }
     return NULL;
 }
 /* seed a scan: open root, make a ScanCtx + its first DirJob (pending=1) */
-static void scan_start(uint32_t sid, const char *root, int names_only, IgnorePat *ign, int nign) {
+static void scan_start(uint32_t sid, const char *root, int names_only, int diragg,
+                       IgnorePat *ign, int nign) {
     int rfd = open(root, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     if (rfd < 0) { for (int i = 0; i < nign; i++) free(ign[i].pat); free(ign);
         emit_eof(sid); return; }                            /* unreadable root: empty scan */
-    struct stat rst; uint64_t rino = fstat(rfd,&rst)==0 ? (uint64_t)rst.st_ino : 0;
-    ScanCtx *c = calloc(1, sizeof *c); c->sid=sid; c->names_only=names_only; c->pending=1;
+    struct stat rst; memset(&rst, 0, sizeof rst);           /* SCAN_DIRS ships this as the root row */
+    uint64_t rino = fstat(rfd,&rst)==0 ? (uint64_t)rst.st_ino : 0;
+    ScanCtx *c = calloc(1, sizeof *c); c->sid=sid; c->names_only=names_only; c->diragg=diragg;
+    c->pending=1; c->rootfd = dup(rfd);      /* held for the scan: the deferred-open anchor */
     c->ign = ign; c->nign = nign;
     pthread_mutex_init(&c->mu, 0);
     if (g_scan_prof) __atomic_store_n(&sp_wall, now_ns(), __ATOMIC_RELAXED);
     DirJob *j = malloc(sizeof *j); j->ctx=c; j->dfd=rfd; j->rel=strdup(""); j->next=NULL;
     j->ino=rino; j->depth=0;                                /* root's children get depth 1 (qvm/ducl convention) */
+    /* the root's stat is taken HERE, before any readdir touches its atime -- SCAN_DIRS emits
+     * the scan root as a row (SCAN_FS emits only what is under it), so ducl no longer has to
+     * synthesize it, and gets the pre-walk atime for free. parent 0 marks it as the root. */
+    j->pino=0; j->st=rst;
     dq_push(&g_dq, j);
 }
 
@@ -2089,8 +2291,16 @@ int main(int argc, char **argv) {
     { char *q = getenv("BVM_URING_QD"); if (q) { g_uring_qd = atoi(q); if (g_uring_qd < 64) g_uring_qd = 64;
         if (g_uring_qd > 32768) g_uring_qd = 32768; } }
     { char *m = getenv("BVM_SCATTER_META"); if (m) g_scatter_meta = atoi(m); }
+    { char *sc = getenv("BVM_SCAN_CHUNK_MAX"); if (sc) { long v = atol(sc);
+        if (v >= 20000) g_scan_chunk_max = (uint32_t)v; } }
     { char *w = getenv("BVM_URING_WORKERS"); if (w) g_uring_workers = atoi(w); }
     { char *r = getenv("BVM_URING_RINGS"); if (r) g_uring_rings = atoi(r); }
+    /* TAKE THE HARD LIMIT. A scan holds every queued directory open, so the soft RLIMIT_NOFILE
+     * is a ceiling on how wide the walk frontier can get. Raising it to the hard limit does
+     * not make the walk correct on its own (the EMFILE path in scan_walker does that) -- it
+     * just keeps the slow reopen path rare. */
+    { struct rlimit rl; if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); } }
     umask(0);                            /* so open(O_CREAT, mode) sets the exact perms (drops fchmod) */
     gear_init(); (void)sodium_init();    /* BLAKE2b chunk ids need no RNG, but init is cheap hygiene */
     g_start_ns = now_ns();
@@ -2130,16 +2340,16 @@ int main(int argc, char **argv) {
             uint8_t fl = RD(uint8_t, p); ta->stat_only = fl & 1; ta->tar_compat = (fl >> 1) & 1;   /* flags byte */
             char *path = readstr(&p); strcpy(ta->path, path); free(path);
             pthread_t t; pthread_create(&t, 0, tar_thread, ta); track(t); }
-        else if (type == 5 || type == 14) {             /* SCAN_FS / SCAN_NAMES (+ ignore patterns) */
+        else if (type == 5 || type == 14 || type == 16) {  /* SCAN_FS / SCAN_NAMES / SCAN_DIRS (+ ignore patterns) */
             uint32_t sid = RD(uint32_t, p); char *root = readstr(&p);
             uint16_t npat = RD(uint16_t, p);
             IgnorePat *ign = npat ? calloc(npat, sizeof(IgnorePat)) : NULL;
             for (uint16_t k = 0; k < npat; k++) { ign[k].flags = RD(uint8_t, p); ign[k].pat = readstr(&p); }
-            scan_start(sid, root, type == 14, ign, npat); free(root); }
+            scan_start(sid, root, type == 14, type == 16, ign, npat); free(root); }
         else if (type == 15) {                          /* MANIFEST: digest+chunk paths (delta planning) */
             uint32_t sid = RD(uint32_t, p); char *root = readstr(&p);
-            const uint8_t *bp[3]; const uint8_t *cur = p; int64_t n;
-            while ((n = arrow_next(&cur, bp, 3)) > 0) {
+            const uint8_t *bp[3];
+            ARROW_FOREACH(p, bp, 3) {
                 const int64_t *po = (const int64_t *)bp[1]; const char *pd = (const char *)bp[2];
                 Job *j = calloc(1, sizeof(Job)); j->kind = J_MANIFEST; j->frame_id = sid;
                 j->root = strdup(root);
@@ -2147,8 +2357,7 @@ int main(int argc, char **argv) {
                 for (int64_t k = 0; k < n; k++)
                     j->memb[k].path = strndup(pd + po[k], (size_t)(po[k+1] - po[k]));
                 jq_push(&g_jq, j);
-            }
-            if (n < 0) { fprintf(stderr, "bvm: MANIFEST batch shape mismatch\n"); g_fatal = 1; }
+            } ARROW_END("MANIFEST")
             free(root); }
         else if (type == 6) { Job *j = calloc(1, sizeof(Job)); j->kind = J_COPY_BLOCK;
             j->block_id = RD(uint64_t, p); j->frame_id = RD(uint64_t, p); j->level = RD(uint32_t, p); j->sink_id = RD(uint32_t, p);
@@ -2162,8 +2371,8 @@ int main(int argc, char **argv) {
              * bodyless tar entries synthesized in the workers — FULL tar parity, one path. */
             uint32_t level = RD(uint32_t, p), sink_id = RD(uint32_t, p);
             uint8_t tc = RD(uint8_t, p); char *root = readstr(&p);
-            const uint8_t *bp[22]; const uint8_t *cur = p; int64_t n;
-            while ((n = arrow_next(&cur, bp, 22)) > 0) {
+            const uint8_t *bp[22];
+            ARROW_FOREACH(p, bp, 22) {
             const int64_t *fi = (const int64_t *)bp[1], *sz = (const int64_t *)bp[7], *mt = (const int64_t *)bp[9];
             const uint8_t *ty = bp[3];
             const int32_t *md = (const int32_t *)bp[5], *ui = (const int32_t *)bp[11], *gi = (const int32_t *)bp[13];
@@ -2189,8 +2398,7 @@ int main(int argc, char **argv) {
                 jq_push(&g_jq, j);
                 s = e;
             }
-            }
-            if (n < 0) { fprintf(stderr, "bvm: PACK_FILES batch shape mismatch\n"); g_fatal = 1; }
+            } ARROW_END("PACK_FILES")
             free(root); }
         else if (type == 8) {
             /* ONE Arrow batch, MANY frames: nock i32, coff i64, clen i64, in_off i64, size i64,
@@ -2200,8 +2408,8 @@ int main(int argc, char **argv) {
              * Frame identity is a COLUMN — one message covers ~1M members; jobs are cut here
              * at (nock,coff,clen) boundary changes. Kills the planner's per-frame Python
              * (polars pays ~0.4 ms fixed per IPC write; at ~8-member frames that dominated). */
-            const uint8_t *bp[25]; const uint8_t *cur = p; int64_t n;
-            while ((n = arrow_next(&cur, bp, 25)) > 0) {
+            const uint8_t *bp[25];
+            ARROW_FOREACH(p, bp, 25) {
             const int32_t *nk = (const int32_t *)bp[1], *md = (const int32_t *)bp[15],
                           *ui = (const int32_t *)bp[19], *gi = (const int32_t *)bp[21];
             const int64_t *co = (const int64_t *)bp[3], *cl = (const int64_t *)bp[5],
@@ -2223,17 +2431,14 @@ int main(int argc, char **argv) {
                 jq_push(&g_jq, j);                       /* bounded queue = backpressure */
                 s = e;
             }
-            }
-            if (n < 0) { fprintf(stderr, "bvm: SCATTER batch shape mismatch\n"); g_fatal = 1; } }
+            } ARROW_END("SCATTER") }
         else if (type == 9) { uint64_t bid = RD(uint64_t, p); blk_retire(bid); }   /* FREE = retire the owner */
         else if (type == 13) {                          /* UNLINK: io_uring batch unlink/rmdir */
             /* [u8 removedir] + ARROW batch: path large_utf8 -> 3 buffers */
             uint8_t removedir = RD(uint8_t, p);
-            const uint8_t *bp[3]; const uint8_t *cur = p; int64_t bn; 
-            for (;;) {
-            bn = arrow_next(&cur, bp, 3);
-            if (bn <= 0) break;
-            uint32_t nn = (uint32_t)bn;
+            const uint8_t *bp[3];
+            ARROW_FOREACH(p, bp, 3) {
+            uint32_t nn = (uint32_t)n;
             char **paths = malloc((nn ? nn : 1) * sizeof(char *));
             uint8_t *failed = calloc(nn ? nn : 1, 1);
             { const int64_t *po = (const int64_t *)bp[1]; const char *pd = (const char *)bp[2];
@@ -2260,8 +2465,31 @@ int main(int argc, char **argv) {
                 if (failed[k]) { emit_err(paths[k], -(int)failed[k]); reported++; }
             for (uint32_t k = 0; k < nn; k++) free(paths[k]);
             free(paths); free(failed);
-            }
-            if (bn < 0) { fprintf(stderr, "bvm: UNLINK batch shape mismatch\n"); g_fatal = 1; } }
+            } ARROW_END("UNLINK") }
+        else if (type == 17) {                          /* META: batched node create + metadata */
+            /* ARROW batch: path large_utf8, link large_utf8, type u8, mode i32, mtime_ns i64,
+             * uid i32, gid i32 -> 16 buffers. Chunked into worker jobs; no natural boundary,
+             * so a fixed 2048. */
+            const uint8_t *bp[16];
+            ARROW_FOREACH(p, bp, 16) {
+                const int64_t *po = (const int64_t *)bp[1]; const char *pd = (const char *)bp[2];
+                const int64_t *lo = (const int64_t *)bp[4]; const char *ld = (const char *)bp[5];
+                const uint8_t *ty = bp[7];
+                const int32_t *md = (const int32_t *)bp[9];
+                const int64_t *mt = (const int64_t *)bp[11];
+                const int32_t *ui = (const int32_t *)bp[13], *gi = (const int32_t *)bp[15];
+                for (int64_t s = 0; s < n; s += 2048) {
+                    int64_t e = s + 2048 < n ? s + 2048 : n;
+                    Job *j = calloc(1, sizeof(Job)); j->kind = J_SET_META;
+                    j->nmemb = (uint32_t)(e - s); j->memb = calloc(e - s, sizeof(Member));
+                    for (int64_t k = s; k < e; k++) { Member *m = &j->memb[k - s];
+                        m->mtype = ty[k]; m->mode = (uint32_t)md[k]; m->mtime = mt[k];
+                        m->uid = (uint32_t)ui[k]; m->gid = (uint32_t)gi[k];
+                        m->path = strndup(pd + po[k], (size_t)(po[k+1] - po[k]));
+                        m->link = lo[k+1] > lo[k] ? strndup(ld + lo[k], (size_t)(lo[k+1] - lo[k])) : NULL; }
+                    jq_push(&g_jq, j);
+                }
+            } ARROW_END("META") }
         else if (type == 12) { Job *j = calloc(1, sizeof(Job)); j->kind = J_COPY_MEMBERS;
             /* [block][frame][level][sink][tc] + ARROW batch, TYPED (same cols as PACK_FILES
              * with in_off replacing fid): in_off i64, type u8, mode i32, size i64, mtime_ns
@@ -2307,7 +2535,7 @@ int main(int argc, char **argv) {
     int64_t err = 0, files = 0;
     for (int i = 0; i < nw; i++) { pthread_join(th[i], 0); files += ws[i].files; if (ws[i].err && !err) err = ws[i].err;
         if (ws[i].ffd >= 0) close(ws[i].ffd);            /* the kept source fd */
-        ZSTD_freeCCtx(ws[i].c); ZSTD_freeDCtx(ws[i].d); free(ws[i].cb); free(ws[i].ob); free(ws[i].mb); free(ws[i].ctb); free(ws[i].sb); }
+        ZSTD_freeCCtx(ws[i].c); ZSTD_freeDCtx(ws[i].d); free(ws[i].cb); free(ws[i].ob); free(ws[i].mb); free(ws[i].ctb); }
     __atomic_store_n(&g_sampling, 0, __ATOMIC_RELAXED); pthread_join(smp, 0);
     emit_stats();                                    /* final sample: the run's totals */
     if (g_apply) rx_apply_meta();                    /* links + dir metadata: after ALL rx drains */

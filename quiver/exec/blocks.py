@@ -97,7 +97,10 @@ def default_bvm():
 def _member_filter(include=None, exclude=None, min_size=0):
     """The shared PLANNER filter — a predicate over a member dict {path,size,...}, used
     identically by recompress (tar) and pack (fs). `include`/`exclude` are glob lists,
-    `min_size` a byte floor. Returns None if nothing filters (the fast, no-filter path)."""
+    `min_size` a byte floor. Returns None if nothing filters (the fast, no-filter path).
+    NOTE: the row-wise keep(m) path is currently unreachable — keep.expr is always set,
+    and every consumer (pack_fs_c, _plan_block) filters with the expression, falling
+    back to row-wise iteration only when .expr is None."""
     if not include and not exclude and not min_size:
         return None
     import re
@@ -210,8 +213,7 @@ def store_stats(nock, at=None):
     the footer assigns them are reported separately: they are not compression, they are loss."""
     import numpy as np
     df = scan_nock(nock, at=at).filter(pl.col("frame") >= 0)
-    if "shard" not in df.columns:
-        df = df.with_columns(shard=pl.lit(0, pl.Int64))
+    df = _ensure_cols(df, {"shard": (pl.Int64, 0)})
     fr = df.group_by("shard", "coff", "clen").agg(pl.col("size").sum().alias("pay"))
     p = fr["pay"].to_numpy().astype(float); c = fr["clen"].to_numpy().astype(float)
     good = (p > 0) & (c > 64)                            # tiny clen + huge payload = a lost member
@@ -246,8 +248,7 @@ def verify(nock, sample=None):
     # with digest -1, so `verify` skipped it as undigested and the run reported lost=0. Two such
     # frames sat in a 4.9 TB home backup claiming 55.7 TB of payload between them.
     short = []
-    if "shard" not in df.columns:
-        df = df.with_columns(shard=pl.lit(0, pl.Int64))
+    df = _ensure_cols(df, {"shard": (pl.Int64, 0)})
     frames = df.group_by("shard", "coff", "clen", maintain_order=True).agg(
         pl.col("path"), pl.col("in_off"), pl.col("size"), pl.col("digest"))
     idx = list(range(frames.height))
@@ -266,7 +267,15 @@ def verify(nock, sample=None):
                 got = zstd.frame_content_size(f.read(18))
             except Exception:
                 got = -1
-            if got >= 0 and got != want:
+            # `want` is the sum of RAW member sizes -- a LOWER BOUND on the frame's content,
+            # never an equality. A tar_compat frame additionally carries a 512-byte header per
+            # member, 512-byte body padding, and PAX/GNU extended-header records, so `got`
+            # legitimately EXCEEDS `want` (measured: 274/300 frames == the tar-layout sum, the
+            # rest larger by exact multiples of 512; NONE ever smaller). Testing `!=` flagged
+            # every frame of every tar_compat archive -- 471,319 of 471,319 on a round-trip whose
+            # restored tree matched exactly -- burying the real signal. Only SHORT is corruption:
+            # the empty-frame case this pass exists to catch declares 0 against a nonzero want.
+            if got >= 0 and got < want:
                 short.append((r["path"][0] if r["path"] else "?", want, got, int(r["clen"])))
         for k in idx:
             r = frames.row(k, named=True)
@@ -731,6 +740,13 @@ class _Bvm:
         self._send(5, struct.pack("<I", sid) + _s(root) + _ign_wire(ignore))
     def scan_names(self, sid, root, ignore=None):   # readdir-only, no lstat
         self._send(14, struct.pack("<I", sid) + _s(root) + _ign_wire(ignore))
+    def scan_dirs(self, sid, root, ignore=None):
+        """SCAN_FS in complete-directory-chunk form: every dir row carries child_count in
+        `in_off` and dir_total_size in `digest`, the scan root gets a row, and no batch ever
+        splits a directory. Lets a consumer compute ducl's aggregates (or diff a directory as
+        a unit, rsync-style) from the STREAM -- plain scan_fs forces materializing the whole
+        table, which is ~200 GB at full-mount scale. Files carry the usual in_off/digest."""
+        self._send(16, struct.pack("<I", sid) + _s(root) + _ign_wire(ignore))
     def manifest(self, sid, root, paths):   # digest+CDC-manifest these files (delta planning)
         s_ = paths if isinstance(paths, pl.Series) else pl.Series(list(paths), dtype=pl.Utf8)
         self._send(15, struct.pack("<I", sid) + _s(root) + _ipc_bytes(s_.rename("path").to_frame()))
@@ -799,6 +815,22 @@ class _Bvm:
         s_ = paths if isinstance(paths, pl.Series) else pl.Series(list(paths), dtype=pl.Utf8)
         self._send(13, struct.pack("<B", 1 if removedir else 0)
                    + _ipc_bytes(s_.rename("path").to_frame()))
+    def set_meta(self, df, type_=0):    # batched node creation + metadata under DEST (op 17 META)
+        """`df`: path (DEST-relative) [, link][, type], mode, mtime_ns, uid, gid. Missing
+        link/type columns are filled ("" / `type_`). Types: 0 meta-only chown->chmod->utimensat
+        on an existing path (tolerant — a strict finish() stays clean); 5 mkdir(+parents);
+        2 replace-symlink (+its own NOFOLLOW meta); 1 hardlink of DEST+link. Ordering is the
+        CALLER's: creation types are order-free (mkparents), but hardlinks need their targets
+        and meta-only must come after every write — fence those with their own session."""
+        if "link" not in df.columns:
+            df = df.with_columns(link=pl.lit("", pl.Utf8))
+        if "type" not in df.columns:
+            df = df.with_columns(type=pl.lit(type_, pl.UInt8))
+        self._send(17, _ipc_bytes(df.select(
+            path=pl.col("path"), link=pl.col("link").fill_null(""),
+            type=pl.col("type").cast(pl.UInt8),
+            mode=pl.col("mode").cast(pl.Int32), mtime_ns=pl.col("mtime_ns").cast(pl.Int64),
+            uid=pl.col("uid").cast(pl.Int32), gid=pl.col("gid").cast(pl.Int32))))
     DONE_SZ = 64                                     # bvm.c: sizeof(Done)
     FRAME_COLS = ("frame", "coff", "clen", "t0_ns", "t1_ns", "in_bytes",
                   "jq_depth", "busy", "worker", "sink")
@@ -812,10 +844,19 @@ class _Bvm:
                    "pack_used_sum", "blk_live_sum", "jq_cap", "pack_budget", "blk_budget",
                    "wall_ns", "nworkers")
     def read(self):
-        while True:                                      # intercept ERROR(3)/STATS(4) transparently
+        while True:                                      # intercept ERROR(3)/DONE(2)/STATS(4) transparently
             t, pld = self._q.get()
             if t == 3:
                 self._err(pld); continue
+            if t == 2:
+                # DONE(2) is a MID-RUN locator flush, not end-of-stream: bvm flushes frame
+                # records every DONE_FLUSH (2048) frames AND on a 1s timer. Every driver that
+                # read() feeds (recompress_c/_multi/_shards, pack_fs_c, backup*) used to fall
+                # through and DISCARD these, so finish() returned only the locators of the
+                # FINAL flush -- the footer then KeyError'd on the first frame id. Invisible
+                # under 2048 frames and a fast run, fatal at EVI scale. Accumulate here, where
+                # ERROR/STATS are already absorbed, so no caller can drop them again.
+                self._take_done(pld); continue
             if t == 4:
                 self.perf = dict(zip(self.PERF_FIELDS, struct.unpack(f"<{len(self.PERF_FIELDS)}q", pld)))
                 self.perf_series.append(self.perf); continue
@@ -958,6 +999,51 @@ def _tar_hlens(paths, links=None):
     return h
 
 
+_SC_SCHEMA = {"path": pl.Utf8, "size": pl.Int64, "mode": pl.Int64, "mtime_ns": pl.Int64,
+              "uid": pl.Int64, "gid": pl.Int64, "in_off": pl.Int64, "link": pl.Utf8}
+
+
+def _scan_to_stat(b, root, ign=None):
+    """Issue SCAN_FS on `b` and drain the streamed fs STAT (Arrow batches) into two
+    normalized frames: (files+links, dirs sorted by path) — the one scan front end
+    shared by pack_fs_c / backup / backup_multi."""
+    b.scan_fs(0, root, ignore=ign)
+    parts, dparts = [], []
+    while True:
+        t, pld = b.read()
+        if t is None or t == 1:
+            break
+        if t == 0:
+            df = _stat_df(pld)[2]
+            if df.height:
+                nm = df.select(path="path", size="size", mode=(pl.col("mode") & 0o7777).cast(pl.Int64),
+                               mtime_ns="mtime_ns", uid=pl.col("uid").cast(pl.Int64),
+                               gid=pl.col("gid").cast(pl.Int64), in_off="in_off", link="link",
+                               is_dir="is_dir")
+                parts.append(nm.filter(pl.col("is_dir") == 0).drop("is_dir"))
+                dparts.append(nm.filter(pl.col("is_dir") == 1).drop("is_dir"))
+    sc = pl.concat(parts) if parts else pl.DataFrame(schema=_SC_SCHEMA)
+    dirs = (pl.concat(dparts) if dparts else pl.DataFrame(schema=_SC_SCHEMA)).sort("path")
+    return sc, dirs
+
+
+def _frame_bounds(sizes, frame_bytes):
+    """Greedy frame cut, exact via searchsorted over the byte cumsum — O(frames), not
+    O(members). Returns (bounds, pre, fidx): frame row bounds, the cumsum itself
+    (pre[i] = budgeted bytes before row i — callers reuse it for in_off layout and
+    byte-budget chunking), and each row's 0-based frame index."""
+    import numpy as np
+    pre = np.zeros(sizes.size + 1, np.int64); np.cumsum(sizes, out=pre[1:])
+    bounds = [0]
+    while bounds[-1] < sizes.size:
+        i = bounds[-1]
+        e = int(np.searchsorted(pre, pre[i] + frame_bytes, side="right")) - 1
+        bounds.append(max(e, i + 1))
+    nframes = len(bounds) - 1
+    fidx = np.repeat(np.arange(nframes, dtype=np.int64), np.diff(bounds))
+    return bounds, pre, fidx
+
+
 def pack_fs_c(root, out, wal_path, bvm_exe, nworkers=16, level=6, frame_bytes=1 << 20,
               tar_compat=True, predicate=None):
     """INCREMENTAL fs pack in the corrected architecture: bvm (C) WALKS the tree and
@@ -979,26 +1065,7 @@ def pack_fs_c(root, out, wal_path, bvm_exe, nworkers=16, level=6, frame_bytes=1 
     fid = int(pf["frame"].max()) + 1 if pf.height else 0
     b = _Bvm(bvm_exe, nworkers)
     b.sink(0, out, start=cursor)
-    b.scan_fs(0, os.path.abspath(root), ignore=load_ignore(os.path.abspath(root)))
-    parts, dparts = [], []
-    SC_SCHEMA = {"path": pl.Utf8, "size": pl.Int64, "mode": pl.Int64, "mtime_ns": pl.Int64,
-                 "uid": pl.Int64, "gid": pl.Int64, "in_off": pl.Int64, "link": pl.Utf8}
-    while True:                                          # C streams fs STAT (Arrow batches)
-        t, pld = b.read()
-        if t is None or t == 1:
-            break
-        if t == 0:
-            df = _stat_df(pld)[2]
-            if df.height:
-                norm = df.select(
-                    path="path", size="size", mode=(pl.col("mode") & 0o7777).cast(pl.Int64),
-                    mtime_ns="mtime_ns", uid=pl.col("uid").cast(pl.Int64),
-                    gid=pl.col("gid").cast(pl.Int64), in_off="in_off", link="link",
-                    is_dir="is_dir")
-                parts.append(norm.filter(pl.col("is_dir") == 0).drop("is_dir"))
-                dparts.append(norm.filter(pl.col("is_dir") == 1).drop("is_dir"))
-    sc = pl.concat(parts) if parts else pl.DataFrame(schema=SC_SCHEMA)
-    dirs = (pl.concat(dparts) if dparts else pl.DataFrame(schema=SC_SCHEMA)).sort("path")
+    sc, dirs = _scan_to_stat(b, os.path.abspath(root), load_ignore(os.path.abspath(root)))
     if predicate is not None:                            # same PLANNER filter as recompress;
         expr = getattr(predicate, "expr", None)          # vectorized when the filter carries its expr
         sc = sc.filter(expr) if expr is not None else \
@@ -1030,15 +1097,8 @@ def pack_fs_c(root, out, wal_path, bvm_exe, nworkers=16, level=6, frame_bytes=1 
     sizes = np.where(types == 0, typed["size"].to_numpy(), 0)
     hlens = _tar_hlens(typed["path"], typed["link"]) if tar_compat else np.zeros(sizes.size, np.int64)
     step = hlens + (((sizes + 511) & ~511) if tar_compat else sizes)   # header+body budget
-    # frame cut: exact greedy via searchsorted over the step cumsum — O(frames), not O(members)
-    pre = np.zeros(step.size + 1, np.int64); np.cumsum(step, out=pre[1:])
-    bounds = [0]
-    while bounds[-1] < step.size:
-        i = bounds[-1]
-        e = int(np.searchsorted(pre, pre[i] + frame_bytes, side="right")) - 1
-        bounds.append(max(e, i + 1))
+    bounds, pre, fidx = _frame_bounds(step, frame_bytes)
     nframes = len(bounds) - 1
-    fidx = np.repeat(np.arange(nframes, dtype=np.int64), np.diff(bounds))
     pdf = typed.with_columns(fid=pl.Series(fidx + fid), mode32=pl.col("mode").cast(pl.Int32))
     ba = np.asarray(bounds, dtype=np.int64)
     c = 0
@@ -1442,22 +1502,13 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
         prior_ents = meta[0] or []
         prior_leaves, prior_commit = meta[5], meta[4]
         for pb in _nx.iter_batches(out):
-            pb = pb.rename({a: c for a, c in (("frame_coff", "coff"), ("frame_clen", "clen"))
-                            if a in pb.columns})
-            for c, t in (("chunks", pl.Binary), ("extents", pl.Binary)):
-                if c not in pb.columns:
-                    pb = pb.with_columns(pl.lit(None, t).alias(c))
-            if "digest" not in pb.columns:
-                pb = pb.with_columns(digest=pl.lit(-1, pl.Int64))
-            if "shard" not in pb.columns:
-                pb = pb.with_columns(shard=pl.lit(0, pl.Int64))
+            pb = _ensure_cols(_locs_mem(pb), {"chunks": (pl.Binary, None),
+                                              "extents": (pl.Binary, None),
+                                              "digest": (pl.Int64, -1), "shard": (pl.Int64, 0)})
             prior_batches.append(pb)
     prior = pl.concat(prior_batches) if prior_batches else _stat_rows([])
-    for c, t in (("chunks", pl.Binary), ("extents", pl.Binary)):
-        if c not in prior.columns:
-            prior = prior.with_columns(pl.lit(None, t).alias(c))
-    if "shard" not in prior.columns:                     # stores written before sharding
-        prior = prior.with_columns(shard=pl.lit(0, pl.Int64))
+    prior = _ensure_cols(prior, {"chunks": (pl.Binary, None), "extents": (pl.Binary, None),
+                                 "shard": (pl.Int64, 0)})    # stores written before sharding
     if not exists:
         open(out, "wb").close()
     ign = load_ignore(root_abs, excludes)                # .quiverignore + explicit: pruned in C
@@ -1475,25 +1526,7 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
         if not os.path.exists(p):
             open(p, "wb").close()
         b.sink(k, p, start=prev_ends[k])                 # APPEND after each shard's tail
-    b.scan_fs(0, root_abs, ignore=ign)
-    parts, dparts = [], []
-    while True:
-        t, pld = b.read()
-        if t is None or t == 1:
-            break
-        if t == 0:
-            df = _stat_df(pld)[2]
-            if df.height:
-                nm = df.select(path="path", size="size", mode=(pl.col("mode") & 0o7777).cast(pl.Int64),
-                               mtime_ns="mtime_ns", uid=pl.col("uid").cast(pl.Int64),
-                               gid=pl.col("gid").cast(pl.Int64), in_off="in_off", link="link",
-                               is_dir="is_dir")
-                parts.append(nm.filter(pl.col("is_dir") == 0).drop("is_dir"))
-                dparts.append(nm.filter(pl.col("is_dir") == 1).drop("is_dir"))
-    SCH = {"path": pl.Utf8, "size": pl.Int64, "mode": pl.Int64, "mtime_ns": pl.Int64,
-           "uid": pl.Int64, "gid": pl.Int64, "in_off": pl.Int64, "link": pl.Utf8}
-    sc = pl.concat(parts) if parts else pl.DataFrame(schema=SCH)
-    dirs = (pl.concat(dparts) if dparts else pl.DataFrame(schema=SCH)).sort("path")
+    sc, dirs = _scan_to_stat(b, root_abs, ign)
     links = sc.filter(pl.col("link") != "")
     files = sc.filter(pl.col("link") == "")
     pf = prior.filter((pl.col("frame") >= 0) | (pl.col("frame") == -4)).unique(
@@ -1595,7 +1628,7 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
     small = full.filter(pl.col("size") <= frame_cap)
     typed = pl.concat([
         dirs.with_columns(type=pl.lit(5, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
-        small.select(list(SCH)).with_columns(type=pl.lit(0, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
+        small.select(list(_SC_SCHEMA)).with_columns(type=pl.lit(0, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
         links.with_columns(type=pl.when(pl.col("in_off") == 1).then(1).otherwise(2).cast(pl.UInt8),
                            src_off=pl.lit(0, pl.Int64)),
     ])
@@ -1616,14 +1649,8 @@ def backup(root, out, bvm_exe, nworkers=16, level=6, time_ns=None, excludes=None
         typed = pl.concat([typed, pl.DataFrame(lit_rows).select(typed.columns).cast(
             {c: typed.schema[c] for c in typed.columns})])
     sizes = np.where(typed["type"].to_numpy() == 0, typed["size"].to_numpy(), 0)
-    pre = np.zeros(sizes.size + 1, np.int64); np.cumsum(sizes, out=pre[1:])
-    bounds = [0]
-    while bounds[-1] < sizes.size:
-        i = bounds[-1]
-        e = int(np.searchsorted(pre, pre[i] + (1 << 20), side="right")) - 1
-        bounds.append(max(e, i + 1))
+    bounds, pre, fidx = _frame_bounds(sizes, 1 << 20)
     nframes = len(bounds) - 1
-    fidx = np.repeat(np.arange(nframes, dtype=np.int64), np.diff(bounds))
     pdf = typed.with_columns(fid=pl.Series(fidx))
     ba = np.asarray(bounds, dtype=np.int64)
     c = 0
@@ -1976,26 +2003,7 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     # ---- scan (metadata-bound, one node: it is ~2% of a full backup's wall time) ----
     phase[0] = "scan"
     t_scan = time.time()
-    bs[0].scan_fs(0, root_abs, ignore=ign)
-    parts, dparts = [], []
-    while True:
-        t, pld = bs[0].read()
-        if t is None or t == 1:
-            break
-        if t == 0:
-            df = _stat_df(pld)[2]
-            if df.height:
-                nm = df.select(path="path", size="size",
-                               mode=(pl.col("mode") & 0o7777).cast(pl.Int64),
-                               mtime_ns="mtime_ns", uid=pl.col("uid").cast(pl.Int64),
-                               gid=pl.col("gid").cast(pl.Int64), in_off="in_off", link="link",
-                               is_dir="is_dir")
-                parts.append(nm.filter(pl.col("is_dir") == 0).drop("is_dir"))
-                dparts.append(nm.filter(pl.col("is_dir") == 1).drop("is_dir"))
-    SCH = {"path": pl.Utf8, "size": pl.Int64, "mode": pl.Int64, "mtime_ns": pl.Int64,
-           "uid": pl.Int64, "gid": pl.Int64, "in_off": pl.Int64, "link": pl.Utf8}
-    sc = pl.concat(parts) if parts else pl.DataFrame(schema=SCH)
-    dirs = (pl.concat(dparts) if dparts else pl.DataFrame(schema=SCH)).sort("path")
+    sc, dirs = _scan_to_stat(bs[0], root_abs, ign)
     links, files = sc.filter(pl.col("link") != ""), sc.filter(pl.col("link") == "")
     scan_s = time.time() - t_scan
 
@@ -2013,7 +2021,7 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
     small = files.filter(pl.col("size") <= frame_cap)
     typed = pl.concat([
         dirs.with_columns(type=pl.lit(5, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
-        small.select(list(SCH)).with_columns(type=pl.lit(0, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
+        small.select(list(_SC_SCHEMA)).with_columns(type=pl.lit(0, pl.UInt8), src_off=pl.lit(0, pl.Int64)),
         links.with_columns(type=pl.when(pl.col("in_off") == 1).then(1).otherwise(2).cast(pl.UInt8),
                            src_off=pl.lit(0, pl.Int64)),
     ])
@@ -2027,14 +2035,8 @@ def backup_multi(root, out, bvm_exe, nodes, nworkers=64, level=6, time_ns=None,
         typed = pl.concat([typed, pl.DataFrame(piece_rows).select(typed.columns).cast(
             {c: typed.schema[c] for c in typed.columns})])
     sizes = np.where(typed["type"].to_numpy() == 0, typed["size"].to_numpy(), 0)
-    pre = np.zeros(sizes.size + 1, np.int64); np.cumsum(sizes, out=pre[1:])
-    bounds = [0]
-    while bounds[-1] < sizes.size:
-        i = bounds[-1]
-        e = int(np.searchsorted(pre, pre[i] + (1 << 20), side="right")) - 1
-        bounds.append(max(e, i + 1))
+    bounds, pre, fidx = _frame_bounds(sizes, 1 << 20)
     nframes = len(bounds) - 1
-    fidx = np.repeat(np.arange(nframes, dtype=np.int64), np.diff(bounds))
     pdf = typed.with_columns(fid=pl.Series(fidx))
     ba = np.asarray(bounds, dtype=np.int64)
 
@@ -2268,7 +2270,7 @@ def pull(url, store):
                 data = ob.get(f"{pfx}seg-{s2:016x}-{e:016x}")
                 if data is None or len(data) != e - s2:
                     raise IOError(f"segment {pfx}{s2:x}-{e:x} missing/short at {url}")
-                os.pwrite(fd, data, s2); got += len(data)
+                _pwrite_all(fd, data, s2); got += len(data)   # segments can exceed pwrite's 2 GiB cap
             os.ftruncate(fd, sh["size"])
         finally:
             os.close(fd)
@@ -2344,11 +2346,8 @@ def gc(store, last=None, daily=None, weekly=None, monthly=None, yearly=None):
             f.seek(off)
             raw = _z.ZstdDecompressor().decompress(f.read(clen))
         df = pl.read_ipc(_io.BytesIO(raw))
-        df = df.rename({a: c for a, c in (("frame_coff", "coff"), ("frame_clen", "clen"))
-                        if a in df.columns})
-        if "shard" not in df.columns:
-            df = df.with_columns(shard=pl.lit(0, pl.Int64))
-        return df
+        df = _locs_mem(df)
+        return _ensure_cols(df, {"shard": (pl.Int64, 0)})
     bdfs = {k: _load(*k) for k in batches}
     live = {}                                             # (shard, coff, clen) -> new coff
     for df in bdfs.values():
@@ -2384,8 +2383,7 @@ def gc(store, last=None, daily=None, weekly=None, monthly=None, yearly=None):
                          for c2, l2, io2, ln2, oo2, sh2 in _parse_extents(b_)])
                         for b_ in df["extents"].to_list()]
                     df = df.with_columns(extents=pl.Series(exts, dtype=pl.Binary))
-            disk = df.rename({a: b_ for a, b_ in (("coff", "frame_coff"), ("clen", "frame_clen"))
-                              if a in df.columns})
+            disk = _locs_disk(df)
             import hashlib as _hl
             buf = _io.BytesIO(); disk.write_ipc(buf)
             comp = cctx.compress(buf.getvalue())
@@ -2504,177 +2502,128 @@ def _links_footer(parts):
         digest=pl.lit(-1, pl.Int64), link="link")
 
 
-def recompress_c(src, out, bvm_exe, nworkers=16, level=6, frame_bytes=1 << 20, tar_compat=True,
-                 wal_path=None, predicate=None):
-    """RECOMPRESS a foreign .tar.zstd -> nock in the corrected architecture: bvm (C)
-    stream-DECODEs the archive into whole-member frames and STREAMS member STAT up;
-    here we assign frame ids (+ could dedup/skip) and stream COPY(block)/SKIP down;
-    bvm compresses in parallel and streams DONE; we write the footer. Single decode
-    thread + a block budget bound memory. Returns member count. `tar_compat` keeps the
-    raw tar bytes (headers inline) so the data section is a valid tar (zstd -dc | tar x).
-    `wal_path`: the WAL is appended AFTER the executor drains (finish()), so a rerun skips
-    the frames of a PREVIOUS COMPLETED run — a crash mid-run loses that run's progress
-    (no fsync/frame-level commit yet; streaming DONE + fsync barriers are future work,
-    and nothing here is durable until the kernel flushes).
-    `predicate` (a member-dict -> bool, from `_member_filter`) keeps only matching members:
-    filtered blocks are re-framed via COPY_MEMBERS (planner-synthesized headers when
-    tar_compat); unfiltered blocks keep the fast verbatim COPY_BLOCK path."""
+def recompress(srcs, out, bvm_exe, shards=1, nworkers=16, level=6, frame_bytes=1 << 20,
+               tar_compat=True, budget_mb=512, predicate=None, wal_path=None):
+    """RECOMPRESS foreign .tar(.zstd) source(s) -> ONE nock store; the unified driver
+    behind recompress_c/_multi/_shards (three copies of this loop drifted separately,
+    and the sharded one kept a private '{shard}' naming store_files() could not
+    discover plus per-shard DENSE frame-id renumbering — the locator-rebookkeeping
+    family that produced the qvm null_coff bug and this week's DONE-flush KeyError).
+
+    bvm stream-DECODEs each source into whole-member frames and streams member STAT
+    up; frames route round-robin (`blk % shards`) across shard_paths(out, shards)
+    sinks. shards == 1 is the classic single-file nock, INLINE footer, dense frame
+    ids. shards > 1 writes ONE SIDECAR footer (out + ".footer", offset 0): frame ids
+    stay GLOBAL, the `shard` column routes — the same layout backup_multi produces,
+    so a sharded recompress is a first-class store (scan_nock/unpack/verify/push work
+    on `out` unmodified). Each shard's data section is still a valid tar stream when
+    tar_compat (read one alone with `tar --ignore-zeros`).
+
+    `wal_path` (shards == 1 only): WAL appended AFTER the executor drains — a rerun
+    skips frames of a PREVIOUS COMPLETED run; a crash mid-run loses that run.
+    `predicate` (see _member_filter): filtered blocks re-frame via COPY_MEMBERS;
+    unfiltered keep the verbatim COPY_BLOCK fast path. Returns packed member count
+    (frame != -1 rows: files + links, not dirs)."""
+    if isinstance(srcs, str):
+        srcs = [srcs]
+    if wal_path and shards != 1:
+        raise ValueError("wal_path requires shards == 1")
     committed, cursor, _ = _wal_load(wal_path) if wal_path else ({}, 0, None)
     resume = bool(committed)
     done_paths = set()
     for _f, (_c, _c2, st) in committed.items():
         done_paths |= set(st["path"].to_list())
+    paths = shard_paths(out, shards)
     if not resume:
-        open(out, "wb").close()
-    b = _Bvm(bvm_exe, nworkers)
-    b.sink(0, out, start=cursor); b.open_tar(0, os.path.abspath(src), frame_bytes, tar_compat=tar_compat)
+        for p in paths:
+            open(p, "wb").close()
+    b = _Bvm(bvm_exe, nworkers, budget_mb)
+    for i, p in enumerate(paths):
+        b.sink(i, p, start=cursor if i == 0 else 0)
+    for sid, s in enumerate(srcs):
+        b.open_tar(sid, os.path.abspath(s), frame_bytes, tar_compat=tar_compat)
     fid = (max(committed) + 1) if committed else 0
-    planmap, symparts = {}, []
-    while True:                                          # C streams member STAT per block
+    planmap, shard_of, symparts, eofs, blk = {}, {}, [], 0, 0
+    while eofs < len(srcs):                              # C streams member STAT per block
         t, pld = b.read()
-        if t is None or t == 1:
+        if t is None:
             break
+        if t == 1:
+            eofs += 1; continue
         if t != 0:
             continue
         _sid, block, df = _stat_df(pld)
         if block < 0:                                    # sym/hardlinks -> footer-only
             expr = getattr(predicate, "expr", None) if predicate else None
             symparts.append(df.filter(expr) if expr is not None else df); continue
-        if _plan_block(b, block, df, fid, level, tar_compat, predicate, done_paths, planmap):
-            fid += 1
+        sh = blk % shards; blk += 1                      # round-robin whole-frame routing
+        if _plan_block(b, block, df, fid, level, tar_compat, predicate, done_paths,
+                       planmap, sink_id=sh):
+            shard_of[fid] = sh; fid += 1
+    meta_fid = None
     if tar_compat and predicate is not None and symparts:   # re-framed: dirs+links need synth headers
-        if _send_meta_frame(b, symparts, fid, level):
-            fid += 1
+        if _send_meta_frame(b, symparts, fid, level, sink_id=0):
+            meta_fid = fid; fid += 1
     locs = b.finish()
-    parts = [st for _f, (_c, _c2, st) in sorted(committed.items())] if resume else []
+    parts = [st.with_columns(shard=pl.lit(0, pl.Int64))
+             for _f, (_c, _c2, st) in sorted(committed.items())] if resume else []
     wal = _wal_open(wal_path, resume) if wal_path else None
-    end = cursor
+    ends = [cursor if i == 0 else 0 for i in range(shards)]
     for f_id, fdf in planmap.items():
-        coff, clen = locs[f_id]; end = max(end, coff + clen)
-        st = _frame_footer(fdf, f_id, coff, clen)
+        coff, clen = locs[f_id]; sh = shard_of[f_id]
+        ends[sh] = max(ends[sh], coff + clen)
+        st = _frame_footer(fdf, f_id, coff, clen).with_columns(shard=pl.lit(sh, pl.Int64))
         if wal:
             _wal_append(wal, f_id, coff + clen, st)
         parts.append(st)
     if wal:
         wal.close()
-    if symparts:
-        parts.append(_links_footer(symparts))
-    end = max([end] + [c + l for c, l in locs.values()])    # incl. the meta frame
-    fd = os.open(out, os.O_RDWR); os.ftruncate(fd, end)
-    if tar_compat:
-        end = _tar_eof_frame(fd, end, level)
-    write_footer(fd, end, parts if parts else [_stat_rows([])]); os.close(fd)
-    return sum(int((p["frame"] != -1).sum()) for p in parts)
+    if symparts:                                         # links/dirs live in shard 0
+        parts.append(_links_footer(symparts).with_columns(shard=pl.lit(0, pl.Int64)))
+    if meta_fid is not None:                             # tar-compat meta frame, sink 0
+        c0, l0 = locs[meta_fid]; ends[0] = max(ends[0], c0 + l0)
+    for i, p in enumerate(paths):                        # per-sink truncate + tar EOF; the
+        fd = os.open(p, os.O_RDWR)                       # single-file case inlines the footer
+        os.ftruncate(fd, ends[i])
+        if tar_compat:
+            ends[i] = _tar_eof_frame(fd, ends[i], level)
+        if shards == 1:
+            write_footer(fd, ends[i], parts if parts else [_stat_rows([])])
+        os.close(fd)
+    if shards > 1:                                       # ONE sidecar footer at offset 0 —
+        fd = os.open(out + ".footer", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        write_footer(fd, 0, parts if parts else [_stat_rows([])])   # no shard is data+index
+        os.close(fd)
+    return sum(int((p_["frame"] != -1).sum()) for p_ in parts)
+
+
+def recompress_c(src, out, bvm_exe, nworkers=16, level=6, frame_bytes=1 << 20, tar_compat=True,
+                 wal_path=None, predicate=None):
+    """Single source -> single-file nock (inline footer). Thin wrapper; kept for the
+    WAL-resume signature."""
+    return recompress([src], out, bvm_exe, shards=1, nworkers=nworkers, level=level,
+                      frame_bytes=frame_bytes, tar_compat=tar_compat,
+                      predicate=predicate, wal_path=wal_path)
 
 
 def recompress_multi(srcs, out, bvm_exe, nworkers=16, level=6, frame_bytes=1 << 20, budget_mb=512,
                      tar_compat=True, predicate=None):
-    """Recompress MULTIPLE tars into one nock in a SINGLE bvm session — N decode
-    threads run concurrently (shared worker pool + block budget), parallelizing the
-    otherwise-serial per-source decode. STAT is tagged by src_id; members from all
-    sources land in one footer. Returns member count. `tar_compat` keeps raw tar bytes
-    inline; all members + one trailing EOF frame = a single valid tar (zstd -dc | tar x)."""
-    open(out, "wb").close()
-    b = _Bvm(bvm_exe, nworkers, budget_mb)
-    b.sink(0, out)
-    for sid, s in enumerate(srcs):
-        b.open_tar(sid, os.path.abspath(s), frame_bytes, tar_compat=tar_compat)
-    fid, planmap, eofs, symparts = 0, {}, 0, []
-    while eofs < len(srcs):
-        t, pld = b.read()
-        if t is None:
-            break
-        if t == 1:
-            eofs += 1; continue
-        if t == 0:
-            _sid, block, df = _stat_df(pld)
-            if block < 0:                                # sym/hardlinks -> footer-only
-                expr = getattr(predicate, "expr", None) if predicate else None
-                symparts.append(df.filter(expr) if expr is not None else df); continue
-            if _plan_block(b, block, df, fid, level, tar_compat, predicate, None, planmap):
-                fid += 1
-    if tar_compat and predicate is not None and symparts:   # re-framed: dirs+links need synth headers
-        if _send_meta_frame(b, symparts, fid, level):
-            fid += 1
-    locs = b.finish()
-    parts, end = [], 0
-    for f_id, fdf in planmap.items():
-        coff, clen = locs[f_id]; end = max(end, coff + clen)
-        parts.append(_frame_footer(fdf, f_id, coff, clen))
-    end = max([end] + [c + l for c, l in locs.values()])    # incl. the meta frame
-    parts.append(_links_footer(symparts))
-    fd = os.open(out, os.O_RDWR); os.ftruncate(fd, end)
-    if tar_compat:
-        end = _tar_eof_frame(fd, end, level)
-    write_footer(fd, end, parts); os.close(fd)
-    return sum(p.height for p in parts)
+    """Multiple sources -> single-file nock in ONE bvm session (N decode threads share
+    the worker pool + block budget). Thin wrapper."""
+    return recompress(srcs, out, bvm_exe, shards=1, nworkers=nworkers, level=level,
+                      frame_bytes=frame_bytes, tar_compat=tar_compat,
+                      budget_mb=budget_mb, predicate=predicate)
 
 
-def _shard_path(tmpl, i):
-    if "{shard}" in tmpl:
-        return tmpl.format(shard=i)
-    if "%d" in tmpl:
-        return tmpl % i
-    return f"{tmpl}.{i}"
-
-
-def recompress_shards(srcs, out_tmpl, bvm_exe, shards, nworkers=16, level=6,
+def recompress_shards(srcs, out, bvm_exe, shards, nworkers=16, level=6,
                       frame_bytes=1 << 20, tar_compat=True, budget_mb=512, predicate=None):
-    """Recompress tar source(s) into N SHARD nocks in ONE pass — whole frames are routed
-    round-robin across N sink files (even split; every member lands in exactly one shard,
-    each shard a self-contained valid nock). `out_tmpl` uses '{shard}'/'%d', else a '.i'
-    suffix. Union-unpack the shards (a glob) to reconstruct the tree. Returns total members.
-    (tar_compat: each shard's frames are valid tar members + a trailing EOF; a shard mixes
-    members from many source positions, so read a shard with `tar --ignore-zeros`.)"""
-    if isinstance(srcs, str):
-        srcs = [srcs]
-    paths = [_shard_path(out_tmpl, i) for i in range(shards)]
-    for p in paths:
-        open(p, "wb").close()
-    b = _Bvm(bvm_exe, nworkers, budget_mb)
-    for i, p in enumerate(paths):
-        b.sink(i, p)
-    for sid, s in enumerate(srcs):
-        b.open_tar(sid, os.path.abspath(s), frame_bytes, tar_compat=tar_compat)
-    fid, planmap, shard_of, eofs, blk, symparts = 0, {}, {}, 0, 0, []
-    while eofs < len(srcs):
-        t, pld = b.read()
-        if t is None:
-            break
-        if t == 1:
-            eofs += 1; continue
-        if t == 0:
-            _sid, block, df = _stat_df(pld)
-            if block < 0:                                # sym/hardlinks -> shard 0's footer
-                expr = getattr(predicate, "expr", None) if predicate else None
-                symparts.append(df.filter(expr) if expr is not None else df); continue
-            sh = blk % shards; blk += 1                  # round-robin whole-frame routing
-            if _plan_block(b, block, df, fid, level, tar_compat, predicate, None, planmap, sink_id=sh):
-                shard_of[fid] = sh; fid += 1
-    meta_fid = None
-    if tar_compat and predicate is not None and symparts:   # meta frame lives in shard 0
-        if _send_meta_frame(b, symparts, fid, level, sink_id=0):
-            meta_fid = fid; fid += 1
-    locs = b.finish()
-    by_shard = {i: [] for i in range(shards)}
-    for f_id in planmap:
-        by_shard[shard_of[f_id]].append(f_id)
-    total = 0
-    for i in range(shards):
-        rows, end = [], 0
-        for dense, f_id in enumerate(sorted(by_shard[i])):   # per-shard dense frame ids
-            coff, clen = locs[f_id]; end = max(end, coff + clen)
-            rows.append(_frame_footer(planmap[f_id], dense, coff, clen))
-        if i == 0:
-            rows.append(_links_footer(symparts))          # symlinks live in shard 0
-        if i == 0 and meta_fid is not None:
-            c0, l0 = locs[meta_fid]; end = max(end, c0 + l0)
-        fd = os.open(paths[i], os.O_RDWR); os.ftruncate(fd, end)
-        if tar_compat and rows:
-            end = _tar_eof_frame(fd, end, level)
-        write_footer(fd, end, rows if rows else [_stat_rows([])]); os.close(fd)
-        total += sum(p.height for p in rows)
-    return total
+    """Sharded recompress -> ONE store: shard_paths(out, shards) sinks + a sidecar
+    footer. (The old '{shard}' template layout with per-shard inline footers is gone;
+    old archives remain readable — scan_nock falls back to the inline footer.) Thin
+    wrapper."""
+    return recompress(srcs, out, bvm_exe, shards=shards, nworkers=nworkers, level=level,
+                      frame_bytes=frame_bytes, tar_compat=tar_compat,
+                      budget_mb=budget_mb, predicate=predicate)
 
 
 def diff_trees(a, b, bvm_exe, nworkers=8, digest=False):
@@ -3024,6 +2973,27 @@ def rsync(src, dst, bvm_exe, n=4, nworkers=8, level=6):
     t.join(); return out
 
 
+def _locs_mem(df):
+    """Locator names disk -> memory (frame_coff/frame_clen -> coff/clen), when present."""
+    return df.rename({a: b for a, b in (("frame_coff", "coff"), ("frame_clen", "clen"))
+                      if a in df.columns})
+
+
+def _locs_disk(df):
+    """Locator names memory -> disk (coff/clen -> frame_coff/frame_clen), when present."""
+    return df.rename({a: b for a, b in (("coff", "frame_coff"), ("clen", "frame_clen"))
+                      if a in df.columns})
+
+
+def _ensure_cols(df, spec):
+    """Legacy-footer upgrade: add each column missing from `df` as a typed default
+    literal. `spec` maps name -> (dtype, default)."""
+    for c, (t, v) in spec.items():
+        if c not in df.columns:
+            df = df.with_columns(pl.lit(v, t).alias(c))
+    return df
+
+
 def scan_nock(path, at=None):
     """SCAN(NOCK): read the chunked footer STAT table (NOCKZC01). Decodes NO data frames
     (they are lazy). Normalizes the on-disk locator names (frame_coff/clen -> coff/clen)
@@ -3031,19 +3001,24 @@ def scan_nock(path, at=None):
     can use nockidx.iter_batches / read_directory directly."""
     from ..nock import nockidx
     df = nockidx.read_footer(path, at=at)
-    ren = {a: b for a, b in (("frame_coff", "coff"), ("frame_clen", "clen"))
-           if a in df.columns}
-    if ren:
-        df = df.rename(ren)
-    if "digest" not in df.columns:
-        df = df.with_columns(digest=pl.lit(-1, pl.Int64))
-    if "link" not in df.columns:                             # legacy footer (pre-symlink)
-        df = df.with_columns(link=pl.lit("", pl.Utf8))
-    return df
+    df = _locs_mem(df)
+    return _ensure_cols(df, {"digest": (pl.Int64, -1),       # legacy footers: pre-digest /
+                             "link": (pl.Utf8, "")})         # pre-symlink
 
 
 # ------------------------------------------------------------------ COPY
 # ------------------------------------------------------------------ drivers
+def _pwrite_all(fd, buf, off):
+    """pwrite(2) writes at most 0x7ffff000 bytes per call; one os.pwrite of the full EVI
+    footer (34M rows -> 2.3 GB packed) returned 2,147,479,552 and the ignored short count
+    SILENTLY truncated the index — the store then failed to open with 'no NOCKZC01 footer'.
+    Loop to completion; every multi-GB pwrite must go through here."""
+    mv = memoryview(buf)
+    while len(mv):
+        n = os.pwrite(fd, mv, off)
+        mv = mv[n:]; off += n
+
+
 def write_footer(sink_fd, cursor, parts, level=3, rows_per_batch=1 << 20, prev_off=None,
                  reuse_ents=None, part_cuts=False, snap_time_ns=None, prev_commit=None):
     """Append the nock footer at `cursor`: STAT -> row-batched, independently
@@ -3053,17 +3028,16 @@ def write_footer(sink_fd, cursor, parts, level=3, rows_per_batch=1 << 20, prev_o
     from ..nock import nockidx
     stat = pl.concat([p for p in parts if p.height], how="vertical_relaxed") \
         if any(p.height for p in parts) else _stat_rows([])
-    disk = stat.rename({a: b for a, b in (("coff", "frame_coff"), ("clen", "frame_clen"))
-                        if a in stat.columns})
+    disk = _locs_disk(stat)
     fc = None
     if part_cuts:                                       # PART boundaries never share a batch —
         acc, fc = 0, []                                 # keeps meta rows out of reusable batches
         for p in parts:
             acc += p.height; fc.append(acc)
-    os.pwrite(sink_fd, nockidx.pack_footer(disk, cursor, rows_per_batch, level,
-                                           prev_off=prev_off, reuse_ents=reuse_ents,
-                                           forced_cuts=fc, snap_time_ns=snap_time_ns,
-                                           prev_commit=prev_commit), cursor)
+    _pwrite_all(sink_fd, nockidx.pack_footer(disk, cursor, rows_per_batch, level,
+                                             prev_off=prev_off, reuse_ents=reuse_ents,
+                                             forced_cuts=fc, snap_time_ns=snap_time_ns,
+                                             prev_commit=prev_commit), cursor)
     return stat
 
 
@@ -3109,10 +3083,7 @@ def unpack(nocks, dest, bvm_exe, nworkers=16, predicate=None, shuffle=True, at=N
         for si, sp in enumerate(sfiles):
             b.nock(os.path.abspath(sp), nock_id=base + si)
         for batch in nockidx.iter_batches(nk, at=ats[k]):
-            if "shard" not in batch.columns:
-                batch = batch.with_columns(shard=pl.lit(0, pl.Int64))
-            batch = batch.rename({a: c for a, c in (("frame_coff", "coff"), ("frame_clen", "clen"))
-                                  if a in batch.columns})
+            batch = _locs_mem(_ensure_cols(batch, {"shard": (pl.Int64, 0)}))
             ext_pieces = []
             neg = batch.filter(pl.col("frame") < 0)
             ext = neg.filter(pl.col("frame") == -4)
@@ -3126,26 +3097,23 @@ def unpack(nocks, dest, bvm_exe, nworkers=16, predicate=None, shuffle=True, at=N
                                            mtime_ns=r["mtime_ns"], uid=r["uid"], gid=r["gid"],
                                            path=r["path"]))
                 n += 1
-            for r in neg.filter(pl.col("frame") != -4).iter_rows(named=True):
-                p = os.path.join(dest, r["path"])
-                if r["frame"] == -3:
-                    hardlinks.append(r); continue
-                if r["frame"] == -2:
-                    dd = os.path.dirname(p)
-                    if dd:
-                        os.makedirs(dd, exist_ok=True)
-                    if os.path.lexists(p):
-                        os.remove(p)
-                    os.symlink(r["link"], p); n += 1
-                    try:                                    # the symlink's own metadata
-                        if r["uid"] or r["gid"]:
-                            os.chown(p, r["uid"], r["gid"], follow_symlinks=False)
-                        os.utime(p, ns=(r["mtime_ns"], r["mtime_ns"]), follow_symlinks=False)
-                    except (OSError, NotImplementedError):
-                        pass
-                else:                                       # -1: dir now, metadata LAST
-                    os.makedirs(p, exist_ok=True)
-                    dirmeta.append((p, r["mode"], r["mtime_ns"]))
+            # dirs + symlinks ride op 17 META inside the MAIN session — creation is
+            # order-independent (mkparents), so they interleave freely with file scatter.
+            # These were per-row Python syscalls; on the 4-node EVI unpack the rank owning
+            # shard 0 spent 17 min in exactly this loop while the other ranks sat done.
+            nodes = neg.filter(pl.col("frame").is_in([-1, -2]))
+            if nodes.height:
+                b.set_meta(nodes.select(
+                    path="path", link="link",
+                    type=pl.when(pl.col("frame") == -1).then(5).otherwise(2).cast(pl.UInt8),
+                    mode="mode", mtime_ns="mtime_ns", uid="uid", gid="gid"))
+                n += nodes.filter(pl.col("frame") == -2).height
+                dirmeta.append(nodes.filter(pl.col("frame") == -1)
+                                    .select("path", "mode", "mtime_ns", "uid", "gid"))
+            hl = neg.filter(pl.col("frame") == -3)
+            if hl.height:                                   # need their targets: own session below
+                hardlinks.append(hl.select("path", "link", "mode", "mtime_ns", "uid", "gid"))
+                n += hl.height
             files = batch.filter(pl.col("frame") >= 0)
             if predicate is not None:
                 files = files.filter(predicate)
@@ -3172,25 +3140,22 @@ def unpack(nocks, dest, bvm_exe, nworkers=16, predicate=None, shuffle=True, at=N
     if not stream and parts:
         _send(pl.concat(parts), shuffle)                    # GLOBAL cross-source shuffle
     b.finish()
-    for r in hardlinks:                                     # after all files exist
-        p = os.path.join(dest, r["path"]); tgt = os.path.join(dest, r["link"])
-        dd = os.path.dirname(p)
-        if dd:
-            os.makedirs(dd, exist_ok=True)
-        if os.path.lexists(p):
-            os.remove(p)
-        try:
-            os.link(tgt, p); n += 1
-        except OSError:
-            pass
-    for p, md, mt in dirmeta:                               # LAST: restrictive dir modes/mtimes
-        try:                                                # can't block the writes above
-            if md:
-                os.chmod(p, md & 0o7777)
-            if mt:
-                os.utime(p, ns=(mt, mt))
-        except OSError:
-            pass
+    # sessions are the fences: finish() above means every file is durably written, so
+    # hardlinks can find their targets; the second finish() below means every write is
+    # done, so restrictive dir modes cannot lock anything out. Each was a serial per-row
+    # Python loop (~10 min for 530k dirs on the full EVI tree); META batches both.
+    if hardlinks:
+        bh = _Bvm(bvm_exe, min(nworkers, 64)); bh.dest(dest)
+        hdf = pl.concat(hardlinks)
+        for i in range(0, hdf.height, 1 << 20):
+            bh.set_meta(hdf.slice(i, 1 << 20), type_=1)
+        bh.finish()
+    if dirmeta:                                             # LAST: restrictive dir modes/mtimes
+        b2 = _Bvm(bvm_exe, min(nworkers, 64)); b2.dest(dest)
+        dm = pl.concat(dirmeta)
+        for i in range(0, dm.height, 1 << 20):
+            b2.set_meta(dm.slice(i, 1 << 20))
+        b2.finish()
     return n
 
 

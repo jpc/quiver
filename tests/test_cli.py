@@ -180,13 +180,16 @@ def test_cli_shards(bvm, tmp_path):
     out = str(tmp_path / "o.nock")
     o = _q("recompress", out, "--shards", "4", "--frame-mb", "0.03", src)
     assert "4 shards" in o
-    assert len(glob.glob(out + ".*")) == 4                 # o.nock.0 .. o.nock.3
-    pat = out + ".*"
-    s = _q("scan", pat)
-    assert f"{len(truth)} members" in s and "across 4 nocks" in s
+    from quiver.exec import blocks as _b
+    import os as _os
+    assert [_os.path.basename(p) for p in _b.store_files(out)] == \
+        ["o.nock", "o.nock.1", "o.nock.2", "o.nock.3"]      # ONE store, discoverable
+    assert _os.path.exists(out + ".footer")                 # sidecar index, offset 0
+    s = _q("scan", out)                                     # the STORE scans as one nock
+    assert f"{len(truth)} members" in s
     dest = str(tmp_path / "un")
-    _q("unpack", pat, dest)
-    assert _tree_md5(dest) == truth                        # union of shards == source
+    _q("unpack", out, dest)
+    assert _tree_md5(dest) == truth                         # union of shards == source
 
 
 def test_cli_filter(bvm, tmp_path):
