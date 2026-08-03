@@ -15,7 +15,7 @@ import pyarrow as pa
 QVM2 = os.path.join(os.path.dirname(__file__), "exec", "qvm2")
 
 (NEWVAL, MOV, CLOSE, SPAWN, JOIN, SINK, EMIT,
- MKDIR, SYMLINK, LINK, SETMETA, UNLINK, RMDIR, FENCE, READDIR, STATB, SCAN) = range(17)
+ MKDIR, SYMLINK, LINK, SETMETA, UNLINK, RMDIR, FENCE, READDIR, STATB, SCAN, FREE) = range(18)
 E_FS, E_VAL, E_INLINE, E_SINK = range(4)
 
 ISCH = dict(tid=pl.UInt32, op=pl.UInt8, k1=pl.UInt8, k2=pl.UInt8,
@@ -146,6 +146,8 @@ def pack(root, out, level=3, frame_bytes=1 << 20, walkers=32, sdf=None):
                   d=pl.lit(0, pl.Int64)),
         fh.group_by("tid", maintain_order=True).agg(pl.col("fid").first())
           .select(tid="tid", op=pl.lit(EMIT, pl.UInt8), a=pl.lit(1, pl.Int64)),
+        fh.group_by("tid", maintain_order=True).agg(pl.col("fid").first())
+          .select(tid="tid", op=pl.lit(FREE, pl.UInt8), a="fid"),
         pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[1, 1],
                           b=[nframes, nframes])),
     ]
@@ -230,6 +232,7 @@ def unpack(nock, dest, walkers=32):
         fmap.select(tid="tid", op=pl.lit(SETMETA, pl.UInt8),
                     a=(pl.col("mode") & 0o7777), b="mtime_ns",
                     path=pl.lit(dest + "/") + pl.col("path")),
+        fr.select(tid="tid", op=pl.lit(FREE, pl.UInt8), a="vid"),
         pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[1, 1],
                           b=[nd + nfr, nd + nfr])),
     ]

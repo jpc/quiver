@@ -70,6 +70,10 @@ typedef struct Val {
     int     closed;                             /* no more producers */
     int     codec;                              /* 0 none, 1 zstd-c, 2 zstd-d */
     int     clevel;
+    int64_t charged;                            /* budget held by this val's chunks */
+    _Atomic int jobs;                           /* codec jobs in flight/queued: FREE
+                                                 * must wait for zero — enforced, not
+                                                 * assumed (ASan caught a straggler) */
     int64_t pledged;                            /* known-in-advance raw size: stamps the
                                                  * zstd frame's content size, which the
                                                  * structural verify's anti-truncation
@@ -82,7 +86,7 @@ typedef struct Val {
     struct Val *snext;                          /* scope free-list */
 } Val;
 
-static int64_t g_budget = 1LL << 30; static _Atomic int64_t g_live = 0;
+static int64_t g_budget = 4LL << 30;   /* env QVM2_BUDGET (MB) */ static _Atomic int64_t g_live = 0;
 static Fiber  *g_budget_waiters = NULL;
 static int     g_nlive_fibers = 0;              /* sole-runner rule input */
 
@@ -200,7 +204,10 @@ enum { I_NEWVAL, I_MOV, I_CLOSE, I_SPAWN, I_JOIN, I_SINK, I_EMIT,
        I_READDIR, I_STATB,                      /* wave-scan leaves (coarse fan-out only:
                                                  * per-dir waves measured 85x off a flat
                                                  * walker — see the I_SCAN generator) */
-       I_SCAN };                                /* the C walker as a generator leaf */
+       I_SCAN,                                  /* the C walker as a generator leaf */
+       I_FREE };                                /* explicit val release — v1 lifetime:
+                                                 * macros FREE after the last consumer;
+                                                 * scope-freeing (ISA3) supersedes later */
 enum { E_FS, E_VAL, E_INLINE, E_SINK };         /* endpoint kinds */
 /* Vals are named by PLANNER-ASSIGNED ids — dataflow edge names, not slots: the
  * runtime maps id -> Val* in a growable table at execution, ids carry no
@@ -322,11 +329,16 @@ static Fiber *ready_pop(void) {
 
 /* ---- budget: charge n bytes for fiber f; 0 = parked (sole-runner may exceed) */
 static int budget_charge(Fiber *f, int64_t n) {
-    if (g_live > 0 && g_live + n > g_budget) {
+    /* ADMISSION GATE only — accounting moved to val_append (output bytes), release
+     * to I_FREE / STREAM fin / val_free. LIMITATION (v1, documented loudly): a single
+     * val larger than the whole budget parks its own producer with nothing to free —
+     * scopes fix this properly; until then size QVM2_BUDGET above the largest frame. */
+    (void)n;
+    if (g_live > 0 && g_live >= g_budget) {
         f->wnext = g_budget_waiters; g_budget_waiters = f; f->st = F_WAIT_BUDGET;
         return 0;
     }
-    g_live += n; return 1;
+    return 1;
 }
 static void budget_release(int64_t n) {
     g_live -= n;
@@ -339,7 +351,9 @@ static Val *val_new(int codec, int clevel, int stream) {
     v->codec = codec; v->clevel = clevel; v->stream = stream;
     return v;
 }
-static void val_append(Val *v, const uint8_t *b, int64_t n) {   /* raw append */
+static void val_append(Val *v, const uint8_t *b, int64_t n) {   /* raw append; CHARGES
+                                                 * the budget on OUTPUT bytes (atomic:
+                                                 * codec workers append off-thread) */
     while (n > 0) {
         if (!v->tail || v->tail->len == CHUNK) {
             VChunk *c = malloc(sizeof(VChunk));
@@ -349,7 +363,8 @@ static void val_append(Val *v, const uint8_t *b, int64_t n) {   /* raw append */
         }
         int64_t take = CHUNK - v->tail->len; if (take > n) take = n;
         memcpy(v->tail->b + v->tail->len, b, take);
-        v->tail->len += take; v->len += take; b += take; n -= take;
+        v->tail->len += take; v->len += take; v->charged += take; b += take; n -= take;
+        g_live += take;
     }
 }
 static void val_wake(Val *v);
@@ -378,7 +393,8 @@ static void mkparents(char *full) {             /* as bvm.c: EEXIST benign */
     for (char *q = strchr(full + 1, '/'); q; q = strchr(q + 1, '/')) { *q = 0; mkdir(full, 0777); *q = '/'; }
 }
 static void val_free(Val *v) {
-    for (VChunk *c = v->head; c; ) { VChunk *nx = c->next; budget_release(c->len ? CHUNK : CHUNK); free(c->b); free(c); c = nx; }
+    for (VChunk *c = v->head; c; ) { VChunk *nx = c->next; free(c->b); free(c); c = nx; }
+    budget_release(v->charged);
     free(v);
 }
 
@@ -518,6 +534,7 @@ static void *worker(void *arg) {
                 if (ob.pos) val_append(v, out, (int64_t)ob.pos);   /* only this worker touches v */
             }
         }
+        v->jobs--;
         pthread_mutex_lock(&g_dmu); j->next = g_done_h; g_done_h = j; pthread_mutex_unlock(&g_dmu);
         uint64_t one = 1; (void)!write(g_evfd, &one, 8);
     }
@@ -533,6 +550,7 @@ static void job_push_ns(Instr *I, Fiber *f) {
 }
 static void job_push(Val *v, const uint8_t *src, int64_t n, Fiber *f) {
     Job *j = calloc(1, sizeof(Job)); j->v = v; j->src = src; j->n = n; j->f = f; j->next = NULL;
+    v->jobs++;
     pthread_mutex_lock(&g_jmu);
     if (g_jq_t) g_jq_t->next = j; else g_jq_h = j;
     g_jq_t = j; pthread_cond_signal(&g_jcv); pthread_mutex_unlock(&g_jmu);
@@ -731,6 +749,7 @@ static void fib_retire(Fiber *f) {         /* pc advance = cursor reset, no exce
         memcpy(&f->dbg_digest, h, 8);
     }
     if (f->cur.fin) { budget_release(f->cur.fin->len); free(f->cur.fin->b); free(f->cur.fin); }
+    /* NOTE: fin belonged to a val whose ->charged already dropped via the quantum path */
     if (f->cur.dents) free(f->cur.dents);
     if (f->cur.ablk) free(f->cur.ablk);
     qc_free(&f->cur.qc);
@@ -844,6 +863,7 @@ static void fib_step(Fiber *f) {
                 if (f->cur.fin) {                           /* release-behind: freed one quantum
                                                              * late so in-flight writes finish */
                     budget_release(f->cur.fin->len);
+                    sv->charged -= f->cur.fin->len;
                     sv->head = f->cur.fin->next;
                     free(f->cur.fin->b); free(f->cur.fin); f->cur.fin = NULL;
                 }
@@ -984,6 +1004,15 @@ static void fib_step(Fiber *f) {
                 else { f->st = F_WAIT_JOB; return; }
             }
             fib_retire(f); break;
+        case I_FREE: {
+            Val *fv = val_at(I->cvid);
+            if (fv && fv->jobs > 0) {           /* straggler job: WAIT, witnessed */
+                TR("t%d FREE defer vid=%lld jobs=%d\n", f->tid, (long long)I->cvid, (int)fv->jobs);
+                f->wnext = fv->waiters; fv->waiters = f; f->st = F_WAIT_VAL; return;
+            }
+            if (fv) { val_free(fv); val_bind(I->cvid, NULL); }
+            fib_retire(f); break;
+        }
         case I_FENCE:
             /* no-op TODAY: every op completes before its fiber advances and cross-
              * fiber order is spawn/join. Becomes real when namespace ops pipeline. */
@@ -1154,7 +1183,7 @@ static void feed_rows(const uint8_t **bp, int64_t n) {
             I->nofollow = k1[k] & 1;
             I->mode = a[k]; I->mtime = b[k]; I->uid = c[k]; I->gid = d[k];
             break;
-        case I_CLOSE:  I->cvid = a[k]; break;
+case I_CLOSE: case I_FREE: I->cvid = a[k]; break;
         case I_SPAWN: case I_JOIN: I->lo = (int)a[k]; I->hi = (int)b[k]; break;
         case I_SINK:
             I->sink = (int)a[k]; I->mode = b[k];   /* b==1: arrow sink (schema at open) */
@@ -1259,6 +1288,8 @@ static Instr *fib_push(Fiber *f, uint8_t op) { Instr *I = &f->prog[f->n++]; mems
 
 int main(int argc, char **argv) {
     g_trace = getenv("QVM2_TRACE") != NULL;
+    { const char *bg = getenv("QVM2_BUDGET");
+      if (bg) { long v = atol(bg); if (v > 0) g_budget = v << 20; } }
     { const char *w = getenv("QVM2_WORKERS");
       if (w) { NWORK = atoi(w); if (NWORK < 1) NWORK = 1; if (NWORK > NWORK_MAX) NWORK = NWORK_MAX; } }
     if (argc >= 2 && !strcmp(argv[1], "stream")) {
