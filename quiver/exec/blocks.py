@@ -233,73 +233,79 @@ def store_stats(nock, at=None):
                 bogus_payload=float(p[~good].sum()), hist=hist)
 
 
-def verify(nock, sample=None):
+def verify(nock, sample=None, workers=32):
     """Integrity check: re-hash every member body (BLAKE3) against the footer `digest`
     column (-1 rows = packed before digests, skipped). `sample` = check only that many
-    frames (random). Returns dict(checked, mismatched, undigested, frames, bad_frames) —
-    mismatches also carry the first few offending paths."""
+    frames (random). PARALLEL: frames are independent and pread/zstd/blake3 all release
+    the GIL, so `workers` threads scale on both passes — the serial version cost 36 min
+    of structural pass alone on a 2.6M-frame archive while `-j` silently did nothing.
+    Returns dict(checked, mismatched, undigested, frames, bad_frames) — mismatches also
+    carry the first few offending paths."""
     import random as _r
+    import threading
     import blake3 as _b3
+    from concurrent.futures import ThreadPoolExecutor
     df = scan_nock(nock).filter(pl.col("frame") >= 0)
-    # STRUCTURAL PASS over EVERY frame, before any sampling. A zstd frame header declares its
-    # content size, so comparing it against the payload the footer claims lives there costs 18
-    # bytes of read per frame and catches a whole class of silent loss that digest checking
-    # cannot: a member that failed to buffer (ENOMEM on a giant file) left a 9-byte EMPTY frame
-    # with digest -1, so `verify` skipped it as undigested and the run reported lost=0. Two such
-    # frames sat in a 4.9 TB home backup claiming 55.7 TB of payload between them.
     short = []
-    df = _ensure_cols(df, {"shard": (pl.Int64, 0)})
+    if "shard" not in df.columns:
+        df = df.with_columns(shard=pl.lit(0, pl.Int64))
     frames = df.group_by("shard", "coff", "clen", maintain_order=True).agg(
         pl.col("path"), pl.col("in_off"), pl.col("size"), pl.col("digest"))
     idx = list(range(frames.height))
     if sample is not None and sample < len(idx):
         _r.shuffle(idx); idx = idx[:sample]
-    dctx = zstd.ZstdDecompressor()
-    checked = mism = undig = bad = 0; badpaths = []
-    fhs = [open(p, "rb") for p in store_files(nock)]
-    try:
-        for k in range(frames.height):                   # ALL frames, not just the sample
-            r = frames.row(k, named=True)
-            want = int(sum(r["size"]))
-            f = fhs[r["shard"]]
-            f.seek(r["coff"])
-            try:
-                got = zstd.frame_content_size(f.read(18))
-            except Exception:
-                got = -1
-            # `want` is the sum of RAW member sizes -- a LOWER BOUND on the frame's content,
-            # never an equality. A tar_compat frame additionally carries a 512-byte header per
-            # member, 512-byte body padding, and PAX/GNU extended-header records, so `got`
-            # legitimately EXCEEDS `want` (measured: 274/300 frames == the tar-layout sum, the
-            # rest larger by exact multiples of 512; NONE ever smaller). Testing `!=` flagged
-            # every frame of every tar_compat archive -- 471,319 of 471,319 on a round-trip whose
-            # restored tree matched exactly -- burying the real signal. Only SHORT is corruption:
-            # the empty-frame case this pass exists to catch declares 0 against a nonzero want.
-            if got >= 0 and got < want:
+    fds = [os.open(p_, os.O_RDONLY) for p_ in store_files(nock)]   # os.pread: no seek state,
+    mu = threading.Lock()                                          # one fd per shard, all threads
+    checked = [0]; mism = [0]; undig = [0]; bad = [0]; badpaths = []
+
+    def _structural(k):
+        # STRUCTURAL PASS over EVERY frame, before any sampling: a zstd frame header
+        # declares its content size; `want` (sum of member sizes) is a LOWER bound
+        # (tar_compat adds headers/padding), so only got < want is corruption — the
+        # empty-frame-claiming-terabytes case this pass exists for.
+        r = frames.row(k, named=True)
+        want = int(sum(r["size"]))
+        try:
+            got = zstd.frame_content_size(os.pread(fds[r["shard"]], 18, r["coff"]))
+        except Exception:
+            got = -1
+        if got >= 0 and got < want:
+            with mu:
                 short.append((r["path"][0] if r["path"] else "?", want, got, int(r["clen"])))
-        for k in idx:
-            r = frames.row(k, named=True)
-            f = fhs[r["shard"]]
-            f.seek(r["coff"]); comp = f.read(r["clen"])
-            try:
-                body = dctx.decompress(comp)
-            except Exception:
-                bad += 1; badpaths.append(f"frame@{r['shard']}:{r['coff']}"); continue
-            for p, io_, sz, dg in zip(r["path"], r["in_off"], r["size"], r["digest"]):
-                if dg == -1:
-                    undig += 1; continue
-                checked += 1
-                h = int.from_bytes(_b3.blake3(body[io_:io_ + sz]).digest(length=8),
-                                   "little", signed=True)   # == C blake3_i64 (BLAKE3 XOF[:8] LE)
-                if h != dg:
-                    mism += 1
-                    if len(badpaths) < 8:
-                        badpaths.append(p)
+
+    def _deep(k):
+        r = frames.row(k, named=True)
+        comp = os.pread(fds[r["shard"]], r["clen"], r["coff"])
+        try:
+            body = zstd.ZstdDecompressor().decompress(comp)
+        except Exception:
+            with mu:
+                bad[0] += 1; badpaths.append(f"frame@{r['shard']}:{r['coff']}")
+            return
+        c = m = u = 0; mp = []
+        for p_, io_, sz, dg in zip(r["path"], r["in_off"], r["size"], r["digest"]):
+            if dg == -1:
+                u += 1; continue
+            c += 1
+            h = int.from_bytes(_b3.blake3(body[io_:io_ + sz]).digest(length=8),
+                               "little", signed=True)   # == C blake3_i64 (BLAKE3 XOF[:8] LE)
+            if h != dg:
+                m += 1; mp.append(p_)
+        with mu:
+            checked[0] += c; mism[0] += m; undig[0] += u
+            for p_ in mp:
+                if len(badpaths) < 8:
+                    badpaths.append(p_)
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_structural, range(frames.height), chunksize=256))
+            list(ex.map(_deep, idx, chunksize=16))
     finally:
-        for f in fhs:
-            f.close()
-    return dict(checked=checked, mismatched=mism, undigested=undig,
-                frames=len(idx), bad_frames=bad, bad=badpaths,
+        for fd in fds:
+            os.close(fd)
+    return dict(checked=checked[0], mismatched=mism[0], undigested=undig[0],
+                frames=len(idx), bad_frames=bad[0], bad=badpaths,
                 truncated=len(short), truncated_sample=short[:5])
 
 

@@ -267,7 +267,7 @@ def main(argv=None):
             r = blocks.verify_merkle(args.archive)
             ok = r["bad"] is not None and not r["bad"] and r["root"]
             print(("OK " if ok else "FAIL ") + str(r)); sys.exit(0 if ok else 1)
-        r = blocks.verify(args.archive, sample=args.sample)
+        r = blocks.verify(args.archive, sample=args.sample, workers=j)
         ok = r["mismatched"] == 0 and r["bad_frames"] == 0
         print(("OK " if ok else "FAIL ") + str(r))
         if not ok:
