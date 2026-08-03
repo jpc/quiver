@@ -70,6 +70,10 @@ typedef struct Val {
     int     closed;                             /* no more producers */
     int     codec;                              /* 0 none, 1 zstd-c, 2 zstd-d */
     int     clevel;
+    int64_t pledged;                            /* known-in-advance raw size: stamps the
+                                                 * zstd frame's content size, which the
+                                                 * structural verify's anti-truncation
+                                                 * check depends on (bvm frames have it) */
     int     stream;                             /* STREAM: single consumer chases the
                                                  * producer; chunks free behind it.
                                                  * 0 = RANDOM: consumers wait for close. */
@@ -506,7 +510,8 @@ static void *worker(void *arg) {
             }
         } else {
             if (!v->cc) { v->cc = ZSTD_createCCtx();
-                ZSTD_CCtx_setParameter(v->cc, ZSTD_c_compressionLevel, v->clevel); }
+                ZSTD_CCtx_setParameter(v->cc, ZSTD_c_compressionLevel, v->clevel);
+                if (v->pledged > 0) ZSTD_CCtx_setPledgedSrcSize(v->cc, (uint64_t)v->pledged); }
             while (ib.pos < ib.size) {
                 ZSTD_outBuffer ob = { out, sizeof out, 0 };
                 ZSTD_compressStream2(v->cc, &ob, &ib, ZSTD_e_continue);
@@ -581,69 +586,108 @@ static void scan_flush(QC *qc, int final_) {
     }
     free(ab);
 }
+#define SCAN_POP 16                             /* dirs batch-opened per walker pop */
+static void scan_one_dir(SDir *d, int dfd, QC *qc) {
+    char rel[4096];
+    size_t rl = strlen(d->rel);
+    if (rl) { memcpy(rel, d->rel, rl); rel[rl] = '/'; }
+    if (dfd >= 0) {
+        uint8_t buf[1 << 16];
+        long r;
+        while ((r = syscall(SYS_getdents64, dfd, buf, sizeof buf)) > 0) {
+            for (long o = 0; o < r; ) {
+                struct dirent64 *de = (struct dirent64 *)(buf + o); o += de->d_reclen;
+                if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+                size_t nl = strlen(de->d_name);
+                size_t tot = (rl ? rl + 1 : 0) + nl;
+                if (tot >= sizeof rel) continue;
+                memcpy(rel + (rl ? rl + 1 : 0), de->d_name, nl + 1);
+                struct statx stx;
+                if (statx(dfd, de->d_name, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stx))
+                    continue;
+                int isdir = S_ISDIR(stx.stx_mode);
+                int64_t mt = (int64_t)stx.stx_mtime.tv_sec * 1000000000LL + stx.stx_mtime.tv_nsec;
+                qc_add(qc, rel, tot, isdir ? 1 : S_ISREG(stx.stx_mode) ? 0 : 2,
+                       stx.stx_mode, (int64_t)stx.stx_size, mt, stx.stx_uid, stx.stx_gid);
+                if (isdir) {
+                    SDir *nd = malloc(sizeof *nd);
+                    nd->rel = strdup(rel);
+                    pthread_mutex_lock(&g_scan.mu);
+                    g_scan.pending++; scan_push(nd); pthread_cond_signal(&g_scan.cv);
+                    pthread_mutex_unlock(&g_scan.mu);
+                }
+            }
+        }
+        close(dfd);
+    }
+    if (qc->n >= 20000) scan_flush(qc, 0);
+    free(d->rel); free(d);
+    pthread_mutex_lock(&g_scan.mu);
+    g_scan.pending--;
+    if (g_scan.pending == 0) pthread_cond_broadcast(&g_scan.cv);
+    pthread_mutex_unlock(&g_scan.mu);
+}
 static void *scan_walker(void *arg) {
     (void)arg;
     QC qc = {0};
-    char rel[4096];
+    struct io_uring wr; int wr_ok = io_uring_queue_init(SCAN_POP * 2, &wr, 0) == 0;
+    SDir *batch[SCAN_POP]; int fds[SCAN_POP];
     for (;;) {
+        int n = 0;
         pthread_mutex_lock(&g_scan.mu);
         while (!g_scan.h && g_scan.pending > 0 && !g_scan.stop)
             pthread_cond_wait(&g_scan.cv, &g_scan.mu);
         if ((!g_scan.h && g_scan.pending == 0) || g_scan.stop) {
             pthread_mutex_unlock(&g_scan.mu); break;
         }
-        SDir *d = g_scan.h; g_scan.h = d->next; if (!g_scan.h) g_scan.t = NULL;
-        pthread_mutex_unlock(&g_scan.mu);
-        int dfd = d->rel[0] ? openat(g_scan.rootfd, d->rel, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                            : dup(g_scan.rootfd);
-        if (dfd < 0 && (errno == EMFILE || errno == ENFILE)) {
-            usleep(1000);                        /* re-queue holding NOTHING */
-            pthread_mutex_lock(&g_scan.mu); scan_push(d); pthread_cond_signal(&g_scan.cv);
-            pthread_mutex_unlock(&g_scan.mu);
-            continue;
+        while (g_scan.h && n < SCAN_POP) {              /* batch pop: fds exist only in
+                                                         * WALKERS, never in the queue */
+            SDir *d = g_scan.h; g_scan.h = d->next; if (!g_scan.h) g_scan.t = NULL;
+            batch[n++] = d;
         }
-        size_t rl = strlen(d->rel);
-        if (rl) { memcpy(rel, d->rel, rl); rel[rl] = '/'; }
-        if (dfd >= 0) {
-            uint8_t buf[1 << 16];
-            long r;
-            while ((r = syscall(SYS_getdents64, dfd, buf, sizeof buf)) > 0) {
-                for (long o = 0; o < r; ) {
-                    struct dirent64 *de = (struct dirent64 *)(buf + o); o += de->d_reclen;
-                    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-                    size_t nl = strlen(de->d_name);
-                    size_t tot = (rl ? rl + 1 : 0) + nl;
-                    if (tot >= sizeof rel) continue;
-                    memcpy(rel + (rl ? rl + 1 : 0), de->d_name, nl + 1);
-                    struct statx stx;
-                    if (statx(dfd, de->d_name, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stx))
-                        continue;
-                    int isdir = S_ISDIR(stx.stx_mode);
-                    int64_t mt = (int64_t)stx.stx_mtime.tv_sec * 1000000000LL + stx.stx_mtime.tv_nsec;
-                    qc_add(&qc, rel, tot, isdir ? 1 : S_ISREG(stx.stx_mode) ? 0 : 2,
-                           stx.stx_mode, (int64_t)stx.stx_size, mt, stx.stx_uid, stx.stx_gid);
-                    if (isdir) {
-                        SDir *nd = malloc(sizeof *nd);
-                        nd->rel = strdup(rel);
-                        pthread_mutex_lock(&g_scan.mu);
-                        g_scan.pending++; scan_push(nd); pthread_cond_signal(&g_scan.cv);
-                        pthread_mutex_unlock(&g_scan.mu);
-                    }
-                }
+        pthread_mutex_unlock(&g_scan.mu);
+        if (wr_ok && n >= 2) {                          /* ring-batched opens: one latency
+                                                         * round for the whole pop (bvm's
+                                                         * 0.94->0.79s trick, invariant-safe) */
+            for (int i = 0; i < n; i++) {
+                struct io_uring_sqe *sq = io_uring_get_sqe(&wr);
+                if (batch[i]->rel[0])
+                    io_uring_prep_openat(sq, g_scan.rootfd, batch[i]->rel,
+                                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+                else
+                    io_uring_prep_openat(sq, g_scan.rootfd, ".",
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+                io_uring_sqe_set_data64(sq, (uint64_t)i);
             }
-            close(dfd);
+            io_uring_submit(&wr);
+            for (int i = 0; i < n; i++) {
+                struct io_uring_cqe *cq;
+                if (io_uring_wait_cqe(&wr, &cq) < 0) break;
+                fds[(int)io_uring_cqe_get_data64(cq)] = cq->res;
+                io_uring_cqe_seen(&wr, cq);
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                fds[i] = batch[i]->rel[0]
+                       ? openat(g_scan.rootfd, batch[i]->rel, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                       : dup(g_scan.rootfd);
+                if (fds[i] < 0) fds[i] = -errno;
+            }
         }
-        if (qc.n >= 20000) scan_flush(&qc, 0);
-        free(d->rel); free(d);
-        pthread_mutex_lock(&g_scan.mu);
-        g_scan.pending--;
-        if (g_scan.pending == 0) pthread_cond_broadcast(&g_scan.cv);
-        pthread_mutex_unlock(&g_scan.mu);
+        for (int i = 0; i < n; i++) {
+            if (fds[i] == -EMFILE || fds[i] == -ENFILE) {
+                usleep(1000);                            /* re-queue holding NOTHING */
+                pthread_mutex_lock(&g_scan.mu); scan_push(batch[i]);
+                pthread_cond_signal(&g_scan.cv); pthread_mutex_unlock(&g_scan.mu);
+                continue;
+            }
+            scan_one_dir(batch[i], fds[i] < 0 ? -1 : fds[i], &qc);
+        }
     }
-    scan_flush(&qc, 0);                          /* residue (final marker: closer below) */
+    scan_flush(&qc, 0);
+    if (wr_ok) io_uring_queue_exit(&wr);
     return NULL;
 }
-
 static void *scan_closer(void *arg) {
     (void)arg;
     for (int i = 0; i < g_scan.nth; i++) pthread_join(g_scan.th[i], NULL);
@@ -721,7 +765,8 @@ static void fib_step(Fiber *f) {
             f->join_lo = I->lo; f->join_hi = I->hi; f->st = F_WAIT_JOIN; return;
         }
         case I_NEWVAL:
-            val_bind(I->cvid, val_new(I->codec, I->clevel, I->stream_flag)); f->pc++; break;
+            { Val *nv = val_new(I->codec, I->clevel, I->stream_flag);
+              nv->pledged = I->fsize; val_bind(I->cvid, nv); f->pc++; break; }
         case I_SINK: {
             Sink *sk = &g_sinks[I->sink];
             sk->fd = open(I->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -1077,7 +1122,8 @@ static void feed_rows(const uint8_t **bp, int64_t n) {
         I->op = op[k];
         switch (op[k]) {
         case I_NEWVAL: I->cvid = a[k]; I->codec = (int)b[k]; I->clevel = (int)c[k];
-            I->stream_flag = (int)d[k]; break;
+            /* d: 1 = STREAM val; >1 = pledged raw size (content-size stamp) */
+            I->stream_flag = d[k] == 1; I->fsize = d[k] > 1 ? d[k] : 0; break;
         case I_EMIT: I->sink = (int)a[k]; break;
         case I_MKDIR: case I_UNLINK: case I_RMDIR: case I_FENCE:
             if (po[k + 1] > po[k]) I->path = prog_strdup_range(pd, po[k], po[k + 1]);
