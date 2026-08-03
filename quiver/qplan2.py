@@ -38,7 +38,12 @@ def _ipc(df):
 
 
 def _run(program_parts, timeout=3600):
-    """Concatenate instruction tables, hand them to one qvm2, wait."""
+    """Send instruction tables to one qvm2 IN ORDER, wait. ORDERING CONTRACT: a
+    fiber's rows must be fed before any SPAWN covering it executes — polars splits
+    big IPC streams into ~245k-row batches, so root control rows (SPAWN/JOIN) must
+    ride in their own FINAL part, never sorted in front of megarow fiber bodies
+    (the EVI unpack silently lost whole subtrees to exactly that: later-batch
+    fibers spawned empty, completed instantly, made nothing)."""
     blob = b"".join(_ipc(p) for p in program_parts)
     proc = subprocess.Popen([QVM2, "stream"], stdin=subprocess.PIPE)
     proc.stdin.write(blob)
@@ -151,17 +156,13 @@ def pack(root, out, level=3, frame_bytes=1 << 20, walkers=32, sdf=None):
         pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[1, 1],
                           b=[nframes, nframes])),
     ]
-    # ROW ORDER within a fiber is execution order: sort the concatenated program by
-    # (tid, op-sequence) using a stage column.
+    # ROW ORDER within a fiber is execution order; fiber BODIES are sorted by
+    # (tid, stage) and sent BEFORE root's SPAWN/JOIN (see _run's ordering contract).
     staged = []
-    for si, p_ in enumerate(prog):
+    for si, p_ in enumerate(prog[1:-1], start=1):
         staged.append(_pad(p_).with_columns(_s=pl.lit(si)))
-    program = (pl.concat(staged)
-               .sort(["tid", "_s"], maintain_order=True)
-               .drop("_s"))
-    # tid 0 rows must come first regardless of stage sort (SINKs before spawns is
-    # already guaranteed by stage order within tid 0)
-    _run([program])
+    body = pl.concat(staged).sort(["tid", "_s"], maintain_order=True).drop("_s")
+    _run([_pad(prog[0]), body, _pad(prog[-1])])
 
     recs = _emit_records(emitf)
     os.unlink(emitf)
@@ -247,9 +248,14 @@ def unpack(nock, dest, walkers=32):
                               a=[nd + nfr + 1, nd + nfr + 1],
                               b=[nd + nfr + nd, nd + nfr + nd])),
         ]
-    staged = []
+    body_parts, tails = [], []
     for si, p_ in enumerate(prog):
-        staged.append(_pad(p_).with_columns(_s=pl.lit(si)))
-    program = pl.concat(staged).sort(["tid", "_s"], maintain_order=True).drop("_s")
-    _run([program])
+        q_ = _pad(p_).with_columns(_s=pl.lit(si))
+        (tails if (p_["tid"].max() is not None and p_["tid"].max() == 0 and p_["tid"].min() == 0)
+         else body_parts).append(q_)
+    body = pl.concat(body_parts).sort(["tid", "_s"], maintain_order=True).drop("_s")
+    # each control part (SPAWN/JOIN pair) must land AFTER the bodies it covers; the
+    # dir-meta pair also after the first JOIN — keep tail order as authored
+    tail = pl.concat(tails).sort("_s", maintain_order=True).drop("_s")
+    _run([body, tail])
     return files.height + dirs.height

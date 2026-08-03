@@ -306,6 +306,13 @@ static Fiber *fib_get(int tid) {                /* grow-safe: pointers never mov
 static int g_trace = 0;
 #define TR(...) do { if (g_trace) fprintf(stderr, __VA_ARGS__); } while (0)
 static Fiber *g_ready_h, *g_ready_t;
+/* O(1) join accounting: a parked JOIN registers a countdown; each completion
+ * decrements matching registrations. The previous scheme scanned the WHOLE
+ * fiber table per completion and the whole range per hit — O(n^2) that cost
+ * 79 min of a 1M-fiber unpack while looking like "scheduler overhead". */
+typedef struct JoinWait { Fiber *joiner; int lo, hi; int64_t remaining;
+                          struct JoinWait *next; } JoinWait;
+static JoinWait *g_joins;
 static struct io_uring g_ring;
 static struct io_uring_sqe *sqe_get(void) {     /* SQ full: flush and retry — thousands
                                                  * of scan fibers WILL fill any depth */
@@ -734,10 +741,17 @@ static int scan_start(Fiber *f, const char *root, int sink, int nwalk) {
 
 static void fib_step(Fiber *f);
 
-static void fib_finish_children_check(int lo, int hi, Fiber *joiner) {
-    for (int t = lo; t <= hi; t++)
-        if (fib_get(t)->st != F_DONE) return;
-    ready_push(joiner);
+static void join_note_done(int tid) {           /* O(active joins) per completion */
+    JoinWait **pp = &g_joins;
+    while (*pp) {
+        JoinWait *jw = *pp;
+        if (tid >= jw->lo && tid <= jw->hi && --jw->remaining == 0) {
+            ready_push(jw->joiner);
+            *pp = jw->next; free(jw);
+            continue;
+        }
+        pp = &jw->next;
+    }
 }
 
 static void fib_retire(Fiber *f) {         /* pc advance = cursor reset, no exceptions */
@@ -763,12 +777,7 @@ static void fib_step(Fiber *f) {
         if (f->pc >= f->n) {
             if (f->tid == 0 && !g_stream_eof) { f->st = F_WAIT_STREAM; return; }
             f->st = F_DONE; g_nlive_fibers--;
-            /* wake any joiner covering us */
-            for (int t = 0; t < g_nfib; t++) {
-                Fiber *j = g_fib[t]; if (!j) continue;
-                if (j->st == F_WAIT_JOIN && f->tid >= j->join_lo && f->tid <= j->join_hi)
-                    fib_finish_children_check(j->join_lo, j->join_hi, j);
-            }
+            join_note_done(f->tid);
             return;
         }
         Instr *I = &f->prog[f->pc];
@@ -778,9 +787,12 @@ static void fib_step(Fiber *f) {
             for (int t = I->lo; t <= I->hi; t++) { g_nlive_fibers++; ready_push(fib_get(t)); }
             f->pc++; break;
         case I_JOIN: {
-            int all = 1;
-            for (int t = I->lo; t <= I->hi; t++) if (fib_get(t)->st != F_DONE) { all = 0; break; }
-            if (all) { f->pc++; break; }
+            int64_t rem = 0;                    /* one O(range) count at PARK time */
+            for (int t = I->lo; t <= I->hi; t++) if (fib_get(t)->st != F_DONE) rem++;
+            if (rem == 0) { f->pc++; break; }
+            JoinWait *jw = malloc(sizeof *jw);
+            jw->joiner = f; jw->lo = I->lo; jw->hi = I->hi; jw->remaining = rem;
+            jw->next = g_joins; g_joins = jw;
             f->join_lo = I->lo; f->join_hi = I->hi; f->st = F_WAIT_JOIN; return;
         }
         case I_NEWVAL:
