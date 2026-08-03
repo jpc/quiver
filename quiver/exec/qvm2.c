@@ -1070,11 +1070,11 @@ static void run(void) {
     for (;;) {
         Fiber *f;
         while ((f = ready_pop())) { f->st = F_READY; fib_step(f); }
-        /* all parked: reap ONE completion (cqe or eventfd) */
-        int live = 0;
-        for (int t = 0; t < g_nfib; t++) if (g_fib[t] && g_fib[t]->st != F_DONE && g_fib[t]->st != F_INERT) live = 1;
-        if (!g_stream_eof) live = 1;
-        if (!live) return;
+        /* all parked: reap ONE completion (cqe or eventfd). Liveness is the
+         * COUNTER, not a table scan — the scan was O(fibers) per reap iteration:
+         * 1.06M fibers x ~2M iterations = 1.4 TRILLION cycles, 64% of the whole
+         * unpack (perf-witnessed), the same O(n*events) disease as the join scan. */
+        if (g_nlive_fibers == 0 && g_stream_eof) return;
         struct io_uring_cqe *cqe;
         int rc = io_uring_wait_cqe(&g_ring, &cqe);
         if (rc < 0) { fprintf(stderr, "qvm2: wait_cqe: %s\n", strerror(-rc)); return; }
