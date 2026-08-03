@@ -20,3 +20,11 @@ bvm: bvm.c ipc_gen.h
 	$(CC) -O2 -pthread -w -I$(ZSTD)/include -I$(SODIUM)/include -I$(URING)/include -I$(BLAKE3)/include -o $(BVM_OUT).tmp bvm.c \
 	  $(ZSTD)/lib/libzstd.a $(SODIUM)/lib/libsodium.a $(URING)/lib/liburing.a $(BLAKE3)/lib/libblake3.a
 	mv -f $(BVM_OUT).tmp $(BVM_OUT)
+
+# --- qvm2 (ISA v3 prototype; docs/ISA3.md) — same static-link discipline as bvm ---
+qvm2: qvm2.c qvm2_gen.h
+	$(CC) -O2 -pthread -w -I$(ZSTD)/include -I$(URING)/include -I$(BLAKE3)/include -o qvm2.tmp qvm2.c \
+	  $(ZSTD)/lib/libzstd.a $(URING)/lib/liburing.a $(BLAKE3)/lib/libblake3.a
+	mv -f qvm2.tmp qvm2
+qvm2_gen.h: ../compiler/gen_qvm2.py
+	cd ../.. && PYTHONPATH=. python3 quiver/compiler/gen_qvm2.py quiver/exec/qvm2_gen.h
