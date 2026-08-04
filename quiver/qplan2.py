@@ -194,7 +194,7 @@ def pack(root, out, level=3, frame_bytes=1 << 20, walkers=32, sdf=None):
 
 
 # ------------------------------------------------------------------ unpack
-def unpack(nock, dest, walkers=32):
+def unpack(nock, dest, walkers=32, phase_times=None):
     """nock -> tree, authored from the footer: MKDIRs, one fiber per frame
     (decode window -> per-member scatter with TRUNC + SETMETA), restrictive dir
     metadata last — ISA3 §4.6 as column ops. Reads bvm-packed nocks too (the
@@ -266,5 +266,22 @@ def unpack(nock, dest, walkers=32):
     # each control part (SPAWN/JOIN pair) must land AFTER the bodies it covers; the
     # dir-meta pair also after the first JOIN — keep tail order as authored
     tail = pl.concat(tails).sort("_s", maintain_order=True).drop("_s")
-    _run([body, tail])
+    if phase_times is None:
+        _run([body, tail])
+    else:
+        # PHASE ATTRIBUTION: run each scope as its own session and time it —
+        # mkdir wave / frames+file-meta / dir metadata. Costs 3 process spawns
+        # and 3 footer-feeds; only for profiling, results identical.
+        scopes = [("mkdir", body.filter(pl.col("op") == MKDIR), tails[0].drop("_s")),
+                  ("frames", body.filter((pl.col("op") != MKDIR) &
+                                         ~((pl.col("op") == SETMETA) & (pl.col("tid") > nd + nfr))),
+                   tails[1].drop("_s")),
+                  ("dirmeta", body.filter((pl.col("op") == SETMETA) & (pl.col("tid") > nd + nfr)),
+                   tails[2].drop("_s") if len(tails) > 2 else None)]
+        for name, b_, t_ in scopes:
+            if t_ is None or not b_.height:
+                continue
+            t0 = time.time()
+            _run([b_, t_])
+            phase_times[name] = round(time.time() - t0, 1)
     return files.height + dirs.height
