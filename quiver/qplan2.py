@@ -206,7 +206,12 @@ def unpack(nock, dest, walkers=32):
     if foot.filter(pl.col("frame") < -1).height:
         raise NotImplementedError("qplan2.unpack v1: links/extents in footer")
     files = foot.filter(pl.col("frame") >= 0)
-    dirs = foot.filter(pl.col("frame") == -1)
+    # DEPTH-SORTED dirs: parents queue before children, so the C-side
+    # ENOENT->mkparents fallback (depth-many probing RPCs per miss) becomes a
+    # never-taken safety net instead of the common path. Profiled: the unpack is
+    # RPC-latency-bound at full worker width — RPCs per op is the lever.
+    dirs = (foot.filter(pl.col("frame") == -1)
+            .with_columns(_d=pl.col("path").str.count_matches("/")).sort("_d").drop("_d"))
     frames = (files.group_by("frame", maintain_order=True)
               .agg(pl.col("coff").first(), pl.col("clen").first()))
     nfr = frames.height
@@ -230,11 +235,15 @@ def unpack(nock, dest, walkers=32):
                     k1=pl.lit(E_VAL, pl.UInt8), k2=pl.lit(E_FS, pl.UInt8),
                     a="vid", b="in_off", c="size", d="size",
                     path=pl.lit(dest + "/") + pl.col("path")),
-        fmap.select(tid="tid", op=pl.lit(SETMETA, pl.UInt8),
-                    a=(pl.col("mode") & 0o7777), b="mtime_ns",
-                    path=pl.lit(dest + "/") + pl.col("path")),
+        fmap.with_columns(
+            c=pl.when(pl.col("uid") == os.getuid()).then(0).otherwise(pl.col("uid")),
+            d=pl.when(pl.col("gid") == os.getgid()).then(0).otherwise(pl.col("gid")))
+            .select(tid="tid", op=pl.lit(SETMETA, pl.UInt8),
+                    a=(pl.col("mode") & 0o7777), b="mtime_ns", c="c", d="d",
+                    path=pl.lit(dest + "/") + pl.col("path")),   # chown-to-self: skipped
         fr.select(tid="tid", op=pl.lit(FREE, pl.UInt8), a="vid"),
-        pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[1, 1],
+        pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[1, 1], b=[nd, nd])),
+        pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[nd + 1, nd + 1],
                           b=[nd + nfr, nd + nfr])),
     ]
     # dir metadata LAST, own scope
