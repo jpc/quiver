@@ -817,12 +817,18 @@ static void fib_step(Fiber *f) {
             /* FRESH: one-time setup, then RUN quanta until the transfer drains. */
             if (f->cur.phase == 0) {
                 f->cur.phase = 1;
+                if (I->digest) { blake3_hasher_init(&f->cur.bh); f->cur.hashing = 1; }
                 if (I->skind == E_FS) {
-                    f->cur.fd = open(I->path, O_RDONLY);    /* M2: ring openat */
-                    if (f->cur.fd < 0) { fprintf(stderr, "qvm2: open %s: %m\n", I->path); fib_retire(f); break; }
-                    struct stat st; fstat(f->cur.fd, &st);
-                    f->cur.off = I->soff;
-                    f->cur.remain = I->slen >= 0 ? I->slen : st.st_size - I->soff;
+                    /* ASYNC open — a sync open() here serialized every file open on
+                     * the SCHEDULER thread: 113k dst opens x ~4ms WEKA latency was
+                     * the entire 468s frames phase (the '1 D' histogram tail was
+                     * this thread, not a worker). fd: 0 = not opened, -1 = in flight. */
+                    struct io_uring_sqe *sq = sqe_get();
+                    io_uring_prep_openat(sq, AT_FDCWD, I->path, O_RDONLY, 0);
+                    io_uring_sqe_set_data(sq, f);
+                    io_uring_submit(&g_ring);
+                    f->cur.fd = -1;
+                    f->st = F_WAIT_CQE; return;
                 } else if (I->skind == E_INLINE) {
                     f->cur.remain = I->inlen;
                 } else if (I->skind == E_VAL) {
@@ -841,14 +847,14 @@ static void fib_step(Fiber *f) {
                         f->dbg_base = f->cur.base; f->dbg_len = sv->len;
                     }
                 }
-                if (I->dkind == E_FS) {                     /* scatter destination */
-                    char *dp = (char *)I->path;
-                    int fd = open(dp, O_WRONLY | O_CREAT, 0644);
-                    if (fd < 0 && errno == ENOENT) { mkparents(dp); fd = open(dp, O_WRONLY | O_CREAT, 0644); }
-                    if (fd < 0) { fprintf(stderr, "qvm2: open %s: %m\n", dp); fib_retire(f); break; }
-                    f->cur.fd = fd; f->cur.dst_off = 0;
+                if (I->dkind == E_FS) {                     /* scatter destination: async */
+                    struct io_uring_sqe *sq = sqe_get();
+                    io_uring_prep_openat(sq, AT_FDCWD, I->path, O_WRONLY | O_CREAT, 0644);
+                    io_uring_sqe_set_data(sq, f);
+                    io_uring_submit(&g_ring);
+                    f->cur.fd = -1;
+                    f->st = F_WAIT_CQE; return;
                 }
-                if (I->digest) { blake3_hasher_init(&f->cur.bh); f->cur.hashing = 1; }
             }
             if (f->cur.remain == 0) { fib_retire(f); break; }
             /* ---- exactly one quantum ---- */
@@ -1124,7 +1130,29 @@ static void run(void) {
             Fiber *f = ud;
             if (f->st == F_WAIT_CQE) {
                 Instr *I = &f->prog[f->pc];
-                if (I->op == I_MOV && I->skind == E_FS) fib_resume_read(f, res);
+                if (I->op == I_MOV && f->cur.fd == -1) {         /* async open landed */
+                    if (res == -ENOENT && I->dkind == E_FS) {    /* rare: parents missing */
+                        char *dp = (char *)I->path;
+                        mkparents(dp);
+                        res = open(dp, O_WRONLY | O_CREAT, 0644);
+                        if (res < 0) res = -errno;
+                    }
+                    if (res < 0) {
+                        fprintf(stderr, "qvm2: open %s: %s\n", I->path, strerror(-res));
+                        fib_retire(f); ready_push(f);
+                    } else {
+                        f->cur.fd = res;
+                        if (I->skind == E_FS) {                  /* src: size the transfer */
+                            struct stat st; fstat(f->cur.fd, &st);
+                            f->cur.off = I->soff;
+                            f->cur.remain = I->slen >= 0 ? I->slen : st.st_size - I->soff;
+                        } else {
+                            f->cur.dst_off = 0;                  /* dst: begin at 0 */
+                        }
+                        ready_push(f);
+                    }
+                }
+                else if (I->op == I_MOV && I->skind == E_FS) fib_resume_read(f, res);
                 else ready_push(f);                          /* write done / etc */
             }
         }
