@@ -228,11 +228,20 @@ def unpack(nock, dest, walkers=32, phase_times=None):
               .agg(pl.col("coff").first(), pl.col("clen").first())
               .with_columns(_h=pl.col("frame").hash(seed=11)).sort("_h").drop("_h"))
     nfr = frames.height
-    # tids: 1..nd (mkdir) | nd+1..nd+nfr (frames) | meta fibers after
     nd = dirs.height
+    # PRODUCER fiber per frame (decode), CONSUMER fibers per <=512-member chunk
+    # (scatter + file meta) sharing the frame's RANDOM val — a byte-capped frame
+    # of tiny members previously serialized THOUSANDS of scatters in one fiber
+    # (the profiled 7-minute single-worker tail). FREEs ride a cleanup scope.
+    K = 512
     fr = frames.with_columns(tid=(pl.int_range(nfr, dtype=pl.UInt32) + 1 + nd),
                              vid=pl.int_range(nfr, dtype=pl.Int64))
-    fmap = files.join(fr.select("frame", "tid", "vid"), on="frame")
+    fm = (files.join(fr.select("frame", "vid"), on="frame")
+          .with_columns(ci=pl.int_range(pl.len()).over("frame") // K))
+    chunks = (fm.group_by("frame", "ci", maintain_order=True).agg(pl.col("vid").first())
+              .with_columns(ctid=(pl.int_range(pl.len(), dtype=pl.UInt32) + 1 + nd + nfr)))
+    nch = chunks.height
+    fmap = fm.join(chunks.select("frame", "ci", "ctid"), on=["frame", "ci"])              .rename({"ctid": "tid"})
     nockp = os.path.abspath(nock)
     prog = [
         dirs.with_columns(tid=(pl.int_range(nd, dtype=pl.UInt32) + 1))
@@ -253,22 +262,28 @@ def unpack(nock, dest, walkers=32, phase_times=None):
             d=pl.when(pl.col("gid") == os.getgid()).then(0).otherwise(pl.col("gid")))
             .select(tid="tid", op=pl.lit(SETMETA, pl.UInt8),
                     a=(pl.col("mode") & 0o7777), b="mtime_ns", c="c", d="d",
-                    path=pl.lit(dest + "/") + pl.col("path")),   # chown-to-self: skipped
-        fr.select(tid="tid", op=pl.lit(FREE, pl.UInt8), a="vid"),
+                    path=pl.lit(dest + "/") + pl.col("path")),
         pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[1, 1], b=[nd, nd])),
         pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN], a=[nd + 1, nd + 1],
-                          b=[nd + nfr, nd + nfr])),
+                          b=[nd + nfr + nch, nd + nfr + nch])),
+    ]
+    base2 = nd + nfr + nch
+    # cleanup scope: one fiber batch-FREEing every frame val (local ops, instant)
+    prog += [
+        fr.select(tid=pl.lit(base2 + 1, pl.UInt32), op=pl.lit(FREE, pl.UInt8), a="vid"),
+        pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN],
+                          a=[base2 + 1, base2 + 1], b=[base2 + 1, base2 + 1])),
     ]
     # dir metadata LAST, own scope
     if nd:
-        dm = dirs.with_columns(tid=(pl.int_range(nd, dtype=pl.UInt32) + 1 + nd + nfr))
+        dm = dirs.with_columns(tid=(pl.int_range(nd, dtype=pl.UInt32) + base2 + 2))
         prog += [
             dm.select(tid="tid", op=pl.lit(SETMETA, pl.UInt8),
                       a=(pl.col("mode") & 0o7777), b="mtime_ns",
                       path=pl.lit(dest + "/") + pl.col("path")),
             pl.DataFrame(dict(tid=[0, 0], op=[SPAWN, JOIN],
-                              a=[nd + nfr + 1, nd + nfr + 1],
-                              b=[nd + nfr + nd, nd + nfr + nd])),
+                              a=[base2 + 2, base2 + 2],
+                              b=[base2 + 1 + nd, base2 + 1 + nd])),
         ]
     body_parts, tails = [], []
     for si, p_ in enumerate(prog):
@@ -285,12 +300,13 @@ def unpack(nock, dest, walkers=32, phase_times=None):
         # PHASE ATTRIBUTION: run each scope as its own session and time it —
         # mkdir wave / frames+file-meta / dir metadata. Costs 3 process spawns
         # and 3 footer-feeds; only for profiling, results identical.
+        dm_lo = nd + nfr + nch + 2                   # dirmeta fibers start here
         scopes = [("mkdir", body.filter(pl.col("op") == MKDIR), tails[0].drop("_s")),
                   ("frames", body.filter((pl.col("op") != MKDIR) &
-                                         ~((pl.col("op") == SETMETA) & (pl.col("tid") > nd + nfr))),
-                   tails[1].drop("_s")),
-                  ("dirmeta", body.filter((pl.col("op") == SETMETA) & (pl.col("tid") > nd + nfr)),
-                   tails[2].drop("_s") if len(tails) > 2 else None)]
+                                         (pl.col("tid") < dm_lo)),
+                   pl.concat([tails[1], tails[2]]).drop("_s")),
+                  ("dirmeta", body.filter(pl.col("tid") >= dm_lo),
+                   tails[3].drop("_s") if len(tails) > 3 else None)]
         for name, b_, t_ in scopes:
             if t_ is None or not b_.height:
                 continue
