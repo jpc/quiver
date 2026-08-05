@@ -210,10 +210,23 @@ def unpack(nock, dest, walkers=32, phase_times=None):
     # ENOENT->mkparents fallback (depth-many probing RPCs per miss) becomes a
     # never-taken safety net instead of the common path. Profiled: the unpack is
     # RPC-latency-bound at full worker width — RPCs per op is the lever.
+    # (depth, hash) order: parents still lead their children (stratified), but
+    # SIBLINGS SCATTER — depth-sort alone parks all 64 workers on the same few
+    # parent dirs, and WEKA serializes creates per parent (the ~535/s "ceiling"
+    # equalled the SERIAL loop's rate: single-lane-per-parent, not per-client).
+    # Same trick as blocks.unpack's shuffle. Stratum-edge races hit the
+    # mkparents fallback, which is exactly what it's for.
     dirs = (foot.filter(pl.col("frame") == -1)
-            .with_columns(_d=pl.col("path").str.count_matches("/")).sort("_d").drop("_d"))
+            .with_columns(_d=pl.col("path").str.count_matches("/"),
+                          _h=pl.col("path").hash(seed=7))
+            .sort("_d", "_h").drop("_d", "_h"))
+    # frame fibers SHUFFLED for the same reason as dirs: frames group path-sorted
+    # siblings, so ordered spawn parks all workers on the same parent dirs (per-
+    # parent create serialization — measured 5.7x on mkdirs). blocks.unpack has
+    # shuffled frames by default since the multi-node era for exactly this.
     frames = (files.group_by("frame", maintain_order=True)
-              .agg(pl.col("coff").first(), pl.col("clen").first()))
+              .agg(pl.col("coff").first(), pl.col("clen").first())
+              .with_columns(_h=pl.col("frame").hash(seed=11)).sort("_h").drop("_h"))
     nfr = frames.height
     # tids: 1..nd (mkdir) | nd+1..nd+nfr (frames) | meta fibers after
     nd = dirs.height
