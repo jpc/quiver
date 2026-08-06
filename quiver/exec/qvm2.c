@@ -284,6 +284,12 @@ struct Fiber {
 static Fiber **g_fib; static int g_nfib, g_fibcap;
 static uint8_t *g_pb; static size_t g_pbcap, g_pblen, g_ppos;   /* streamed program */
 static int g_stdin_tag;
+static int g_open_inflight;                     /* opens in io-wq: ADMISSION-gated.
+                                                 * Unthrottled IOSQE_ASYNC let 113k
+                                                 * fibers submit before one reap —
+                                                 * SQ/CQ overflow, scheduler livelock
+                                                 * in sqe_get (3600s timeout). */
+#define OPEN_GATE 512
 static uint8_t g_stage[1 << 16];
 static void stream_parse(void);
 static void stdin_arm(void);
@@ -819,6 +825,11 @@ static void fib_step(Fiber *f) {
                 f->cur.phase = 1;
                 if (I->digest) { blake3_hasher_init(&f->cur.bh); f->cur.hashing = 1; }
                 if (I->skind == E_FS) {
+                    if (g_open_inflight >= OPEN_GATE) {      /* admission: park, re-FRESH */
+                        f->cur.phase = 0;
+                        f->wnext = g_budget_waiters; g_budget_waiters = f;
+                        f->st = F_WAIT_BUDGET; return;
+                    }
                     /* ASYNC open — a sync open() here serialized every file open on
                      * the SCHEDULER thread: 113k dst opens x ~4ms WEKA latency was
                      * the entire 468s frames phase (the '1 D' histogram tail was
@@ -832,6 +843,7 @@ static void fib_step(Fiber *f) {
                     io_uring_sqe_set_flags(sq, IOSQE_ASYNC);
                     io_uring_sqe_set_data(sq, f);
                     io_uring_submit(&g_ring);
+                    g_open_inflight++;
                     f->cur.fd = -1;
                     f->st = F_WAIT_CQE; return;
                 } else if (I->skind == E_INLINE) {
@@ -853,11 +865,17 @@ static void fib_step(Fiber *f) {
                     }
                 }
                 if (I->dkind == E_FS) {                     /* scatter destination: async */
+                    if (g_open_inflight >= OPEN_GATE) {      /* admission: park, re-FRESH */
+                        f->cur.phase = 0;
+                        f->wnext = g_budget_waiters; g_budget_waiters = f;
+                        f->st = F_WAIT_BUDGET; return;
+                    }
                     struct io_uring_sqe *sq = sqe_get();
                     io_uring_prep_openat(sq, AT_FDCWD, I->path, O_WRONLY | O_CREAT, 0644);
                     io_uring_sqe_set_flags(sq, IOSQE_ASYNC);     /* see src-open note */
                     io_uring_sqe_set_data(sq, f);
                     io_uring_submit(&g_ring);
+                    g_open_inflight++;
                     f->cur.fd = -1;
                     f->st = F_WAIT_CQE; return;
                 }
@@ -1137,6 +1155,9 @@ static void run(void) {
             if (f->st == F_WAIT_CQE) {
                 Instr *I = &f->prog[f->pc];
                 if (I->op == I_MOV && f->cur.fd == -1) {         /* async open landed */
+                    g_open_inflight--;
+                    if (g_budget_waiters && g_open_inflight < OPEN_GATE - 128)
+                        budget_release(0);                   /* wake parked openers */
                     if (res == -ENOENT && I->dkind == E_FS) {    /* rare: parents missing */
                         char *dp = (char *)I->path;
                         mkparents(dp);
@@ -1340,10 +1361,12 @@ int main(int argc, char **argv) {
       if (w) { NWORK = atoi(w); if (NWORK < 1) NWORK = 1; if (NWORK > NWORK_MAX) NWORK = NWORK_MAX; } }
     if (argc >= 2 && !strcmp(argv[1], "stream")) {
         io_uring_queue_init(QD, &g_ring, 0);
-        { unsigned v[2] = {0, 128};              /* io-wq unbounded-pool cap (opens):
-                                                  * env QVM2_IOWQ overrides */
+        { unsigned cap = 128;                    /* io-wq caps, BOTH pools (openat draws
+                                                  * from the bounded one — capping only
+                                                  * slot 1 let it spawn 800+ workers) */
           const char *iw = getenv("QVM2_IOWQ");
-          if (iw && atoi(iw) > 0) v[1] = (unsigned)atoi(iw);
+          if (iw && atoi(iw) > 0) cap = (unsigned)atoi(iw);
+          unsigned v[2] = {cap, cap};
           io_uring_register_iowq_max_workers(&g_ring, v); }
         g_evfd = eventfd(0, 0);
         { struct io_uring_sqe *sq = sqe_get();
