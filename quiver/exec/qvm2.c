@@ -289,7 +289,9 @@ static int g_open_inflight;                     /* opens in io-wq: ADMISSION-gat
                                                  * fibers submit before one reap —
                                                  * SQ/CQ overflow, scheduler livelock
                                                  * in sqe_get (3600s timeout). */
-#define OPEN_GATE 512
+static int OPEN_GATE = 512;                     /* env QVM2_OPEN_GATE (debug: tiny
+                                                 * values exercise the park/wake paths
+                                                 * locally in seconds) */
 static uint8_t g_stage[1 << 16];
 static void stream_parse(void);
 static void stdin_arm(void);
@@ -1156,8 +1158,13 @@ static void run(void) {
                 Instr *I = &f->prog[f->pc];
                 if (I->op == I_MOV && f->cur.fd == -1) {         /* async open landed */
                     g_open_inflight--;
-                    if (g_budget_waiters && g_open_inflight < OPEN_GATE - 128)
-                        budget_release(0);                   /* wake parked openers */
+                    if (g_budget_waiters) budget_release(0); /* a slot just freed: wake
+                                                              * parked openers unconditionally.
+                                                              * The old `< GATE-128` hysteresis
+                                                              * lost the wakeup when the last
+                                                              * opens drained before a fiber
+                                                              * parked (and was negative for
+                                                              * GATE<128 -> never woke). */
                     if (res == -ENOENT && I->dkind == E_FS) {    /* rare: parents missing */
                         char *dp = (char *)I->path;
                         mkparents(dp);
@@ -1355,6 +1362,8 @@ static Instr *fib_push(Fiber *f, uint8_t op) { Instr *I = &f->prog[f->n++]; mems
 
 int main(int argc, char **argv) {
     g_trace = getenv("QVM2_TRACE") != NULL;
+    { const char *og = getenv("QVM2_OPEN_GATE");
+      if (og && atoi(og) > 0) OPEN_GATE = atoi(og); }
     { const char *bg = getenv("QVM2_BUDGET");
       if (bg) { long v = atol(bg); if (v > 0) g_budget = v << 20; } }
     { const char *w = getenv("QVM2_WORKERS");
