@@ -825,6 +825,11 @@ static void fib_step(Fiber *f) {
                      * this thread, not a worker). fd: 0 = not opened, -1 = in flight. */
                     struct io_uring_sqe *sq = sqe_get();
                     io_uring_prep_openat(sq, AT_FDCWD, I->path, O_RDONLY, 0);
+                    /* IOSQE_ASYNC: without it, io_uring attempts the open INLINE in
+                     * submit context and wekafs completes it synchronously — every
+                     * open still ran on the scheduler thread (main=D in the phase
+                     * profile, io-wq workers asleep). Force the offload. */
+                    io_uring_sqe_set_flags(sq, IOSQE_ASYNC);
                     io_uring_sqe_set_data(sq, f);
                     io_uring_submit(&g_ring);
                     f->cur.fd = -1;
@@ -850,6 +855,7 @@ static void fib_step(Fiber *f) {
                 if (I->dkind == E_FS) {                     /* scatter destination: async */
                     struct io_uring_sqe *sq = sqe_get();
                     io_uring_prep_openat(sq, AT_FDCWD, I->path, O_WRONLY | O_CREAT, 0644);
+                    io_uring_sqe_set_flags(sq, IOSQE_ASYNC);     /* see src-open note */
                     io_uring_sqe_set_data(sq, f);
                     io_uring_submit(&g_ring);
                     f->cur.fd = -1;
@@ -1334,6 +1340,11 @@ int main(int argc, char **argv) {
       if (w) { NWORK = atoi(w); if (NWORK < 1) NWORK = 1; if (NWORK > NWORK_MAX) NWORK = NWORK_MAX; } }
     if (argc >= 2 && !strcmp(argv[1], "stream")) {
         io_uring_queue_init(QD, &g_ring, 0);
+        { unsigned v[2] = {0, 128};              /* io-wq unbounded-pool cap (opens):
+                                                  * env QVM2_IOWQ overrides */
+          const char *iw = getenv("QVM2_IOWQ");
+          if (iw && atoi(iw) > 0) v[1] = (unsigned)atoi(iw);
+          io_uring_register_iowq_max_workers(&g_ring, v); }
         g_evfd = eventfd(0, 0);
         { struct io_uring_sqe *sq = sqe_get();
           static uint64_t evbuf2; io_uring_prep_read(sq, g_evfd, &evbuf2, 8, 0);

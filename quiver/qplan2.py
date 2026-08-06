@@ -311,6 +311,8 @@ def unpack(nock, dest, walkers=32, phase_times=None):
             if t_ is None or not b_.height:
                 continue
             t0 = time.time()
+            print(f"PHASE {name} START {t0:.0f}", flush=True)
             _run([b_, t_])
             phase_times[name] = round(time.time() - t0, 1)
+            print(f"PHASE {name} END {time.time():.0f}", flush=True)
     return files.height + dirs.height
