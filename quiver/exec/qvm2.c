@@ -289,6 +289,12 @@ static int g_open_inflight;                     /* opens in io-wq: ADMISSION-gat
                                                  * fibers submit before one reap —
                                                  * SQ/CQ overflow, scheduler livelock
                                                  * in sqe_get (3600s timeout). */
+static int g_open_async = 0;                    /* IOSQE_ASYNC offload: env QVM2_ASYNC_OPEN=1.
+                                                 * DEFAULT OFF — forced offload STALLS wekafs
+                                                 * in the frames phase (3 WEKA hangs, deadlock
+                                                 * provably gone locally). Plain async openat
+                                                 * (inline-completed by wekafs) is the shipping
+                                                 * path: measured 477s, no hang. */
 static int OPEN_GATE = 512;                     /* env QVM2_OPEN_GATE (debug: tiny
                                                  * values exercise the park/wake paths
                                                  * locally in seconds) */
@@ -842,7 +848,7 @@ static void fib_step(Fiber *f) {
                      * submit context and wekafs completes it synchronously — every
                      * open still ran on the scheduler thread (main=D in the phase
                      * profile, io-wq workers asleep). Force the offload. */
-                    io_uring_sqe_set_flags(sq, IOSQE_ASYNC);
+                    if (g_open_async) io_uring_sqe_set_flags(sq, IOSQE_ASYNC);
                     io_uring_sqe_set_data(sq, f);
                     io_uring_submit(&g_ring);
                     g_open_inflight++;
@@ -874,7 +880,7 @@ static void fib_step(Fiber *f) {
                     }
                     struct io_uring_sqe *sq = sqe_get();
                     io_uring_prep_openat(sq, AT_FDCWD, I->path, O_WRONLY | O_CREAT, 0644);
-                    io_uring_sqe_set_flags(sq, IOSQE_ASYNC);     /* see src-open note */
+                    if (g_open_async) io_uring_sqe_set_flags(sq, IOSQE_ASYNC);   /* opt-in */
                     io_uring_sqe_set_data(sq, f);
                     io_uring_submit(&g_ring);
                     g_open_inflight++;
@@ -1364,6 +1370,7 @@ int main(int argc, char **argv) {
     g_trace = getenv("QVM2_TRACE") != NULL;
     { const char *og = getenv("QVM2_OPEN_GATE");
       if (og && atoi(og) > 0) OPEN_GATE = atoi(og); }
+    g_open_async = getenv("QVM2_ASYNC_OPEN") != NULL;
     { const char *bg = getenv("QVM2_BUDGET");
       if (bg) { long v = atol(bg); if (v > 0) g_budget = v << 20; } }
     { const char *w = getenv("QVM2_WORKERS");
