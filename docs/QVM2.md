@@ -269,7 +269,96 @@ them by patching buffer offsets — no per-row serialization — and Polars read
 them with one `read_ipc_stream`. A schema is written once at sink open; batches
 are bare messages; a `kind==255` row marks a producer done.
 
-## 9. Status & provenance
+## 9. The scheduler by example
+
+To see how one idle scheduler thread drives real concurrency, take the smallest
+non-trivial program: `pack` two files into two frames. `qplan2.pack` emits this
+(one fiber per frame; `tid 0` is the root):
+
+```
+; tid 0 — root: open sinks, make the frame vals, spawn, join
+0: SINK   0, "out.nock"           ; data sink
+0: SINK   1, "out.rec"            ; EMIT-record sink
+0: NEWVAL v0, codec=zstd, pledged=size(a)
+0: NEWVAL v1, codec=zstd, pledged=size(b)
+0: SPAWN  1..2                    ; activate the two frame fibers
+0: JOIN   1..2                    ; park on a countdown until both DONE
+
+; tid 1 — frame 0 → val v0                | ; tid 2 — frame 1 → val v1
+1: MOV inline:hdr(a) → v0                 | 2: MOV inline:hdr(b) → v1
+1: MOV fs:a.bin      → v0   [DIGEST]      | 2: MOV fs:b.bin      → v1   [DIGEST]
+1: CLOSE v0                               | 2: CLOSE v1
+1: MOV v0 → sink0    ; reserve+write+DONE | 2: MOV v1 → sink0
+1: EMIT sink1        ; {coff,clen,digest} | 2: EMIT sink1
+1: FREE v0                                | 2: FREE v1
+```
+
+Each `mov` into a `codec` val is a **compute-pool** job (deflate); each `fs`
+open/read/write is a **ring** op. Every op is one quantum: the fiber issues it,
+parks, and the scheduler moves on. So the mechanic for a single transfer is a
+suspend/resume loop, never a blocking call:
+
+```mermaid
+sequenceDiagram
+    participant S as scheduler (1 thread)
+    participant R as io_uring
+    participant W as compute pool
+    Note over S: tid1 · MOV fs:a.bin → v0  (FRESH)
+    S->>R: openat(a.bin) async
+    Note over S: tid1 → WAIT_CQE; scheduler runs other fibers
+    R-->>S: cqe · fd
+    Note over S: tid1 READY · size the transfer
+    S->>R: read chunk @ off
+    R-->>S: cqe · bytes in iob
+    S->>W: job · deflate(chunk) → v0
+    Note over S: tid1 → WAIT_JOB
+    W-->>S: eventfd · done-list
+    Note over S: tid1 READY · next chunk … until EOF, then retire
+```
+
+The concurrency is what happens *across* fibers while any one of them is parked.
+The scheduler drains the whole ready queue before it blocks for a single
+completion — so at steady state both frame fibers have work in flight, the two
+pool workers compress different frames at once, the ring holds their reads and
+writes, and the scheduler thread itself is asleep in `wait_cqe`:
+
+```mermaid
+gantt
+    title Two frame-fibers in flight — wall clock, schematic
+    dateFormat X
+    axisFormat %S
+    section scheduler
+    dispatch F0,F1 → codec jobs   :s1, 0, 1
+    reap · issue opens            :s2, 3, 1
+    reap · issue reads            :s3, 5, 1
+    reap · issue writes           :s4, 11, 1
+    footer (EMIT records)         :s5, 14, 2
+    section io_uring
+    open a.bin · open b.bin       :o1, 4, 1
+    read a-body · read b-body     :o2, 6, 4
+    write frame0 · write frame1   :o3, 12, 2
+    section worker 0  (frame 0)
+    deflate hdr(a)                :w0a, 1, 2
+    deflate body(a)               :w0b, 7, 4
+    section worker 1  (frame 1)
+    deflate hdr(b)                :w1a, 1, 2
+    deflate body(b)               :w1b, 7, 4
+```
+
+Read the lanes vertically: at t≈8 both workers are deflating (different frames)
+*and* the ring is reading (both files) *and* the scheduler is idle. That
+vertical slice is the design — throughput is `min(pool cores, ring depth)`, and
+the single scheduler thread is deliberately not on the critical path. When it
+*was* (the two O(n·events) scans of §2), 64% of a 1M-fiber run went to that one
+thread; fixing it is what makes this picture hold at 10⁵ fibers.
+
+The same reading explains the shapes elsewhere: `unpack` (§6) is this gantt with
+hundreds of frame fibers instead of two, plus namespace ops on the blocking
+pool; `scan` (§5) is why per-directory fibers *lose* — a lane per directory is
+10⁵ lanes of microseconds each, so the scheduler row becomes the wall and the
+walker leaf collapses them into one.
+
+## 10. Status & provenance
 
 - **Correctness**: the EVI cross-engine gate passes — a 5.1 GB / 112,819-file
   corpus subset, qplan2-packed, bvm-verified, qplan2-unpacked, `diff` byte-exact.
