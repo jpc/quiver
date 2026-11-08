@@ -689,7 +689,7 @@ class _Bvm:
     """A session with the unified bvm command-stream executor: open sources (tars /
     fs subtrees), send COPY/PACK/SCATTER plans, read STAT/SRC_EOF/DONE. One process
     can hold many sources at once (shared pool + block budget)."""
-    def __init__(self, bvm_exe, nworkers=16, budget_mb=512, launch=None, sock=None):
+    def __init__(self, bvm_exe, nworkers=16, budget_mb=512, launch=None, sock=None, qmax=0):
         """`launch` puts the executor on ANOTHER HOST: a command prefix such as
         ["srun", "-w", "node7", ...] or ["ssh", "node7"]. bvm speaks its whole protocol
         over stdin/stdout, and srun/ssh forward both, so a remote executor is the same
@@ -718,7 +718,11 @@ class _Bvm:
         # fills, workers block in emit under g_out_mu, the command loop stops reading stdin,
         # and the planner deadlocks in pipe_write (hit on a 6.5 TB home backup — tests fit
         # in the 64 KB pipe buffer). The reader ALWAYS drains; consumers pop the queue.
-        self._q = queue.Queue()
+        # UNBOUNDED by default for exactly that reason -- but then a consumer slower than the
+        # walkers buffers the whole scan here (a full-mount ducl scan OOMed at 344 GB). `qmax`
+        # bounds it, pushing backpressure through the pipe into bvm's workers; only safe for a
+        # caller that, once its commands are sent, does nothing but read() (e.g. scan_dirs).
+        self._q = queue.Queue(qmax)
         self._rt = threading.Thread(target=self._reader, daemon=True)
         self._rt.start()
 
