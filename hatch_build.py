@@ -41,11 +41,19 @@ class CustomBuildHook(BuildHookInterface):
             return
 
         exec_dir = os.path.join(self.root, "quiver", "exec")
+        binary = os.path.join(exec_dir, "bvm")
+        if version == "editable":
+            # `pip install -e .`: the package runs from the checkout, so default_bvm() finds
+            # whatever ./bvm is there. Don't rebuild it behind the developer's back (it may be
+            # the binary running jobs depend on); just say so if it is missing.
+            if not os.path.isfile(binary):
+                print(f"hatch_build: no {binary}; run  quiver/exec/build-deps.sh && make -C "
+                      f"quiver/exec bvm", file=sys.stderr)
+            return
         # -B: never ship a stale bvm left over from an earlier/other build. PYTHON: the
         # ipc_gen.h generator runs with the build environment's interpreter (it has numpy).
         env = dict(os.environ, PYTHON=sys.executable)
         subprocess.check_call(["make", "-C", exec_dir, "-B", "bvm"], env=env)
-        binary = os.path.join(exec_dir, "bvm")
         if not os.path.isfile(binary):
             raise SystemExit(f"hatch_build: make did not produce {binary}")
 

@@ -17,14 +17,14 @@ Two candidates, and bvm already collects the counters to separate them:
 
 Runs a small subtree so a variant costs ~10 s instead of 3 minutes.
 
-  ./directsweep.py [root] [--workers N] [--frame-cap MB] [--reps 1]
+  ./directsweep.py <root> [--workers N] [--frame-cap MB] [--reps 1]   (QUIVER_BENCH_OUT= output dir)
 """
 import argparse, os, shutil, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quiver.exec import blocks
 
-OUT = "/mnt/weka/jpc/tmp/quiver-bench/dsweep"
+OUT = os.environ.get("QUIVER_BENCH_OUT", "/tmp/quiver-bench/dsweep")
 
 
 def run(root, label, env, workers, cap, level=6, shards=16):
@@ -57,7 +57,7 @@ def run(root, label, env, workers, cap, level=6, shards=16):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("root", nargs="?", default="/mnt/weka/jpc/eot/high_quality_Nov6_24")
+    ap.add_argument("root", help="tree to back up (a few hundred GB on the target filesystem)")
     ap.add_argument("--workers", type=int, default=128)
     ap.add_argument("--frame-cap", type=int, default=64)
     ap.add_argument("--reps", type=int, default=1)

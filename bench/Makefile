@@ -1,7 +1,10 @@
 # quiver benchmark suite — see README.md
-ZSTD   ?= /mnt/weka/jpc/miniconda3/pkgs/zstd-1.5.6-hc292b87_0
-SODIUM ?= /mnt/weka/jpc/miniconda3/envs/brouhaha
-BLAKE3 ?= /mnt/weka/jpc/tmp/blake3-install
+# Static deps: the same prefix bvm uses (../quiver/exec/build-deps.sh), or DEPS=<prefix>.
+DEPS   ?= $(abspath ../quiver/exec/deps)
+ZSTD   ?= $(DEPS)
+SODIUM ?= $(DEPS)
+URING  ?= $(DEPS)
+BLAKE3 ?= $(DEPS)
 CFLAGS ?= -O2 -pthread -w
 
 all: fsbw fsops cfr rw dwrite dwriteq uread smallread framecap chunking hashes crypto scanprobe unlink_threads numa_zstd
@@ -13,7 +16,6 @@ rw: rw.c ; $(CC) $(CFLAGS) -o $@ $<
 dwrite: dwrite.c ; $(CC) $(CFLAGS) -o $@ $<
 uread: uread.c ; $(CC) $(CFLAGS) -I$(URING)/include -o $@ $< $(URING)/lib/liburing.a
 dwriteq: dwriteq.c ; $(CC) $(CFLAGS) -I$(URING)/include -o $@ $< $(URING)/lib/liburing.a
-URING ?= /mnt/weka/jpc/tmp/liburing-install
 smallread: smallread.c ; $(CC) $(CFLAGS) -I$(URING)/include -o $@ $< $(URING)/lib/liburing.a
 framecap: framecap.c ; $(CC) $(CFLAGS) -I$(ZSTD)/include -o $@ $< $(ZSTD)/lib/libzstd.a
 chunking: chunking.c ; $(CC) $(CFLAGS) -march=native -o $@ $<

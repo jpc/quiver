@@ -2777,14 +2777,20 @@ def find(root, bvm_exe, name=None, min_size=None, max_size=None, newer_than_ns=N
 
 # ------------------------------------------------------------------ networked rsync
 def _sodium():
-    import ctypes
-    for cand in ("/mnt/weka/jpc/miniconda3/envs/brouhaha/lib/libsodium.so",
-                 "libsodium.so", "libsodium.so.23"):
+    """The libsodium SHARED library for the Python side of the handshake (bvm has it linked
+    in statically). QUIVER_LIBSODIUM=<path> overrides the search."""
+    import ctypes, ctypes.util
+    cands = [os.environ.get("QUIVER_LIBSODIUM"), ctypes.util.find_library("sodium"),
+             "libsodium.so.26", "libsodium.so.23", "libsodium.so"]
+    for cand in cands:
+        if not cand:
+            continue
         try:
             so = ctypes.CDLL(cand); so.sodium_init(); return so
         except OSError:
             continue
-    raise RuntimeError("libsodium not found")
+    raise RuntimeError("libsodium shared library not found: install it (apt: libsodium23, "
+                       "dnf: libsodium, conda: libsodium) or set QUIVER_LIBSODIUM=/path/to/libsodium.so")
 
 
 def _kx_keypair(so):
