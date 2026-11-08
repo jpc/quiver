@@ -31,6 +31,9 @@ endif
 # leaves them on their original inode. `mv -f` within one directory is that rename.
 BVM_OUT ?= bvm
 bvm: bvm.c ipc_gen.h
+	@test -f $(ZSTD)/lib/libzstd.a -a -f $(SODIUM)/lib/libsodium.a -a -f $(URING)/lib/liburing.a -a -f $(BLAKE3)/lib/libblake3.a \
+	  || { echo "bvm: static deps not found (looked in ZSTD=$(ZSTD) SODIUM=$(SODIUM) URING=$(URING) BLAKE3=$(BLAKE3))."; \
+	       echo "     Run  $(HERE)build-deps.sh  (or pass DEPS=<prefix>)."; exit 1; }
 	$(CC) -O2 -pthread -w -I$(ZSTD)/include -I$(SODIUM)/include -I$(URING)/include -I$(BLAKE3)/include -o $(BVM_OUT).tmp bvm.c \
 	  $(ZSTD)/lib/libzstd.a $(SODIUM)/lib/libsodium.a $(URING)/lib/liburing.a $(BLAKE3)/lib/libblake3.a
 	mv -f $(BVM_OUT).tmp $(BVM_OUT)
