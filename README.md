@@ -19,8 +19,10 @@ fs, coreutils will beat it — that's expected and honest.
 pip install quiver-tools          # Linux x86_64 / aarch64 wheels, glibc >= 2.28; import name is `quiver`
 ```
 
-The wheel ships the `bvm` executor prebuilt (static zstd, libsodium, liburing, BLAKE3).
-io_uring paths need a reasonably recent kernel; everything falls back to sync I/O otherwise.
+The wheel ships the `bvm` executor prebuilt (static zstd, libsodium, liburing, BLAKE3), so
+nothing else is needed from the system. io_uring paths need a reasonably recent kernel;
+everything falls back to sync I/O otherwise. Networked rsync (`quiver push` / `serve`) also
+wants PyNaCl for the key exchange: `pip install 'quiver-tools[net]'`.
 
 From a checkout, build the executor once (pinned dependency sources, ~1-2 minutes), then
 install editable; `pip install -e` leaves the in-tree `bvm` alone, `make` owns it:

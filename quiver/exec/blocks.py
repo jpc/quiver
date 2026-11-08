@@ -2776,36 +2776,24 @@ def find(root, bvm_exe, name=None, min_size=None, max_size=None, newer_than_ns=N
 
 
 # ------------------------------------------------------------------ networked rsync
-def _sodium():
-    """The libsodium SHARED library for the Python side of the handshake (bvm has it linked
-    in statically). QUIVER_LIBSODIUM=<path> overrides the search."""
-    import ctypes, ctypes.util
-    cands = [os.environ.get("QUIVER_LIBSODIUM"), ctypes.util.find_library("sodium"),
-             "libsodium.so.26", "libsodium.so.23", "libsodium.so"]
-    for cand in cands:
-        if not cand:
-            continue
-        try:
-            so = ctypes.CDLL(cand); so.sodium_init(); return so
-        except OSError:
-            continue
-    raise RuntimeError("libsodium shared library not found: install it (apt: libsodium23, "
-                       "dnf: libsodium, conda: libsodium) or set QUIVER_LIBSODIUM=/path/to/libsodium.so")
+def _kx():
+    """X25519 key exchange for the Python side of the handshake (bvm has libsodium linked in
+    statically). PyNaCl bundles libsodium in its wheels, so no system library is needed."""
+    try:
+        import nacl.bindings as kx
+    except ImportError as e:
+        raise RuntimeError("networked rsync needs PyNaCl: pip install 'quiver-tools[net]'") from e
+    return kx
 
 
-def _kx_keypair(so):
-    import ctypes
-    pk = ctypes.create_string_buffer(so.crypto_kx_publickeybytes())
-    sk = ctypes.create_string_buffer(so.crypto_kx_secretkeybytes())
-    so.crypto_kx_keypair(pk, sk); return pk.raw, sk.raw
+def _kx_keypair(kx):
+    return kx.crypto_kx_keypair()                       # (pk, sk), 32 bytes each
 
 
-def _kx_session(so, client, pk, sk, peer):
-    import ctypes
-    n = so.crypto_kx_sessionkeybytes()
-    rx = ctypes.create_string_buffer(n); tx = ctypes.create_string_buffer(n)
-    (so.crypto_kx_client_session_keys if client else so.crypto_kx_server_session_keys)(rx, tx, pk, sk, peer)
-    return rx.raw, tx.raw
+def _kx_session(kx, client, pk, sk, peer):
+    """(rx, tx) session keys; same argument order as libsodium's crypto_kx_*_session_keys."""
+    f = kx.crypto_kx_client_session_keys if client else kx.crypto_kx_server_session_keys
+    return f(pk, sk, peer)
 
 
 def _fs_entries(root):
@@ -2863,12 +2851,12 @@ def rsync_serve(dst, bvm_exe, ctrl_port, data_port, n=4, nworkers=8, apply=True,
     LISTENs `n` encrypted data connections and applies the delta on the fly. Deletes
     the sender's removed paths. Returns the delete count."""
     import socket, struct, pickle
-    os.makedirs(dst, exist_ok=True); so = _sodium()
+    os.makedirs(dst, exist_ok=True); kx = _kx()
     cs = socket.socket(); cs.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     cs.bind(("0.0.0.0", ctrl_port)); cs.listen(1)
     conn, _ = cs.accept(); rf = conn.makefile("rb")
-    pk, sk = _kx_keypair(so); peer = _recvall(rf, so.crypto_kx_publickeybytes()); conn.sendall(pk)
-    rx, _tx = _kx_session(so, False, pk, sk, peer)
+    pk, sk = _kx_keypair(kx); peer = _recvall(rf, kx.crypto_kx_PUBLIC_KEY_BYTES); conn.sendall(pk)
+    rx, _tx = _kx_session(kx, False, pk, sk, peer)
     blob = pickle.dumps(_fs_entries(dst)); conn.sendall(struct.pack("<Q", len(blob)) + blob)
     (ml,) = struct.unpack("<Q", _recvall(rf, 8))            # delete lists (files, dirs) — FIRST,
     delfiles, deldirs = pickle.loads(_recvall(rf, ml))      # so unlinks can't re-bump dir mtimes
@@ -2896,15 +2884,15 @@ def rsync_push(src, bvm_exe, host, ctrl_port, data_port, n=4, nworkers=8, level=
     added/changed files over `n` encrypted data connections (sharded). Returns
     {sent, deleted, frames}."""
     import socket, struct, pickle
-    so = _sodium(); c = None
+    kx = _kx(); c = None
     for _ in range(100):
         try:
             c = socket.create_connection((host, ctrl_port)); break
         except OSError:
             time.sleep(0.1)
     rf = c.makefile("rb")
-    pk, sk = _kx_keypair(so); c.sendall(pk); peer = _recvall(rf, so.crypto_kx_publickeybytes())
-    _rx, tx = _kx_session(so, True, pk, sk, peer)
+    pk, sk = _kx_keypair(kx); c.sendall(pk); peer = _recvall(rf, kx.crypto_kx_PUBLIC_KEY_BYTES)
+    _rx, tx = _kx_session(kx, True, pk, sk, peer)
     (sl,) = struct.unpack("<Q", _recvall(rf, 8)); tgtfiles, tgtlinks, tgtdirs = pickle.loads(_recvall(rf, sl))
     srcfiles, srclinks, srcdirs = _fs_entries(src)
     def fkey(v): return (v[0], v[1])                         # (size, mtime_ns) EXACT: both ends are

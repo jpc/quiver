@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "quiver-tools"
-version = "0.1.0"
+version = "0.1.1"
 description = "Set-at-a-time Unix file tools on io_uring, Polars, and Arrow; nock self-indexing archives"
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,7 +26,8 @@ Source = "https://github.com/jpc/quiver"
 
 [project.optional-dependencies]
 s3 = ["boto3"]
-dev = ["pytest", "pyarrow", "flatbuffers"]     # test oracles only
+net = ["pynacl>=1.5"]                          # networked rsync (push/serve): X25519 key exchange
+dev = ["pytest", "pyarrow", "flatbuffers", "pynacl>=1.5"]     # test oracles + the net extra
 
 [project.scripts]
 quiver = "quiver.cli:main"
