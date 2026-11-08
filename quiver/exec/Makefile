@@ -1,16 +1,30 @@
 CFLAGS ?= -O2 -Wall -Wextra -pthread
+PYTHON ?= python3
 all: bvm
 ipc_gen.h: ../compiler/gen_templates.py
-	cd ../.. && PYTHONPATH=. python3 quiver/compiler/gen_templates.py quiver/exec/ipc_gen.h
+	cd ../.. && PYTHONPATH=. $(PYTHON) quiver/compiler/gen_templates.py quiver/exec/ipc_gen.h
 clean:
 	rm -f bvm ipc_gen.h
 
 # --- bvm (the BLOCKS executor; docs/BLOCKS.md, docs/DATAFLOW.md) ---
-# zstd static + libsodium static so bvm depends only on glibc + libz (portable).
+# zstd, libsodium, liburing and BLAKE3 are linked STATICALLY so bvm depends only on glibc
+# (portable: the PyPI wheel ships this one binary). Where they come from, in order:
+#   DEPS=<prefix>          one prefix holding include/ and lib/ for all four
+#   quiver/exec/deps/      auto-detected: the output of ./build-deps.sh (pinned sources)
+#   the IREN cluster paths below, as a last resort for in-place dev builds there
+HERE   := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+DEPS   ?= $(if $(wildcard $(HERE)deps/lib),$(HERE)deps,)
+ifneq ($(strip $(DEPS)),)
+ZSTD   ?= $(DEPS)
+SODIUM ?= $(DEPS)
+URING  ?= $(DEPS)
+BLAKE3 ?= $(DEPS)
+else
 ZSTD   ?= /mnt/weka/jpc/miniconda3/pkgs/zstd-1.5.6-hc292b87_0
 SODIUM ?= /mnt/weka/jpc/miniconda3/envs/brouhaha
 URING  ?= /mnt/weka/jpc/tmp/liburing-install
 BLAKE3 ?= /mnt/weka/jpc/tmp/blake3-install
+endif
 # Link to a temp name and RENAME into place. Writing the executable directly replaces the
 # text of every process already running it -- and over a shared filesystem the kernel's
 # ETXTBSY guard does not reach the nodes running remote executors. rename(2) is atomic and

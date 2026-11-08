@@ -14,3 +14,6 @@ dist/
 # large data archives (never commit)
 *.tar.zstd
 *.tar.zst
+
+# static deps for bvm, built by quiver/exec/build-deps.sh
+quiver/exec/deps/

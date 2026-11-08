@@ -13,6 +13,22 @@ Built for high-latency parallel filesystems (WEKA-class) and object
 stores, where round-trips dominate and batching wins. On a warm local
 fs, coreutils will beat it — that's expected and honest.
 
+## Install
+
+```bash
+pip install quiver-tools          # Linux x86_64 / aarch64 wheels, glibc >= 2.28; import name is `quiver`
+```
+
+The wheel ships the `bvm` executor prebuilt (static zstd, libsodium, liburing, BLAKE3).
+io_uring paths need a reasonably recent kernel; everything falls back to sync I/O otherwise.
+
+From a checkout, build the executor once (pinned dependency sources, ~2 minutes):
+
+```bash
+quiver/exec/build-deps.sh && make -C quiver/exec bvm
+pip install -e ".[dev]"
+```
+
 ## The one idea
 
 ```

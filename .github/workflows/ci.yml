@@ -8,16 +8,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - name: deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libzstd-dev libsodium-dev liburing-dev
-          python -m pip install -U pip polars numpy zstandard blake3 pytest
+        run: python -m pip install -U pip polars numpy zstandard blake3 pytest pyarrow
       - name: build bvm
+        # static zstd/libsodium/liburing/BLAKE3 from pinned sources (same as the wheel build)
         run: |
-          git clone --depth 1 https://github.com/BLAKE3-team/BLAKE3 /tmp/b3
-          cmake -S /tmp/b3/c -B /tmp/b3/build -DCMAKE_INSTALL_PREFIX=/tmp/b3/inst >/dev/null
-          cmake --build /tmp/b3/build --target install -j >/dev/null
-          make -C quiver/exec bvm ZSTD=/usr SODIUM=/usr URING=/usr BLAKE3=/tmp/b3/inst \
-            || make -C quiver/exec bvm
+          quiver/exec/build-deps.sh
+          make -C quiver/exec bvm
       - name: pytest
         run: PYTHONPATH=. python -m pytest tests/ -q

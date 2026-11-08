@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+# numpy: quiver/compiler/gen_templates.py (generates quiver/exec/ipc_gen.h at build time) imports it
+requires = ["hatchling", "numpy>=1.26"]
+build-backend = "hatchling.build"
 
 [project]
 name = "quiver-tools"
@@ -8,8 +9,19 @@ version = "0.1.0"
 description = "Set-at-a-time Unix file tools on io_uring, Polars, and Arrow; nock self-indexing archives"
 readme = "README.md"
 license = {file = "LICENSE"}
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = ["polars>=1.0", "numpy>=1.26", "zstandard>=0.22", "blake3>=0.4"]
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Archiving",
+]
+
+[project.urls]
+Homepage = "https://github.com/jpc/quiver"
+Source = "https://github.com/jpc/quiver"
 
 [project.optional-dependencies]
 s3 = ["boto3"]
@@ -18,5 +30,32 @@ dev = ["pytest", "pyarrow", "flatbuffers"]     # test oracles only
 [project.scripts]
 quiver = "quiver.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["quiver*"]
+# The wheel carries the Python package plus the compiled bvm executor (added by hatch_build.py),
+# but NOT bvm.c: default_bvm() treats a binary older than a sibling bvm.c as stale, and install
+# mtimes are arbitrary. Sources, Makefile and the prototype qvm2 stay in the sdist only.
+[tool.hatch.build.targets.wheel]
+packages = ["quiver"]
+exclude = [
+    "quiver/exec/*.c",
+    "quiver/exec/*.h",
+    "quiver/exec/Makefile",
+    "quiver/exec/build-deps.sh",
+    "quiver/exec/qvm2",
+    "quiver/exec/quiver-exec",
+    "quiver/exec/deps",
+    "quiver/exec/*.tmp",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["quiver/**", "tests/**", "pyproject.toml", "README.md", "LICENSE", "NOTICE", "hatch_build.py"]
+exclude = [
+    "quiver/exec/bvm",
+    "quiver/exec/qvm2",
+    "quiver/exec/quiver-exec",
+    "quiver/exec/deps",
+    "quiver/exec/*.tmp",
+    "**/__pycache__",
+]

@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # --- one wheel per Linux arch, built inside the manylinux_2_28 container so bvm links
+  #     against glibc 2.28 (RHEL 8 / Ubuntu 18.10 and newer). hatch_build.py verifies the claim.
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    env:
+      PY: /opt/python/cp312-cp312/bin/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static deps (zstd, libsodium, liburing, BLAKE3)
+        run: quiver/exec/build-deps.sh
+
+      - name: Build wheel
+        env:
+          QUIVER_WHEEL_PLAT: manylinux_2_28_${{ matrix.arch }}
+        run: |
+          $PY -m pip install -q build
+          $PY -m build --wheel
+
+      - name: Smoke test the wheel
+        run: |
+          $PY -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q dist/*.whl
+          cd /tmp
+          /tmp/venv/bin/quiver --help > /dev/null
+          /tmp/venv/bin/python -c "from quiver.exec import blocks; print(blocks.default_bvm())"
+          /tmp/venv/bin/quiver du /usr/include
+
+      - name: Extract standalone bvm
+        run: |
+          $PY -c "import glob, zipfile; z = zipfile.ZipFile(glob.glob('dist/*.whl')[0]); open('bvm-linux-${{ matrix.arch }}', 'wb').write(z.read('quiver/exec/bvm'))"
+          chmod +x bvm-linux-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.arch }}
+          path: dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bvm-${{ matrix.arch }}
+          path: bvm-linux-${{ matrix.arch }}
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: "{wheel-*,sdist}"
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # --- standalone bvm binaries on the GitHub release ---
+  binaries:
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bvm-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bvm-linux-*
